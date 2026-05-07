@@ -6,17 +6,22 @@
 #
 # Requires: bash 3.2+, jq.
 #
-# Hard ceilings (override via env to tune runaway protection):
-#   GOAL_MAX_TICKS    max continuation cycles per goal (default 200)
-#   GOAL_MAX_SECONDS  max wall-clock seconds per goal (default 28800 = 8h)
+# Optional ceilings (off by default — set to a positive integer to enable):
+#   GOAL_MAX_TICKS    max continuation cycles per goal (0 = unlimited)
+#   GOAL_MAX_SECONDS  max wall-clock seconds per goal (0 = unlimited)
+#
+# By default the goal pursues indefinitely; the real safety mechanisms are
+# the Notification hook (auto-pause on rate-limit / API error) and the
+# kill switch file (.claude/goal.pause). Set the env vars only if you
+# want a hard cap on top of those.
 
 set -euo pipefail
 
 GOAL_FILE=".claude/goal.json"
 LOG_FILE=".claude/goal-hook.log"
 KILL_SWITCH=".claude/goal.pause"
-MAX_TICKS=${GOAL_MAX_TICKS:-200}
-MAX_SECONDS=${GOAL_MAX_SECONDS:-28800}
+MAX_TICKS=${GOAL_MAX_TICKS:-0}
+MAX_SECONDS=${GOAL_MAX_SECONDS:-0}
 
 # ----- helpers ---------------------------------------------------------------
 
@@ -141,19 +146,19 @@ is_int "$TOKENS_USED" || TOKENS_USED=0
 is_int "$TICK_COUNT" || TICK_COUNT=0
 is_int "$TIME_USED" || TIME_USED=0
 
-# ----- ceilings (independent of model behavior) ------------------------------
+# ----- optional ceilings (only when set to a positive integer) ---------------
 
-if [ "$TIME_USED" -ge "$MAX_SECONDS" ]; then
+if is_int "$MAX_SECONDS" && [ "$MAX_SECONDS" -gt 0 ] && [ "$TIME_USED" -ge "$MAX_SECONDS" ]; then
     write_state "unmet" "ceiling-wallclock" "auto-stopped at ${TIME_USED}s (limit ${MAX_SECONDS}s)"
     log "ceiling-wallclock" "${TIME_USED}/${MAX_SECONDS}"
-    emit_block "Wall-clock ceiling reached (${TIME_USED}s >= ${MAX_SECONDS}s). The Stop hook auto-marked this goal unmet to prevent runaway. Stop now and report progress to the user. Do not start new substantive work."
+    emit_block "Wall-clock ceiling reached (${TIME_USED}s >= ${MAX_SECONDS}s). The Stop hook auto-marked this goal unmet. Stop now and report progress to the user. Do not start new substantive work."
     exit 0
 fi
 
-if [ "$TICK_COUNT" -ge "$MAX_TICKS" ]; then
+if is_int "$MAX_TICKS" && [ "$MAX_TICKS" -gt 0 ] && [ "$TICK_COUNT" -ge "$MAX_TICKS" ]; then
     write_state "unmet" "ceiling-ticks" "auto-stopped at ${TICK_COUNT} continuations (limit ${MAX_TICKS})"
     log "ceiling-ticks" "${TICK_COUNT}/${MAX_TICKS}"
-    emit_block "Tick ceiling reached (${TICK_COUNT} >= ${MAX_TICKS} continuations). The Stop hook auto-marked this goal unmet to prevent runaway. Stop now and report progress to the user. Do not start new substantive work."
+    emit_block "Tick ceiling reached (${TICK_COUNT} >= ${MAX_TICKS} continuations). The Stop hook auto-marked this goal unmet. Stop now and report progress to the user. Do not start new substantive work."
     exit 0
 fi
 

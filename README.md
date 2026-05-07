@@ -127,15 +127,21 @@ The state file lives on disk independent of the conversation, so most disruption
 
 ## Safety
 
-The Stop hook auto-continues every turn while `status="pursuing"`. To prevent runaway loops (e.g. the model never transitions state), the hook enforces three independent backstops:
+The Stop hook auto-continues every turn while `status="pursuing"`. **By default there are no time or tick limits** — a goal will pursue indefinitely until it's `achieved`, `unmet`, paused, or interrupted by a rate-limit / API error. The real safety mechanisms are:
 
-| Mechanism | Default | Override | Behavior on hit |
-|---|---|---|---|
-| **Tick ceiling** | 200 continuations | `GOAL_MAX_TICKS=N` | Goal auto-marked `unmet`; loop stops |
-| **Wall-clock ceiling** | 28800 seconds (8h) | `GOAL_MAX_SECONDS=N` | Goal auto-marked `unmet`; loop stops |
-| **Token budget** (off by default) | unset | `/goal budget <N>` | Goal auto-marked `budget-limited`; model wraps up |
+1. **Notification hook** — auto-pauses on rate-limit / API-error / timeout / overload notifications. Pick up with `/goal resume`.
+2. **Kill switch** — `touch .claude/goal.pause` from any terminal halts the loop instantly.
+3. **Manual control** — `/goal pause`, `/goal clear`, or `/goal unmet`.
 
-Set the env vars in your `~/.claude/settings.json` under `env`, or `export` them in your shell.
+If you also want hard caps on top of those (e.g. you're on metered API and want a belt-and-suspenders cap), set either or both of:
+
+| Env var | Purpose | Behavior on hit |
+|---|---|---|
+| `GOAL_MAX_TICKS` | Cap continuation cycles per goal | Goal auto-marked `unmet`; loop stops |
+| `GOAL_MAX_SECONDS` | Cap wall-clock seconds per goal | Goal auto-marked `unmet`; loop stops |
+| `/goal budget <N>` | Cap token usage (advisory) | Goal auto-marked `budget-limited`; model wraps up |
+
+Both env vars default to `0` (unlimited). Set to a positive integer to enable. Place them in your `~/.claude/settings.json` under `env`, or `export` them in your shell.
 
 ### Kill switch
 
@@ -189,7 +195,7 @@ This port has the same lifecycle and the same `<untrusted_objective>` framing (w
 | Multiple concurrent goals | One active per thread | One active per project (file-based) |
 | External API | App-server lets external tooling read goal state | File-based — read `.claude/goal.json` directly |
 | Plan mode | Goal continuation suppressed in Plan mode | No equivalent (no Plan-mode signal in hooks) |
-| Hard ceilings | None (runtime-bounded) | Tick + wall-clock ceilings to backstop the absent runtime |
+| Hard ceilings | None (runtime-bounded) | None by default; optional tick / wall-clock ceilings via env vars |
 
 Without hooks installed, you fall back to manual ticking via `/goal`.
 
