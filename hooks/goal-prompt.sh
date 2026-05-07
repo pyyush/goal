@@ -4,40 +4,34 @@
 # UserPromptSubmit hook for /goal — opt-in auto-pause.
 #
 # Subscription-first default: this hook does NOTHING unless you opt in.
-# The goal keeps moving across user prompts; the model interleaves your
-# input with goal continuation and the loop survives /clear and auto-
-# compaction transparently.
+# Set GOAL_AUTOPAUSE_ON_PROMPT=1 to restore Codex-style pause-on-input.
 #
-# Opt in to Codex-style auto-pause-on-input by exporting:
-#   export GOAL_AUTOPAUSE_ON_PROMPT=1
-#
-# Resolves goal state by walking up from $PWD. Requires bash 3.2+, jq.
+# Resolves goal state via goal-resolve.sh: session pointer first, then
+# walk-up from $cwd. Requires bash 3.2+, jq.
 
 set -euo pipefail
 
 [ "${GOAL_AUTOPAUSE_ON_PROMPT:-0}" = "1" ] || exit 0
 
-find_goal_root() {
-    local d="${1:-$PWD}"
-    while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do
-        if [ -f "$d/.claude/goal.json" ]; then
-            printf '%s' "$d"
-            return
-        fi
-        d=$(dirname "$d")
-    done
-}
+RESOLVER="$(dirname "$0")/goal-resolve.sh"
+[ -f "$RESOLVER" ] || exit 0
+# shellcheck disable=SC1090
+. "$RESOLVER"
 
-GOAL_ROOT=$(find_goal_root "$PWD")
-[ -n "$GOAL_ROOT" ] || exit 0
+INPUT=$(cat || printf '')
+INPUT=${INPUT:-\{\}}
 
-GOAL_FILE="$GOAL_ROOT/.claude/goal.json"
-LOG_FILE="$GOAL_ROOT/.claude/goal-hook.log"
+SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // ""' 2>/dev/null)
+SESSION_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
+
+resolve_goal "$SESSION_ID" "${SESSION_CWD:-$PWD}" || exit 0
 
 log() {
     {
-        printf '{"ts":"%s","pid":%d,"hook":"prompt","event":"%s","note":%s}\n' \
-            "$(date -u +%FT%TZ)" "$$" "$1" \
+        printf '{"ts":"%s","pid":%d,"hook":"prompt","session":%s,"event":"%s","note":%s}\n' \
+            "$(date -u +%FT%TZ)" "$$" \
+            "$(printf '%s' "$SESSION_ID" | jq -Rs . 2>/dev/null || printf '""')" \
+            "$1" \
             "$(printf '%s' "${2:-}" | jq -Rs . 2>/dev/null || printf '""')"
     } >> "$LOG_FILE" 2>/dev/null || true
 }
@@ -57,17 +51,11 @@ write_pause() {
     fi
 }
 
-INPUT=$(cat || printf '')
-INPUT=${INPUT:-\{\}}
-
-[ -L "$GOAL_FILE" ] && exit 0
-
 STATUS=$(jq -r '.status // ""' "$GOAL_FILE" 2>/dev/null) || STATUS=""
 [ "$STATUS" = "pursuing" ] || exit 0
 
 PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt // ""' 2>/dev/null) || PROMPT=""
 PROMPT_TRIMMED=$(printf '%s' "$PROMPT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-
 [ -z "$PROMPT_TRIMMED" ] && exit 0
 
 case "$PROMPT_TRIMMED" in

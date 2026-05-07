@@ -61,11 +61,15 @@ Parse `$ARGUMENTS`: trim leading/trailing whitespace, then **lowercase the first
 | `achieved` / `complete` | Run completion audit (below). On pass, set status to `achieved`. On fail, refuse and list what's missing. |
 | `unmet` / `blocked` | Set status to `unmet`. If no reason given, ask for a one-line note and store it in `history`. |
 | `budget <N>` | Validate that N is a positive integer. If valid, set `token_budget` to N. If `tokens_used >= N`, immediately move status to `budget-limited`. If invalid, refuse and explain. |
-| anything else | Treat the **entire trimmed argument** (case preserved) as a **new objective**. Reject objectives over 4000 characters. If a goal exists, mention `(replaced previous goal: "...")`. Initialize fresh state: `status = pursuing`, `tokens_used = 0`, `tick_count = 0`, fresh `created_at`/`updated_at`, history seeded with `create`. Run Continuation Protocol once. |
+| anything else | Treat the **entire trimmed argument** (case preserved) as a **new objective**. Reject objectives over 4000 characters. If a goal exists, mention `(replaced previous goal: "...")`. Initialize fresh state: `status = pursuing`, `tokens_used = 0`, `tick_count = 0`, fresh `created_at`/`updated_at`, history seeded with `create`. **Write `.claude/goal.json` as your FIRST action — before any thinking, planning, or other tool calls.** Then run Continuation Protocol. |
 
 ### Writing state
 
-Rewrite `.claude/goal.json` with the Write tool. Always:
+Rewrite the goal file with the Write tool. The path is `.claude/goal.json` relative to the **goal root** — if the bang-command output above contains `GOAL_ROOT=<dir>`, use `<dir>/.claude/goal.json`. Otherwise default to `./.claude/goal.json`.
+
+**Do this immediately** when setting or replacing a goal — before any other reasoning or tool calls. The Stop hook and statusLine indicator both key off `goal.json` existing on disk; deferring the write delays auto-continuation and the status indicator.
+
+Always:
 - update `updated_at` to the timestamp above
 - append a `history` entry: `{ts, action, note}` where action is `create | replace | pause | resume | mark-achieved | mark-unmet | set-budget | budget-limit-hit`
 - preserve fields you aren't changing (especially `tick_count`, which the Stop hook owns)

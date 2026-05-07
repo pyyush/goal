@@ -63,11 +63,11 @@ esac
 
 # ---- copy files ------------------------------------------------------------
 
-mkdir -p "$TARGET/commands" "$TARGET/hooks"
+mkdir -p "$TARGET/commands" "$TARGET/hooks" "$HOME/.claude/goal-sessions"
 cp "$REPO_DIR/goal.md" "$TARGET/commands/goal.md"
 cp "$REPO_DIR/hooks/"*.sh "$TARGET/hooks/"
 chmod +x "$TARGET/hooks/"*.sh
-printf 'Installed command + 4 hooks to %s/\n' "$TARGET"
+printf 'Installed command + 5 hook files to %s/\n' "$TARGET"
 
 # ---- settings.json merge ---------------------------------------------------
 

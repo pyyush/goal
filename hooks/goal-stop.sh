@@ -4,8 +4,8 @@
 # Stop hook for /goal — auto-continues Claude when status=pursuing.
 # Port of Codex CLI's templates/goals/{continuation,budget_limit}.md.
 #
-# Resolves the goal state by walking up from $PWD to find the nearest
-# enclosing .claude/goal.json (like git locates .git/). Stops at $HOME.
+# Resolves goal state via goal-resolve.sh: session pointer first
+# (sticky across /cwd), then walk-up from $cwd. Stops at $HOME.
 #
 # Requires: bash 3.2+, jq.
 #
@@ -18,32 +18,31 @@ set -euo pipefail
 MAX_TICKS=${GOAL_MAX_TICKS:-0}
 MAX_SECONDS=${GOAL_MAX_SECONDS:-0}
 
-# ----- find the goal root by walking up from CWD ----------------------------
+# ----- resolver --------------------------------------------------------------
 
-find_goal_root() {
-    local d="${1:-$PWD}"
-    while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do
-        if [ -f "$d/.claude/goal.json" ]; then
-            printf '%s' "$d"
-            return
-        fi
-        d=$(dirname "$d")
-    done
-}
+RESOLVER="$(dirname "$0")/goal-resolve.sh"
+if [ ! -f "$RESOLVER" ]; then
+    exit 0
+fi
+# shellcheck disable=SC1090
+. "$RESOLVER"
 
-GOAL_ROOT=$(find_goal_root "$PWD")
-[ -n "$GOAL_ROOT" ] || exit 0
+INPUT=$(cat || printf '')
+INPUT=${INPUT:-\{\}}
 
-GOAL_FILE="$GOAL_ROOT/.claude/goal.json"
-LOG_FILE="$GOAL_ROOT/.claude/goal-hook.log"
-KILL_SWITCH="$GOAL_ROOT/.claude/goal.pause"
+SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // ""' 2>/dev/null)
+SESSION_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
+
+resolve_goal "$SESSION_ID" "${SESSION_CWD:-$PWD}" || exit 0
 
 # ----- helpers ---------------------------------------------------------------
 
 log() {
     {
-        printf '{"ts":"%s","pid":%d,"hook":"stop","event":"%s","root":%s,"note":%s}\n' \
-            "$(date -u +%FT%TZ)" "$$" "$1" \
+        printf '{"ts":"%s","pid":%d,"hook":"stop","session":%s,"event":"%s","root":%s,"note":%s}\n' \
+            "$(date -u +%FT%TZ)" "$$" \
+            "$(printf '%s' "$SESSION_ID" | jq -Rs . 2>/dev/null || printf '""')" \
+            "$1" \
             "$(printf '%s' "$GOAL_ROOT" | jq -Rs . 2>/dev/null || printf '""')" \
             "$(printf '%s' "${2:-}" | jq -Rs . 2>/dev/null || printf '""')"
     } >> "$LOG_FILE" 2>/dev/null || true
@@ -97,14 +96,6 @@ random_nonce() {
 }
 
 # ----- main ------------------------------------------------------------------
-
-INPUT=$(cat || printf '')
-INPUT=${INPUT:-\{\}}
-
-if [ -L "$GOAL_FILE" ]; then
-    log "refuse-symlink" "$GOAL_FILE is a symlink"
-    exit 0
-fi
 
 if [ -e "$KILL_SWITCH" ]; then
     log "kill-switch" "$KILL_SWITCH present"
@@ -189,7 +180,9 @@ Budget:
 
 The system has marked the goal as budget-limited, so do not start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step.
 
-Do not rewrite .claude/goal.json with status "achieved" unless the goal is actually complete.
+(Goal state file: ${GOAL_FILE})
+
+Do not rewrite the goal file with status "achieved" unless the goal is actually complete.
 EOF
 )
     emit_block "$REASON"
@@ -238,11 +231,12 @@ Before deciding that the goal is achieved, perform a completion audit against th
 - Identify any missing, incomplete, weakly verified, or uncovered requirement.
 - Treat uncertainty as not achieved; do more verification or continue the work.
 
-Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only rewrite .claude/goal.json with status "achieved" when the audit shows the objective has actually been achieved and no required work remains. Report the final elapsed time, and if the achieved goal has a token budget, report the final consumed tokens.
+Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only rewrite the goal file with status "achieved" when the audit shows the objective has actually been achieved and no required work remains. Report the final elapsed time, and if the achieved goal has a token budget, report the final consumed tokens.
 
-If the goal cannot continue productively, rewrite .claude/goal.json with status "unmet" and explain the blocker or required input. Do not mark a goal achieved merely because a budget is nearly exhausted or because you are stopping work.
+If the goal cannot continue productively, rewrite the goal file with status "unmet" and explain the blocker or required input. Do not mark a goal achieved merely because a budget is nearly exhausted or because you are stopping work.
 
-(Goal state file is at: ${GOAL_FILE})
+Goal state file (use this exact path for any state writes — do not assume .claude/goal.json relative to your current directory, since you may have shifted working dirs):
+  ${GOAL_FILE}
 EOF
 )
 

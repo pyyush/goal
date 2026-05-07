@@ -4,37 +4,29 @@
 # Helper for the Claude Code statusLine — outputs a single colored segment
 # describing the active /goal status (or nothing if no goal is set).
 #
-# Walks up from the given directory to find the nearest enclosing
-# .claude/goal.json (so a goal set in a parent directory is visible from
-# any sub-directory of that project). Stops at $HOME.
+# Designed to be called from your statusLine command. Pass the session's
+# working directory as the first argument and (optionally) the session_id
+# as the second, both extracted from the statusLine input JSON:
 #
-# Designed to be called from your statusLine command. Pass the project's
-# working directory as the first argument (the statusLine input JSON has
-# this as `.cwd`):
-#
-#   goal_seg=$(bash "$HOME/.claude/hooks/goal-statusline.sh" "$cwd")
+#   cwd=$(echo "$input" | jq -r '.cwd // ""')
+#   session=$(echo "$input" | jq -r '.session_id // ""')
+#   goal_seg=$(bash "$HOME/.claude/hooks/goal-statusline.sh" "$cwd" "$session")
 #   [ -n "$goal_seg" ] && segments+=("$goal_seg")
+#
+# When session_id is provided, the helper uses the session pointer
+# (~/.claude/goal-sessions/<sid>.goal) for sticky goal lookup across /cwd
+# changes. Otherwise it walks up from $cwd.
 #
 # Requires: bash 3.2+, jq.
 
 set -euo pipefail
 
-find_goal_root() {
-    local d="${1:-$PWD}"
-    while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do
-        if [ -f "$d/.claude/goal.json" ]; then
-            printf '%s' "$d"
-            return
-        fi
-        d=$(dirname "$d")
-    done
-}
+RESOLVER="$(dirname "$0")/goal-resolve.sh"
+[ -f "$RESOLVER" ] || exit 0
+# shellcheck disable=SC1090
+. "$RESOLVER"
 
-GOAL_ROOT=$(find_goal_root "${1:-$PWD}")
-[ -n "$GOAL_ROOT" ] || exit 0
-
-GOAL_FILE="$GOAL_ROOT/.claude/goal.json"
-[ -L "$GOAL_FILE" ] && exit 0
+resolve_goal "${2:-}" "${1:-$PWD}" || exit 0
 
 SHAPE=$(jq -r '
     if (type == "object" and (.status | type) == "string") then

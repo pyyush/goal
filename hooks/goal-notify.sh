@@ -4,36 +4,23 @@
 # Notification hook for /goal — auto-pauses an active goal when Claude Code
 # surfaces a rate-limit, API error, quota, or overload notification.
 #
-# Best-effort: depends on Claude Code emitting Notification events with
-# recognizable text. If your client doesn't fire Notification on errors,
-# the goal naturally stops anyway (no Stop hook fires while the API is
-# unreachable), and resumes when the runtime recovers.
-#
-# Resolves goal state by walking up from $PWD. Requires bash 3.2+, jq.
+# Resolves goal state via goal-resolve.sh: session pointer first, then
+# walk-up from $cwd. Requires bash 3.2+, jq.
 
 set -euo pipefail
 
-find_goal_root() {
-    local d="${1:-$PWD}"
-    while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do
-        if [ -f "$d/.claude/goal.json" ]; then
-            printf '%s' "$d"
-            return
-        fi
-        d=$(dirname "$d")
-    done
-}
-
-GOAL_ROOT=$(find_goal_root "$PWD")
-[ -n "$GOAL_ROOT" ] || exit 0
-
-GOAL_FILE="$GOAL_ROOT/.claude/goal.json"
-LOG_FILE="$GOAL_ROOT/.claude/goal-hook.log"
-
-[ -L "$GOAL_FILE" ] && exit 0
+RESOLVER="$(dirname "$0")/goal-resolve.sh"
+[ -f "$RESOLVER" ] || exit 0
+# shellcheck disable=SC1090
+. "$RESOLVER"
 
 INPUT=$(cat || printf '')
 INPUT=${INPUT:-\{\}}
+
+SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // ""' 2>/dev/null)
+SESSION_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
+
+resolve_goal "$SESSION_ID" "${SESSION_CWD:-$PWD}" || exit 0
 
 STATUS=$(jq -r '.status // ""' "$GOAL_FILE" 2>/dev/null) || exit 0
 [ "$STATUS" = "pursuing" ] || exit 0
@@ -65,8 +52,9 @@ else
 fi
 
 {
-    printf '{"ts":"%s","pid":%d,"hook":"notify","event":"auto-pause-error","note":%s}\n' \
+    printf '{"ts":"%s","pid":%d,"hook":"notify","session":%s,"event":"auto-pause-error","note":%s}\n' \
         "$NOW" "$$" \
+        "$(printf '%s' "$SESSION_ID" | jq -Rs . 2>/dev/null || printf '""')" \
         "$(printf '%s' "$reason" | jq -Rs . 2>/dev/null || printf '""')" \
         >> "$LOG_FILE" 2>/dev/null || true
 }
