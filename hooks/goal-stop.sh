@@ -4,32 +4,47 @@
 # Stop hook for /goal — auto-continues Claude when status=pursuing.
 # Port of Codex CLI's templates/goals/{continuation,budget_limit}.md.
 #
+# Resolves the goal state by walking up from $PWD to find the nearest
+# enclosing .claude/goal.json (like git locates .git/). Stops at $HOME.
+#
 # Requires: bash 3.2+, jq.
 #
 # Optional ceilings (off by default — set to a positive integer to enable):
 #   GOAL_MAX_TICKS    max continuation cycles per goal (0 = unlimited)
 #   GOAL_MAX_SECONDS  max wall-clock seconds per goal (0 = unlimited)
-#
-# By default the goal pursues indefinitely; the real safety mechanisms are
-# the Notification hook (auto-pause on rate-limit / API error) and the
-# kill switch file (.claude/goal.pause). Set the env vars only if you
-# want a hard cap on top of those.
 
 set -euo pipefail
 
-GOAL_FILE=".claude/goal.json"
-LOG_FILE=".claude/goal-hook.log"
-KILL_SWITCH=".claude/goal.pause"
 MAX_TICKS=${GOAL_MAX_TICKS:-0}
 MAX_SECONDS=${GOAL_MAX_SECONDS:-0}
+
+# ----- find the goal root by walking up from CWD ----------------------------
+
+find_goal_root() {
+    local d="${1:-$PWD}"
+    while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do
+        if [ -f "$d/.claude/goal.json" ]; then
+            printf '%s' "$d"
+            return
+        fi
+        d=$(dirname "$d")
+    done
+}
+
+GOAL_ROOT=$(find_goal_root "$PWD")
+[ -n "$GOAL_ROOT" ] || exit 0
+
+GOAL_FILE="$GOAL_ROOT/.claude/goal.json"
+LOG_FILE="$GOAL_ROOT/.claude/goal-hook.log"
+KILL_SWITCH="$GOAL_ROOT/.claude/goal.pause"
 
 # ----- helpers ---------------------------------------------------------------
 
 log() {
-    [ -d .claude ] || return 0
     {
-        printf '{"ts":"%s","pid":%d,"hook":"stop","event":"%s","note":%s}\n' \
+        printf '{"ts":"%s","pid":%d,"hook":"stop","event":"%s","root":%s,"note":%s}\n' \
             "$(date -u +%FT%TZ)" "$$" "$1" \
+            "$(printf '%s' "$GOAL_ROOT" | jq -Rs . 2>/dev/null || printf '""')" \
             "$(printf '%s' "${2:-}" | jq -Rs . 2>/dev/null || printf '""')"
     } >> "$LOG_FILE" 2>/dev/null || true
 }
@@ -45,12 +60,10 @@ emit_block() {
     jq -n --arg reason "$1" '{decision: "block", reason: $reason}'
 }
 
-# write_state <new_status> <history_action> <history_note>
 write_state() {
     local status="$1" action="$2" note="$3" now tmp
     now=$(date -u +%FT%TZ)
-    [ -d .claude ] || return 0
-    tmp=$(mktemp ".claude/goal.json.XXXXXX") || return 0
+    tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
     if jq --arg ts "$now" --arg s "$status" --arg a "$action" --arg n "$note" \
          '.status = $s
           | .updated_at = $ts
@@ -65,8 +78,7 @@ write_state() {
 increment_tick() {
     local new_tick="$1" now tmp
     now=$(date -u +%FT%TZ)
-    [ -d .claude ] || return 0
-    tmp=$(mktemp ".claude/goal.json.XXXXXX") || return 0
+    tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
     if jq --arg ts "$now" --argjson t "$new_tick" \
          '.tick_count = $t | .updated_at = $ts' \
          "$GOAL_FILE" > "$tmp" 2>/dev/null; then
@@ -76,8 +88,6 @@ increment_tick() {
     fi
 }
 
-# Strip closing-tag occurrences from $1 to defend against
-# <untrusted_objective> escape via crafted objective text.
 sanitize_objective() {
     printf '%s' "$1" | sed -E 's|</untrusted_objective[^>]*>||g'
 }
@@ -91,28 +101,22 @@ random_nonce() {
 INPUT=$(cat || printf '')
 INPUT=${INPUT:-\{\}}
 
-# Refuse to follow a symlinked state file (defends against drive-by repo).
 if [ -L "$GOAL_FILE" ]; then
     log "refuse-symlink" "$GOAL_FILE is a symlink"
     exit 0
 fi
 
-# Sentinel kill switch: `touch .claude/goal.pause` halts the loop from any terminal.
 if [ -e "$KILL_SWITCH" ]; then
     log "kill-switch" "$KILL_SWITCH present"
     exit 0
 fi
 
-[ -f "$GOAL_FILE" ] || exit 0
-
-# Recursion guard for the Stop hook chain.
 STOP_HOOK_ACTIVE=$(printf '%s' "$INPUT" | jq -r '.stop_hook_active // false' 2>/dev/null || printf 'false')
 if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
     log "recursion-guard" "stop_hook_active=true"
     exit 0
 fi
 
-# Single jq read — extract everything in one subprocess; tolerate malformed.
 SHAPE=$(jq -r '
     if (type == "object" and (.objective | type) == "string" and (.status | type) == "string") then
         [ .status,
@@ -141,12 +145,11 @@ if [ "$STATUS" != "pursuing" ]; then
     exit 0
 fi
 
-# Numeric coercion — reject corrupted values rather than crashing.
 is_int "$TOKENS_USED" || TOKENS_USED=0
 is_int "$TICK_COUNT" || TICK_COUNT=0
 is_int "$TIME_USED" || TIME_USED=0
 
-# ----- optional ceilings (only when set to a positive integer) ---------------
+# ----- optional ceilings ----------------------------------------------------
 
 if is_int "$MAX_SECONDS" && [ "$MAX_SECONDS" -gt 0 ] && [ "$TIME_USED" -ge "$MAX_SECONDS" ]; then
     write_state "unmet" "ceiling-wallclock" "auto-stopped at ${TIME_USED}s (limit ${MAX_SECONDS}s)"
@@ -193,7 +196,7 @@ EOF
     exit 0
 fi
 
-# ----- continuation prompt (port of Codex's continuation.md) -----------------
+# ----- continuation prompt --------------------------------------------------
 
 NEW_TICK=$((TICK_COUNT + 1))
 increment_tick "$NEW_TICK"
@@ -238,6 +241,8 @@ Before deciding that the goal is achieved, perform a completion audit against th
 Do not rely on intent, partial progress, elapsed effort, memory of earlier work, or a plausible final answer as proof of completion. Only rewrite .claude/goal.json with status "achieved" when the audit shows the objective has actually been achieved and no required work remains. Report the final elapsed time, and if the achieved goal has a token budget, report the final consumed tokens.
 
 If the goal cannot continue productively, rewrite .claude/goal.json with status "unmet" and explain the blocker or required input. Do not mark a goal achieved merely because a budget is nearly exhausted or because you are stopping work.
+
+(Goal state file is at: ${GOAL_FILE})
 EOF
 )
 

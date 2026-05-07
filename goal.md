@@ -33,7 +33,7 @@ Without the Stop hook, the user advances the loop manually by running `/goal` (n
 
 ## Current state on disk
 
-!`if [ -d .claude ] || mkdir -p .claude 2>/dev/null; then if [ -f .claude/goal.json ]; then cat .claude/goal.json; else echo NO_GOAL; fi; else echo CLAUDE_DIR_UNWRITABLE; fi`
+!`d="$PWD"; while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do if [ -f "$d/.claude/goal.json" ]; then echo "GOAL_ROOT=$d"; cat "$d/.claude/goal.json"; exit 0; fi; d=$(dirname "$d"); done; mkdir -p .claude 2>/dev/null && echo NO_GOAL || echo CLAUDE_DIR_UNWRITABLE`
 
 ## Current UTC timestamp
 

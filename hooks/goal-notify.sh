@@ -9,15 +9,28 @@
 # the goal naturally stops anyway (no Stop hook fires while the API is
 # unreachable), and resumes when the runtime recovers.
 #
-# Requires: bash 3.2+, jq.
+# Resolves goal state by walking up from $PWD. Requires bash 3.2+, jq.
 
 set -euo pipefail
 
-GOAL_FILE=".claude/goal.json"
-LOG_FILE=".claude/goal-hook.log"
+find_goal_root() {
+    local d="${1:-$PWD}"
+    while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do
+        if [ -f "$d/.claude/goal.json" ]; then
+            printf '%s' "$d"
+            return
+        fi
+        d=$(dirname "$d")
+    done
+}
+
+GOAL_ROOT=$(find_goal_root "$PWD")
+[ -n "$GOAL_ROOT" ] || exit 0
+
+GOAL_FILE="$GOAL_ROOT/.claude/goal.json"
+LOG_FILE="$GOAL_ROOT/.claude/goal-hook.log"
 
 [ -L "$GOAL_FILE" ] && exit 0
-[ -f "$GOAL_FILE" ] || exit 0
 
 INPUT=$(cat || printf '')
 INPUT=${INPUT:-\{\}}
@@ -25,7 +38,6 @@ INPUT=${INPUT:-\{\}}
 STATUS=$(jq -r '.status // ""' "$GOAL_FILE" 2>/dev/null) || exit 0
 [ "$STATUS" = "pursuing" ] || exit 0
 
-# Concatenate the notification's message + title so a single grep can match either.
 MESSAGE=$(printf '%s' "$INPUT" | jq -r '((.message // "") + " " + (.title // "") + " " + (.notification_type // ""))' 2>/dev/null) || MESSAGE=""
 [ -z "$MESSAGE" ] && exit 0
 
@@ -41,7 +53,7 @@ case "$MESSAGE" in
 esac
 
 NOW=$(date -u +%FT%TZ)
-TMP=$(mktemp .claude/goal.json.XXXXXX) || exit 0
+TMP=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || exit 0
 if jq --arg ts "$NOW" --arg r "$reason" \
      '.status = "paused"
       | .updated_at = $ts
@@ -52,7 +64,7 @@ else
     rm -f "$TMP"
 fi
 
-[ -d .claude ] && {
+{
     printf '{"ts":"%s","pid":%d,"hook":"notify","event":"auto-pause-error","note":%s}\n' \
         "$NOW" "$$" \
         "$(printf '%s' "$reason" | jq -Rs . 2>/dev/null || printf '""')" \

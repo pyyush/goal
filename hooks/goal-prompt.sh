@@ -10,20 +10,31 @@
 #
 # Opt in to Codex-style auto-pause-on-input by exporting:
 #   export GOAL_AUTOPAUSE_ON_PROMPT=1
-# (in your shell, or under settings.json `env`).
 #
-# Requires: bash 3.2+, jq.
+# Resolves goal state by walking up from $PWD. Requires bash 3.2+, jq.
 
 set -euo pipefail
 
-# Subscription-first default: do nothing unless explicitly enabled.
 [ "${GOAL_AUTOPAUSE_ON_PROMPT:-0}" = "1" ] || exit 0
 
-GOAL_FILE=".claude/goal.json"
-LOG_FILE=".claude/goal-hook.log"
+find_goal_root() {
+    local d="${1:-$PWD}"
+    while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do
+        if [ -f "$d/.claude/goal.json" ]; then
+            printf '%s' "$d"
+            return
+        fi
+        d=$(dirname "$d")
+    done
+}
+
+GOAL_ROOT=$(find_goal_root "$PWD")
+[ -n "$GOAL_ROOT" ] || exit 0
+
+GOAL_FILE="$GOAL_ROOT/.claude/goal.json"
+LOG_FILE="$GOAL_ROOT/.claude/goal-hook.log"
 
 log() {
-    [ -d .claude ] || return 0
     {
         printf '{"ts":"%s","pid":%d,"hook":"prompt","event":"%s","note":%s}\n' \
             "$(date -u +%FT%TZ)" "$$" "$1" \
@@ -34,8 +45,7 @@ log() {
 write_pause() {
     local now tmp
     now=$(date -u +%FT%TZ)
-    [ -d .claude ] || return 0
-    tmp=$(mktemp ".claude/goal.json.XXXXXX") || return 0
+    tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
     if jq --arg ts "$now" \
          '.status = "paused"
           | .updated_at = $ts
@@ -51,7 +61,6 @@ INPUT=$(cat || printf '')
 INPUT=${INPUT:-\{\}}
 
 [ -L "$GOAL_FILE" ] && exit 0
-[ -f "$GOAL_FILE" ] || exit 0
 
 STATUS=$(jq -r '.status // ""' "$GOAL_FILE" 2>/dev/null) || STATUS=""
 [ "$STATUS" = "pursuing" ] || exit 0

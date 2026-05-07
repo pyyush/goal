@@ -4,9 +4,13 @@
 # Helper for the Claude Code statusLine — outputs a single colored segment
 # describing the active /goal status (or nothing if no goal is set).
 #
+# Walks up from the given directory to find the nearest enclosing
+# .claude/goal.json (so a goal set in a parent directory is visible from
+# any sub-directory of that project). Stops at $HOME.
+#
 # Designed to be called from your statusLine command. Pass the project's
 # working directory as the first argument (the statusLine input JSON has
-# this as `.cwd`). Example, from your existing statusline-command.sh:
+# this as `.cwd`):
 #
 #   goal_seg=$(bash "$HOME/.claude/hooks/goal-statusline.sh" "$cwd")
 #   [ -n "$goal_seg" ] && segments+=("$goal_seg")
@@ -15,11 +19,22 @@
 
 set -euo pipefail
 
-CWD="${1:-$PWD}"
-GOAL_FILE="$CWD/.claude/goal.json"
+find_goal_root() {
+    local d="${1:-$PWD}"
+    while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do
+        if [ -f "$d/.claude/goal.json" ]; then
+            printf '%s' "$d"
+            return
+        fi
+        d=$(dirname "$d")
+    done
+}
 
+GOAL_ROOT=$(find_goal_root "${1:-$PWD}")
+[ -n "$GOAL_ROOT" ] || exit 0
+
+GOAL_FILE="$GOAL_ROOT/.claude/goal.json"
 [ -L "$GOAL_FILE" ] && exit 0
-[ -f "$GOAL_FILE" ] || exit 0
 
 SHAPE=$(jq -r '
     if (type == "object" and (.status | type) == "string") then
@@ -40,12 +55,10 @@ SHAPE=$(jq -r '
 
 IFS=$'\t' read -r STATUS TOKEN_BUDGET TOKENS_USED TICK_COUNT TIME_USED <<<"$SHAPE"
 
-# Numeric guard
 case "$TIME_USED" in
     ''|*[!0-9]*) TIME_USED=0 ;;
 esac
 
-# Compact human-readable elapsed string: "12s" | "5m" | "1h23m" | "2d4h"
 fmt_elapsed() {
     local s="$1"
     if [ "$s" -lt 60 ]; then
