@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 # .claude/hooks/goal-prompt.sh
 #
-# UserPromptSubmit hook for /goal — auto-pauses an active goal when the user
-# submits a non-/goal prompt. Mirrors the spirit of Codex's pause-on-interrupt
-# behavior: your input takes priority over the loop, and the goal is paused
-# (not abandoned) so you can resume it explicitly.
+# UserPromptSubmit hook for /goal — opt-in auto-pause.
 #
-# Optional. Skip this hook if you prefer your input to be treated as
-# refinement during pursuit rather than an interrupt.
+# Subscription-first default: this hook does NOTHING unless you opt in.
+# The goal keeps moving across user prompts; the model interleaves your
+# input with goal continuation and the loop survives /clear and auto-
+# compaction transparently.
+#
+# Opt in to Codex-style auto-pause-on-input by exporting:
+#   export GOAL_AUTOPAUSE_ON_PROMPT=1
+# (in your shell, or under settings.json `env`).
 #
 # Requires: bash 3.2+, jq.
 
 set -euo pipefail
+
+# Subscription-first default: do nothing unless explicitly enabled.
+[ "${GOAL_AUTOPAUSE_ON_PROMPT:-0}" = "1" ] || exit 0
 
 GOAL_FILE=".claude/goal.json"
 LOG_FILE=".claude/goal-hook.log"
@@ -44,24 +50,17 @@ write_pause() {
 INPUT=$(cat || printf '')
 INPUT=${INPUT:-\{\}}
 
-# Refuse to follow symlinks.
 [ -L "$GOAL_FILE" ] && exit 0
-
 [ -f "$GOAL_FILE" ] || exit 0
 
 STATUS=$(jq -r '.status // ""' "$GOAL_FILE" 2>/dev/null) || STATUS=""
 [ "$STATUS" = "pursuing" ] || exit 0
 
 PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt // ""' 2>/dev/null) || PROMPT=""
-
-# Trim leading/trailing whitespace.
 PROMPT_TRIMMED=$(printf '%s' "$PROMPT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
-# Skip on empty/whitespace-only prompt — don't auto-pause spurious submits.
 [ -z "$PROMPT_TRIMMED" ] && exit 0
 
-# Don't auto-pause when user is invoking /goal itself — that's intentional
-# lifecycle control. Match exactly `/goal` or `/goal <args>`, not `/goalish`.
 case "$PROMPT_TRIMMED" in
     /goal) exit 0 ;;
     /goal[[:space:]]*) exit 0 ;;

@@ -7,16 +7,16 @@
 # Requires: bash 3.2+, jq.
 #
 # Hard ceilings (override via env to tune runaway protection):
-#   GOAL_MAX_TICKS    max continuation cycles per goal (default 50)
-#   GOAL_MAX_SECONDS  max wall-clock seconds per goal (default 7200 = 2h)
+#   GOAL_MAX_TICKS    max continuation cycles per goal (default 200)
+#   GOAL_MAX_SECONDS  max wall-clock seconds per goal (default 28800 = 8h)
 
 set -euo pipefail
 
 GOAL_FILE=".claude/goal.json"
 LOG_FILE=".claude/goal-hook.log"
 KILL_SWITCH=".claude/goal.pause"
-MAX_TICKS=${GOAL_MAX_TICKS:-50}
-MAX_SECONDS=${GOAL_MAX_SECONDS:-7200}
+MAX_TICKS=${GOAL_MAX_TICKS:-200}
+MAX_SECONDS=${GOAL_MAX_SECONDS:-28800}
 
 # ----- helpers ---------------------------------------------------------------
 
