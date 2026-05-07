@@ -1,0 +1,5 @@
+# Per-project /goal state — never commit
+.claude/goal.json
+
+# macOS
+.DS_Store
