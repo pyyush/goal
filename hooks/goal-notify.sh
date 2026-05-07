@@ -25,6 +25,9 @@ resolve_goal "$SESSION_ID" "${SESSION_CWD:-$PWD}" || exit 0
 STATUS=$(jq -r '.status // ""' "$GOAL_FILE" 2>/dev/null) || exit 0
 [ "$STATUS" = "pursuing" ] || exit 0
 
+# Capture goal_id for CAS check on write.
+GOAL_ID=$(jq -r '.goal_id // ""' "$GOAL_FILE" 2>/dev/null) || GOAL_ID=""
+
 MESSAGE=$(printf '%s' "$INPUT" | jq -r '((.message // "") + " " + (.title // "") + " " + (.notification_type // ""))' 2>/dev/null) || MESSAGE=""
 [ -z "$MESSAGE" ] && exit 0
 
@@ -41,10 +44,12 @@ esac
 
 NOW=$(date -u +%FT%TZ)
 TMP=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || exit 0
-if jq --arg ts "$NOW" --arg r "$reason" \
-     '.status = "paused"
-      | .updated_at = $ts
-      | .history = ((.history // []) + [{ts: $ts, action: "auto-pause-error", note: $r}])' \
+if jq --arg ts "$NOW" --arg r "$reason" --arg gid "$GOAL_ID" \
+     'if (.goal_id // "") == $gid then
+          .status = "paused"
+          | .updated_at = $ts
+          | .history = ((.history // []) + [{ts: $ts, action: "auto-pause-error", note: $r}])
+      else . end' \
      "$GOAL_FILE" > "$TMP" 2>/dev/null; then
     mv "$TMP" "$GOAL_FILE"
 else

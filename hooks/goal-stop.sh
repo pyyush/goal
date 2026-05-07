@@ -59,14 +59,28 @@ emit_block() {
     jq -n --arg reason "$1" '{decision: "block", reason: $reason}'
 }
 
+# CAS guard: refuse to write if the on-disk goal_id has changed since we
+# read SHAPE. Protects against the model replacing the goal mid-flight.
+goal_id_matches() {
+    local on_disk
+    on_disk=$(jq -r '.goal_id // ""' "$GOAL_FILE" 2>/dev/null)
+    [ "$on_disk" = "${GOAL_ID:-}" ]
+}
+
 write_state() {
     local status="$1" action="$2" note="$3" now tmp
+    if ! goal_id_matches; then
+        log "stale-write-rejected" "write_state status=$status (goal_id changed)"
+        return 1
+    fi
     now=$(date -u +%FT%TZ)
     tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
-    if jq --arg ts "$now" --arg s "$status" --arg a "$action" --arg n "$note" \
-         '.status = $s
-          | .updated_at = $ts
-          | .history = ((.history // []) + [{ts: $ts, action: $a, note: $n}])' \
+    if jq --arg ts "$now" --arg s "$status" --arg a "$action" --arg n "$note" --arg gid "${GOAL_ID:-}" \
+         'if (.goal_id // "") == $gid then
+              .status = $s
+              | .updated_at = $ts
+              | .history = ((.history // []) + [{ts: $ts, action: $a, note: $n}])
+          else . end' \
          "$GOAL_FILE" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$GOAL_FILE"
     else
@@ -76,10 +90,16 @@ write_state() {
 
 increment_tick() {
     local new_tick="$1" now tmp
+    if ! goal_id_matches; then
+        log "stale-write-rejected" "increment_tick (goal_id changed)"
+        return 1
+    fi
     now=$(date -u +%FT%TZ)
     tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
-    if jq --arg ts "$now" --argjson t "$new_tick" \
-         '.tick_count = $t | .updated_at = $ts' \
+    if jq --arg ts "$now" --argjson t "$new_tick" --arg gid "${GOAL_ID:-}" \
+         'if (.goal_id // "") == $gid then
+              .tick_count = $t | .updated_at = $ts
+          else . end' \
          "$GOAL_FILE" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$GOAL_FILE"
     else
@@ -118,7 +138,8 @@ SHAPE=$(jq -r '
           (if (.created_at // null | type) == "string"
             then ((now - (.created_at | fromdateiso8601)) | floor | tostring)
             else "0"
-          end)
+          end),
+          (.goal_id // "")
         ] | @tsv
     else "MALFORMED"
     end
@@ -129,7 +150,7 @@ if [ "$SHAPE" = "MALFORMED" ]; then
     exit 0
 fi
 
-IFS=$'\t' read -r STATUS OBJECTIVE TOKEN_BUDGET TOKENS_USED TICK_COUNT TIME_USED <<<"$SHAPE"
+IFS=$'\t' read -r STATUS OBJECTIVE TOKEN_BUDGET TOKENS_USED TICK_COUNT TIME_USED GOAL_ID <<<"$SHAPE"
 
 if [ "$STATUS" != "pursuing" ]; then
     log "not-pursuing" "$STATUS"

@@ -37,13 +37,16 @@ log() {
 }
 
 write_pause() {
-    local now tmp
+    local now tmp gid
     now=$(date -u +%FT%TZ)
+    gid=$(jq -r '.goal_id // ""' "$GOAL_FILE" 2>/dev/null) || gid=""
     tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
-    if jq --arg ts "$now" \
-         '.status = "paused"
-          | .updated_at = $ts
-          | .history = ((.history // []) + [{ts: $ts, action: "auto-pause", note: "user submitted new prompt"}])' \
+    if jq --arg ts "$now" --arg gid "$gid" \
+         'if (.goal_id // "") == $gid then
+              .status = "paused"
+              | .updated_at = $ts
+              | .history = ((.history // []) + [{ts: $ts, action: "auto-pause", note: "user submitted new prompt"}])
+          else . end' \
          "$GOAL_FILE" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$GOAL_FILE"
     else

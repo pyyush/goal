@@ -26,7 +26,7 @@ That's it. The model continues working on the goal across every turn until it au
 - **Auto-continuation.** A Stop hook injects a continuation prompt after every turn while the goal is `pursuing`, mirroring Codex's app-server runtime.
 - **Subscription-friendly defaults.** No token budget, no time limit. The goal keeps moving until it's done.
 - **Auto-pause on errors.** A Notification hook detects rate-limit / quota / 5xx / overload / auth / timeout patterns and pauses the goal cleanly.
-- **Status line indicator.** A drop-in helper for your statusLine command that shows `Goal pursuing (tick 7)` / `Goal paused (/goal resume)` etc., colored to match Codex's TUI affordance.
+- **Status line indicator.** A drop-in helper for your statusLine command that shows `Pursuing goal (5m)` / `Goal paused (/goal resume)` / `Goal achieved (1h23m)` etc. — exact label wording from Codex's TUI bottom-pane indicator, single magenta color (theme-adaptive ANSI 35), compact token formatting (`12.5K / 50K`).
 - **Kill switch.** `touch .claude/goal.pause` halts the loop instantly from any terminal.
 - **Single-objective audit.** Before claiming `achieved`, the model is forced to build a prompt-to-artifact checklist mapping every requirement to concrete evidence — no false positives from "I implemented it" intuition.
 
@@ -120,16 +120,33 @@ The state file (`.claude/goal.json`) is per-project regardless of where the hook
 
 ### Status line indicator
 
-To see `Goal pursuing` / `Goal paused (/goal resume)` on your status line à la Codex, append to your existing statusLine command (typically `~/.claude/statusline-command.sh`):
+The helper outputs a single colored segment matching Codex's TUI labels exactly:
+
+| State | Label |
+|---|---|
+| `pursuing` (no budget) | `Pursuing goal (5m)` |
+| `pursuing` (with budget) | `Pursuing goal (12.5K / 50K)` |
+| `paused` | `Goal paused (/goal resume)` |
+| `achieved` | `Goal achieved (1h23m)` |
+| `unmet` *(port-only)* | `Goal unmet (/goal status)` |
+| `budget-limited` | `Goal abandoned (50K / 50K)` |
+
+Color: a single magenta (named ANSI 35) for every state — same as Codex, and theme-adaptive (terminals remap named ANSI to be readable on both dark and light backgrounds, so it works on either).
+
+Set `GOAL_STATUSLINE_STYLE=dim` for a softer, reference-style look (`\033[2;35m`), or `GOAL_STATUSLINE_STYLE=plain` for monochrome.
+
+To wire it in, append to your existing statusLine command (typically `~/.claude/statusline-command.sh`):
 
 ```bash
 if [ -x "$HOME/.claude/hooks/goal-statusline.sh" ]; then
-    goal_seg=$(bash "$HOME/.claude/hooks/goal-statusline.sh" "$cwd" 2>/dev/null)
+    cwd=$(echo "$input" | jq -r '.cwd // ""')
+    sid=$(echo "$input" | jq -r '.session_id // ""')
+    goal_seg=$(bash "$HOME/.claude/hooks/goal-statusline.sh" "$cwd" "$sid" 2>/dev/null)
     [ -n "$goal_seg" ] && segments+=("$goal_seg")
 fi
 ```
 
-(The variable names assume you've parsed `cwd` from the statusLine input JSON and you're collecting `segments` to join. Adjust to match your existing script.)
+(Adapt variable names to match your existing script — `$input` is the JSON Claude Code passes to your statusLine, `$cwd` is the session's working directory, `$sid` is the session UUID. Passing `sid` enables sticky goal lookup across `/cwd` shifts via the session pointer file.)
 
 If you don't have a statusLine command yet, set one up via `/statusline` inside Claude Code, or set `statusLine.command` in your `settings.json`.
 
@@ -176,6 +193,7 @@ The state file lives on disk, independent of conversation context. Most disrupti
 4. **Recursion guard** — the Stop hook respects `stop_hook_active` to prevent tight recursion within a chain.
 5. **Atomic state writes** — same-filesystem `mktemp` + `mv` so concurrent or crashed writes can't truncate `goal.json`.
 6. **Symlink refusal** — the hook refuses to follow a symlinked `goal.json`.
+7. **`goal_id` CAS** — every goal has a UUID stamped on it at create/replace. All hook write paths assert the on-disk `goal_id` still matches the one they read at hook entry; if the goal was replaced mid-flight, the stale write is dropped and logged. Modeled on Codex's `goal_id` versioning in `state/src/runtime/goals.rs`.
 
 ### Observability
 
@@ -220,9 +238,12 @@ The Stop hook is the engine: when a turn ends with `status="pursuing"`, the hook
 | Auto-pause trigger | Explicit user interrupt (`Ctrl-C` mid-turn) | Notification hook on rate-limit / API errors; opt-in pause-on-every-prompt |
 | `unmet` state | Not a Codex state | Used here for hard-blocked goals |
 | Subcommands | `pause`, `resume`, `clear` only | Plus `status`, `achieved`, `unmet`, `budget` |
-| Status writes | Model can only mark `complete` via `update_goal` | Model writes status directly to `.claude/goal.json` |
+| Status writes | Model can only mark `complete` via `update_goal` tool | Model writes status directly to `.claude/goal.json` (rule-enforced via dispatch instructions; `goal_id` CAS catches stale writes) |
 | Multiple concurrent goals | One per thread | One per project (file-based) |
 | Hard ceilings | None (runtime-bounded) | Optional, off by default |
+| Status-line label | "Pursuing goal", "Goal paused (/goal resume)", "Goal achieved", "Goal abandoned" | **Same wording**, magenta color (single-color match), via `hooks/goal-statusline.sh` |
+| Plan mode | Continuation suppressed | No equivalent — Claude Code hooks have no Plan-mode signal |
+| Concurrency | `goal_id` CAS in SQL UPDATE; per-thread row | `goal_id` CAS in jq filters; per-project file with same-FS atomic writes |
 
 ## File layout (project scope)
 
