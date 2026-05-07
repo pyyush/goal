@@ -1,5 +1,7 @@
-# Per-project /goal state — never commit
+# Per-project /goal runtime artifacts — never commit
 .claude/goal.json
+.claude/goal-hook.log
+.claude/goal.pause
 
 # macOS
 .DS_Store
