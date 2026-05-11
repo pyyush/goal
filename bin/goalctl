@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+# goalctl — headless CLI for the /goal state file.
+#
+# Approximates Codex CLI's app-server thread_goal_processor (JSON-RPC):
+# create / get / status / pause / resume / clear / set-budget / mark-unmet
+# all operate on .claude/goal.json directly, so external orchestrators
+# (CI jobs, multi-agent runners, IDE integrations) can drive a goal
+# without owning a Claude Code session.
+#
+# Resolution: walks up from $PWD to find .claude/goal.json, stopping at
+# $HOME. Use --root <dir> to override.
+#
+# Requires: bash 3.2+, jq, uuidgen (or /proc/sys/kernel/random/uuid).
+
+set -euo pipefail
+
+die() { printf 'goalctl: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+usage: goalctl <command> [args]
+
+commands:
+  create <objective> [--budget N]   set a new goal (fails if one exists)
+  replace <objective> [--budget N]  overwrite the existing goal
+  get [--json]                      print goal.json (--json: raw JSON, same effect)
+  status [--json]                   print a one-line status (--json: structured object)
+  pause                             set status=paused
+  resume                            set status=pursuing
+  clear                             delete the goal file
+  set-budget <N>                    update token_budget (positive int or 'none')
+  mark-achieved                     set status=achieved (skips audit — caller-owned)
+  mark-unmet [note]                 set status=unmet with optional note
+  listen [--grep PAT] [--since ISO] tail .claude/goal-events.jsonl
+  serve-http [--port N]             local HTTP shim (loopback only, default 7474)
+
+options:
+  --root <dir>     use <dir>/.claude/goal.json instead of walking up
+  --json           machine-readable output (applies to: get, status)
+EOF
+}
+
+# ---- arg parsing -----------------------------------------------------------
+
+ROOT_OVERRIDE=""
+JSON_OUTPUT=0
+ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root) ROOT_OVERRIDE="$2"; shift 2 ;;
+        --json) JSON_OUTPUT=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) ARGS+=("$1"); shift ;;
+    esac
+done
+
+[ "${#ARGS[@]}" -eq 0 ] && { usage; exit 1; }
+CMD="${ARGS[0]}"
+ARGS=("${ARGS[@]:1}")
+
+# ---- resolve root ----------------------------------------------------------
+
+resolve_root() {
+    if [ -n "$ROOT_OVERRIDE" ]; then
+        [ -d "$ROOT_OVERRIDE" ] || die "--root: not a directory: $ROOT_OVERRIDE"
+        printf '%s' "$ROOT_OVERRIDE"
+        return
+    fi
+    local d="$PWD"
+    while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do
+        if [ -f "$d/.claude/goal.json" ] && [ ! -L "$d/.claude/goal.json" ]; then
+            printf '%s' "$d"
+            return
+        fi
+        d=$(dirname "$d")
+    done
+    # No existing goal found — for create/listen/serve-http, use $PWD. Else fail.
+    case "$CMD" in
+        create|listen|serve-http) printf '%s' "$PWD" ;;
+        *) die "no .claude/goal.json found (walked up from $PWD). Did you mean: goalctl create <objective>?" ;;
+    esac
+}
+
+ROOT=$(resolve_root)
+FILE="$ROOT/.claude/goal.json"
+NOW=$(date -u +%FT%TZ)
+
+# ---- helpers ---------------------------------------------------------------
+
+new_uuid() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr 'A-Z' 'a-z'
+    elif [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        # Fallback: not RFC4122 but unique enough.
+        printf '%08x-%04x-%04x-%04x-%012x' \
+            $((RANDOM*RANDOM)) $RANDOM $RANDOM $RANDOM $((RANDOM*RANDOM*RANDOM))
+    fi
+}
+
+read_field() { jq -r "$1 // empty" "$FILE" 2>/dev/null; }
+
+# Cross-writer mutex shared with the MCP server (proper-lockfile) and hooks.
+# Discover goal-lock.sh in this order:
+#   1. $GOAL_LOCK_SH (explicit override)
+#   2. <repo>/hooks/goal-lock.sh (in-repo layout: bin/ and hooks/ are siblings)
+#   3. ~/.claude/hooks/goal-lock.sh (user-scope install)
+# If none found, fall back to no-op locking (logged to stderr).
+__GOAL_LOCK_FOUND=0
+if [ -n "${GOAL_LOCK_SH:-}" ] && [ -r "$GOAL_LOCK_SH" ]; then
+    # shellcheck disable=SC1090
+    . "$GOAL_LOCK_SH"; __GOAL_LOCK_FOUND=1
+else
+    __GC_DIR="$(cd "$(dirname "$0")" && pwd)"
+    for __cand in "$__GC_DIR/../hooks/goal-lock.sh" "$HOME/.claude/hooks/goal-lock.sh"; do
+        if [ -r "$__cand" ]; then
+            # shellcheck disable=SC1090
+            . "$__cand"; __GOAL_LOCK_FOUND=1; break
+        fi
+    done
+fi
+if [ "$__GOAL_LOCK_FOUND" -eq 0 ]; then
+    printf 'goalctl: warning — goal-lock.sh not found; concurrent writes may lose updates\n' >&2
+    goal_lock_acquire() { return 0; }
+    goal_lock_release() { :; }
+fi
+
+write_state() {
+    # $1 = jq filter that mutates ., applied to current file.
+    local tmp
+    if ! goal_lock_acquire "$ROOT"; then
+        die "could not acquire goal lock (held by another writer for >${GOAL_LOCK_TIMEOUT_MS:-5000}ms)"
+    fi
+    # Belt-and-suspenders cleanup so an unexpected exit releases the lock.
+    trap 'goal_lock_release "$ROOT"' EXIT INT TERM
+    tmp=$(mktemp "$ROOT/.claude/goal.json.XXXXXX")
+    if jq --arg ts "$NOW" "$1" "$FILE" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$FILE"
+    else
+        rm -f "$tmp"
+        goal_lock_release "$ROOT"
+        trap - EXIT INT TERM
+        die "jq filter failed; goal.json unchanged"
+    fi
+    goal_lock_release "$ROOT"
+    trap - EXIT INT TERM
+}
+
+ensure_exists() {
+    [ -f "$FILE" ] || die "no goal at $FILE"
+}
+
+ensure_dir() {
+    mkdir -p "$ROOT/.claude" 2>/dev/null || true
+}
+
+append_history() {
+    # $1=action $2=note
+    write_state ".history = ((.history // []) + [{ts: \$ts, action: \"$1\", note: \"$2\"}]) | .updated_at = \$ts"
+}
+
+# ---- commands --------------------------------------------------------------
+
+case "$CMD" in
+
+create|replace)
+    OBJECTIVE="${ARGS[0]:-}"
+    [ -z "$OBJECTIVE" ] && die "create: objective required"
+    BUDGET="null"
+    if [ "${ARGS[1]:-}" = "--budget" ]; then
+        BUDGET="${ARGS[2]:-}"
+        [[ "$BUDGET" =~ ^[1-9][0-9]*$ ]] || die "--budget must be a positive integer"
+    fi
+    if [ "$CMD" = "create" ] && [ -f "$FILE" ]; then
+        STATUS=$(read_field '.status')
+        case "$STATUS" in
+            pursuing|paused) die "a $STATUS goal already exists; use 'goalctl replace' to overwrite or 'clear' first" ;;
+        esac
+    fi
+    ensure_dir
+    NEW_ID=$(new_uuid)
+    OLD_OBJ=""
+    [ -f "$FILE" ] && OLD_OBJ=$(read_field '.objective')
+    ACTION="create"
+    [ -n "$OLD_OBJ" ] && ACTION="replace"
+    # Clear stale baseline files from previous goal_id (the Stop hook
+    # writes one per goal_id; replacing leaves orphans).
+    rm -f "$ROOT/.claude/goal-baseline-"* 2>/dev/null || true
+    jq -n --arg gid "$NEW_ID" --arg obj "$OBJECTIVE" --arg ts "$NOW" \
+          --argjson budget "$BUDGET" --arg action "$ACTION" \
+        '{goal_id: $gid, objective: $obj, status: "pursuing",
+          created_at: $ts, updated_at: $ts,
+          token_budget: $budget, tokens_used: 0, tick_count: 0,
+          history: [{ts: $ts, action: $action, note: "via goalctl"}]}' > "$FILE"
+    printf 'goal %s: %s\n' "$ACTION" "$NEW_ID"
+    ;;
+
+get)
+    ensure_exists
+    # `get` already emits raw goal.json. `--json` is accepted for symmetry; it
+    # ensures jq-validated pretty output rather than the file's literal bytes.
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        jq '.' "$FILE"
+    else
+        cat "$FILE"
+    fi
+    ;;
+
+status)
+    ensure_exists
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        # Structured status object with computed fields.
+        # remaining_tokens: token_budget - tokens_used (or null if no budget)
+        # elapsed_seconds: now - created_at (UTC)
+        # last_action / last_note: from the tail of .history (or null)
+        NOW_EPOCH=$(date -u +%s)
+        jq --argjson now "$NOW_EPOCH" '
+            . as $g
+            | (try ($g.created_at | fromdateiso8601) catch null) as $created
+            | {
+                objective: $g.objective,
+                status: $g.status,
+                created_at: $g.created_at,
+                updated_at: $g.updated_at,
+                token_budget: $g.token_budget,
+                tokens_used: ($g.tokens_used // 0),
+                remaining_tokens: (if $g.token_budget == null then null
+                                   else ($g.token_budget - ($g.tokens_used // 0)) end),
+                elapsed_seconds: (if $created == null then null
+                                  else ($now - ($created | floor)) end),
+                tick_count: ($g.tick_count // 0),
+                last_action: ($g.history // [] | last | .action // null),
+                last_note: ($g.history // [] | last | .note // null)
+              }
+        ' "$FILE"
+    else
+        jq -r '
+          "Goal: \(.objective[:80])\(if (.objective | length) > 80 then "..." else "" end)
+Status: \(.status)
+Set: \(.created_at)
+Tokens: \(.tokens_used)\(if .token_budget then " / \(.token_budget)" else " (no budget)" end)
+Ticks: \(.tick_count // 0)"
+        ' "$FILE"
+    fi
+    ;;
+
+pause)
+    ensure_exists
+    [ "$(read_field '.status')" = "pursuing" ] || die "can only pause a pursuing goal (current: $(read_field '.status'))"
+    append_history "pause" "via goalctl"
+    write_state '.status = "paused"'
+    printf 'paused\n'
+    ;;
+
+resume)
+    ensure_exists
+    [ "$(read_field '.status')" = "paused" ] || die "can only resume a paused goal (current: $(read_field '.status'))"
+    append_history "resume" "via goalctl"
+    write_state '.status = "pursuing"'
+    printf 'resumed\n'
+    ;;
+
+clear)
+    ensure_exists
+    rm -f "$FILE"
+    rm -f "$ROOT/.claude/goal-baseline-"* 2>/dev/null || true
+    printf 'cleared\n'
+    ;;
+
+set-budget)
+    ensure_exists
+    VAL="${ARGS[0]:-}"
+    [ -z "$VAL" ] && die "set-budget: value required (positive int or 'none')"
+    if [ "$VAL" = "none" ] || [ "$VAL" = "null" ]; then
+        append_history "set-budget" "cleared"
+        write_state '.token_budget = null'
+        printf 'budget cleared\n'
+    else
+        [[ "$VAL" =~ ^[1-9][0-9]*$ ]] || die "set-budget: must be a positive integer or 'none'"
+        append_history "set-budget" "$VAL"
+        write_state ".token_budget = ($VAL | tonumber)"
+        printf 'budget set to %s\n' "$VAL"
+    fi
+    ;;
+
+mark-achieved)
+    ensure_exists
+    append_history "mark-achieved" "via goalctl"
+    write_state '.status = "achieved"'
+    printf 'marked achieved\n'
+    ;;
+
+mark-unmet)
+    ensure_exists
+    NOTE="${ARGS[*]:-via goalctl}"
+    NOTE_ESC=$(printf '%s' "$NOTE" | jq -Rs .)
+    append_history "mark-unmet" "$(printf '%s' "$NOTE" | sed 's/"/\\"/g')"
+    write_state '.status = "unmet"'
+    printf 'marked unmet\n'
+    ;;
+
+listen)
+    # tail -F .claude/goal-events.jsonl with optional --grep and --since.
+    # Args supported (consumed from ARGS):
+    #   --grep <pattern>    grep -E filter on lines as they arrive
+    #   --since <iso8601>   print existing lines whose .ts >= since, then tail
+    ensure_dir
+    EVENTS_FILE="$ROOT/.claude/goal-events.jsonl"
+    [ -f "$EVENTS_FILE" ] || : > "$EVENTS_FILE"
+
+    GREP_PAT=""
+    SINCE_ISO=""
+    i=0
+    while [ "$i" -lt "${#ARGS[@]}" ]; do
+        case "${ARGS[$i]}" in
+            --grep)
+                GREP_PAT="${ARGS[$((i+1))]:-}"
+                [ -z "$GREP_PAT" ] && die "listen --grep: pattern required"
+                i=$((i+2))
+                ;;
+            --since)
+                SINCE_ISO="${ARGS[$((i+1))]:-}"
+                [ -z "$SINCE_ISO" ] && die "listen --since: ISO8601 timestamp required"
+                i=$((i+2))
+                ;;
+            *)
+                die "listen: unknown arg: ${ARGS[$i]}"
+                ;;
+        esac
+    done
+
+    # Backfill --since events (best-effort: filter existing lines by .ts >= since).
+    if [ -n "$SINCE_ISO" ]; then
+        # Validate ISO and grab any existing events whose ts >= since.
+        if [ -s "$EVENTS_FILE" ]; then
+            BACKFILL=$(jq -rR --arg since "$SINCE_ISO" '
+                . as $line
+                | (try (fromjson) catch null) as $obj
+                | if $obj == null then empty
+                  else
+                    (try ($obj.ts | fromdateiso8601) catch null) as $t
+                    | (try ($since | fromdateiso8601) catch null) as $s
+                    | if $t == null or $s == null or $t >= $s then $line else empty end
+                  end
+            ' "$EVENTS_FILE" 2>/dev/null || true)
+            if [ -n "$BACKFILL" ]; then
+                if [ -n "$GREP_PAT" ]; then
+                    printf '%s\n' "$BACKFILL" | grep -E "$GREP_PAT" || true
+                else
+                    printf '%s\n' "$BACKFILL"
+                fi
+            fi
+        fi
+        # Now tail only NEW lines (-n 0).
+        if [ -n "$GREP_PAT" ]; then
+            exec tail -n 0 -F "$EVENTS_FILE" | grep --line-buffered -E "$GREP_PAT"
+        else
+            exec tail -n 0 -F "$EVENTS_FILE"
+        fi
+    fi
+
+    if [ -n "$GREP_PAT" ]; then
+        exec tail -F "$EVENTS_FILE" | grep --line-buffered -E "$GREP_PAT"
+    else
+        exec tail -F "$EVENTS_FILE"
+    fi
+    ;;
+
+serve-http)
+    # Hand off to the Node HTTP shim.
+    PORT=7474
+    i=0
+    while [ "$i" -lt "${#ARGS[@]}" ]; do
+        case "${ARGS[$i]}" in
+            --port)
+                PORT="${ARGS[$((i+1))]:-}"
+                [ -z "$PORT" ] && die "serve-http --port: value required"
+                i=$((i+2))
+                ;;
+            *)
+                die "serve-http: unknown arg: ${ARGS[$i]}"
+                ;;
+        esac
+    done
+    [[ "$PORT" =~ ^[1-9][0-9]*$ ]] || die "serve-http: --port must be a positive integer"
+    [ "$PORT" -lt 65536 ] || die "serve-http: --port must be < 65536"
+    ensure_dir
+    SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+    HTTP_SCRIPT="$SCRIPT_DIR/goal-http-server.ts"
+    [ -f "$HTTP_SCRIPT" ] || die "goal-http-server.ts not found at $HTTP_SCRIPT"
+    if ! command -v npx >/dev/null 2>&1; then
+        die "npx not found; install Node.js (>=18) to use 'goalctl serve-http'"
+    fi
+    exec npx tsx "$HTTP_SCRIPT" --port "$PORT" --root "$ROOT"
+    ;;
+
+*)
+    usage
+    die "unknown command: $CMD"
+    ;;
+esac

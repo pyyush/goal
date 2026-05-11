@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# goal-setup — one-command interactive installer for /goal.
+#
+# Replaces the manual sequence:
+#   ./install.sh user
+#   (cd mcp && npm install && npm run build)
+#   manually edit ~/.claude.json to add mcpServers.goal
+#
+# Usage:
+#   bin/goal-setup                  # interactive install (defaults to user scope)
+#   bin/goal-setup --scope user     # explicit
+#   bin/goal-setup --scope project  # install into ./.claude
+#   bin/goal-setup --dry-run        # print planned actions, change nothing
+#   bin/goal-setup --non-interactive  # accept all defaults, no prompts (CI)
+#
+# Exit codes: 0 success, 1 aborted/error.
+# Requires: bash 3.2+, jq. Recommended: node + npm (for MCP server).
+
+set -euo pipefail
+
+# ---- locate repo root ------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ---- color helpers (only when stdout is a tty) -----------------------------
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'
+    C_GRN=$'\033[32m'; C_YLW=$'\033[33m'; C_CYN=$'\033[36m'
+    C_RST=$'\033[0m'
+else
+    C_BOLD=''; C_DIM=''; C_RED=''; C_GRN=''; C_YLW=''; C_CYN=''; C_RST=''
+fi
+
+ok()    { printf '%s✓%s %s\n' "$C_GRN" "$C_RST" "$1"; }
+warn()  { printf '%s⚠%s %s\n' "$C_YLW" "$C_RST" "$1"; }
+err()   { printf '%sx%s %s\n' "$C_RED" "$C_RST" "$1" >&2; }
+note()  { printf '%s%s%s\n' "$C_DIM" "$1" "$C_RST"; }
+head1() { printf '\n%s%s%s\n' "$C_BOLD" "$1" "$C_RST"; }
+
+# ---- arg parsing -----------------------------------------------------------
+
+SCOPE=user
+DRY_RUN=0
+NON_INTERACTIVE=0
+
+usage() {
+    sed -n '2,18p' "$0" | sed 's/^# \?//'
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --scope)
+            case "${2:-}" in
+                user|project) SCOPE="$2"; shift 2 ;;
+                *) err "invalid --scope value: ${2:-} (want user|project)"; exit 1 ;;
+            esac
+            ;;
+        --scope=user)    SCOPE=user; shift ;;
+        --scope=project) SCOPE=project; shift ;;
+        --dry-run)       DRY_RUN=1; shift ;;
+        --non-interactive|--yes|-y) NON_INTERACTIVE=1; shift ;;
+        -h|--help)       usage; exit 0 ;;
+        *) err "unknown arg: $1"; usage >&2; exit 1 ;;
+    esac
+done
+
+# ---- prereqs ---------------------------------------------------------------
+
+head1 "Detecting environment"
+
+# jq is hard-required (matches install.sh).
+if ! command -v jq >/dev/null 2>&1; then
+    err "jq is required. Install with: brew install jq (macOS) or apt-get install jq (Linux)"
+    exit 1
+fi
+ok "jq found at $(command -v jq)"
+
+# Claude CLI is nice-to-have; not strictly required to lay down hooks.
+if command -v claude >/dev/null 2>&1; then
+    ok "Claude Code CLI at $(command -v claude)"
+    HAS_CLAUDE_CLI=1
+else
+    warn "Claude Code CLI not on PATH (Desktop-only installs still work; ~/.claude.json will be patched)"
+    HAS_CLAUDE_CLI=0
+fi
+
+# Node + npm for MCP build (optional but recommended).
+HAS_NODE=0
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    NODE_VER="$(node --version 2>/dev/null || echo unknown)"
+    ok "node $NODE_VER, npm $(npm --version 2>/dev/null || echo unknown)"
+    HAS_NODE=1
+else
+    warn "node/npm not found — MCP server build will be skipped (hooks-only fallback still works)"
+fi
+
+# Optional: Claude Desktop heuristic (macOS path; harmless if absent).
+case "$(uname -s)" in
+    Darwin)
+        if [ -d "/Applications/Claude.app" ] || [ -d "$HOME/Applications/Claude.app" ]; then
+            ok "Claude Desktop app present (will share ~/.claude.json with CLI)"
+        fi
+        ;;
+esac
+
+# ---- target paths ----------------------------------------------------------
+
+case "$SCOPE" in
+    user)
+        TARGET="$HOME/.claude"
+        HOOK_CMD_PREFIX='bash $HOME/.claude/hooks/'
+        ;;
+    project)
+        TARGET="$(pwd)/.claude"
+        HOOK_CMD_PREFIX='bash .claude/hooks/'
+        ;;
+esac
+
+CMD_DST="$TARGET/commands/goal.md"
+HOOKS_DST_DIR="$TARGET/hooks"
+SETTINGS="$TARGET/settings.json"
+CLAUDE_JSON="$HOME/.claude.json"
+MCP_DST_DIR="$HOME/.claude/goal-mcp"
+
+# ---- detect existing pieces -----------------------------------------------
+
+EXISTING_CMD=0;       [ -f "$CMD_DST" ] && EXISTING_CMD=1
+EXISTING_HOOKS=0;     [ -d "$HOOKS_DST_DIR" ] && [ -n "$(ls -A "$HOOKS_DST_DIR" 2>/dev/null | grep '^goal-' || true)" ] && EXISTING_HOOKS=1
+EXISTING_MCP_REG=0
+if [ -f "$CLAUDE_JSON" ]; then
+    if jq -e '.mcpServers.goal // empty' "$CLAUDE_JSON" >/dev/null 2>&1; then
+        EXISTING_MCP_REG=1
+    fi
+fi
+EXISTING_MCP_DIR=0;   [ -d "$MCP_DST_DIR" ] && EXISTING_MCP_DIR=1
+
+[ "$EXISTING_CMD"     = 1 ] && warn "existing /goal command at $CMD_DST (will be updated)"
+[ "$EXISTING_HOOKS"   = 1 ] && warn "existing /goal hooks in $HOOKS_DST_DIR (will be updated)"
+[ "$EXISTING_MCP_REG" = 1 ] && warn "existing mcpServers.goal entry in $CLAUDE_JSON (will be overwritten)"
+[ "$EXISTING_MCP_DIR" = 1 ] && warn "existing MCP server at $MCP_DST_DIR (will be rebuilt)"
+[ "$EXISTING_CMD$EXISTING_HOOKS$EXISTING_MCP_REG$EXISTING_MCP_DIR" = "0000" ] && ok "no prior /goal install detected"
+
+# ---- plan ------------------------------------------------------------------
+
+head1 "Plan (scope: $SCOPE)"
+
+PLAN=(
+    "[x] /goal slash command -> $CMD_DST"
+    "[x] hook scripts -> $HOOKS_DST_DIR/*.sh"
+    "[x] hook registrations -> $SETTINGS"
+)
+if [ "$HAS_NODE" = 1 ]; then
+    PLAN+=("[x] goal-mcp-server -> $MCP_DST_DIR (npm install + tsc build)")
+    PLAN+=("[x] mcpServers.goal entry -> $CLAUDE_JSON")
+else
+    PLAN+=("[-] goal-mcp-server (skipped: node/npm not found)")
+fi
+PLAN+=("[x] statusline integration -> $SETTINGS (will prompt)")
+if [ "$SCOPE" = project ]; then
+    PLAN+=("[x] /goal runtime files -> .gitignore (project scope only)")
+fi
+
+for p in "${PLAN[@]}"; do
+    printf '  %s\n' "$p"
+done
+
+if [ "$DRY_RUN" = 1 ]; then
+    head1 "Dry run: no changes made."
+    exit 0
+fi
+
+if [ "$NON_INTERACTIVE" = 0 ]; then
+    printf '\nApply? [Y/n] '
+    read -r ans || ans=""
+    case "${ans:-Y}" in
+        y|Y|yes|YES|"") : ;;
+        *) note "Aborted."; exit 1 ;;
+    esac
+fi
+
+# ---- helpers ---------------------------------------------------------------
+
+ts() { date +%s; }
+
+backup_file() {
+    # Usage: backup_file <path>; echoes the backup path on stdout.
+    local src="$1"
+    [ -f "$src" ] || return 0
+    local bak="$src.bak.$(ts)"
+    cp "$src" "$bak"
+    printf '%s' "$bak"
+}
+
+ask_keep_update_replace() {
+    # Usage: ask_keep_update_replace <label>; returns "keep"|"update"|"replace" on stdout.
+    local label="$1"
+    if [ "$NON_INTERACTIVE" = 1 ]; then
+        printf 'update'
+        return 0
+    fi
+    while :; do
+        printf '%s already present. [k]eep / [u]pdate / [r]eplace? [u] ' "$label" >&2
+        local c=""
+        read -r c || c=""
+        case "${c:-u}" in
+            k|K) printf 'keep';    return 0 ;;
+            u|U) printf 'update';  return 0 ;;
+            r|R) printf 'replace'; return 0 ;;
+        esac
+    done
+}
+
+# ---- 1. copy command + hooks ----------------------------------------------
+
+head1 "Installing slash command + hooks"
+
+mkdir -p "$TARGET/commands" "$HOOKS_DST_DIR" "$HOME/.claude/goal-sessions"
+
+if [ "$EXISTING_CMD" = 1 ]; then
+    decision=$(ask_keep_update_replace "/goal command")
+    if [ "$decision" != "keep" ]; then
+        cp "$REPO_DIR/goal.md" "$CMD_DST"
+        ok "wrote $CMD_DST"
+    else
+        note "kept existing $CMD_DST"
+    fi
+else
+    cp "$REPO_DIR/goal.md" "$CMD_DST"
+    ok "wrote $CMD_DST"
+fi
+
+if [ "$EXISTING_HOOKS" = 1 ]; then
+    decision=$(ask_keep_update_replace "hook scripts")
+    if [ "$decision" != "keep" ]; then
+        cp "$REPO_DIR/hooks/"*.sh "$HOOKS_DST_DIR/"
+        chmod +x "$HOOKS_DST_DIR/"*.sh
+        ok "updated $HOOKS_DST_DIR/*.sh"
+    else
+        note "kept existing hooks in $HOOKS_DST_DIR"
+    fi
+else
+    cp "$REPO_DIR/hooks/"*.sh "$HOOKS_DST_DIR/"
+    chmod +x "$HOOKS_DST_DIR/"*.sh
+    ok "wrote $HOOKS_DST_DIR/*.sh"
+fi
+
+# ---- 2. settings.json merge (hook registrations) ---------------------------
+
+head1 "Wiring hooks into $SETTINGS"
+
+if [ ! -f "$SETTINGS" ]; then
+    if [ "$SCOPE" = user ]; then
+        sed 's|bash .claude/hooks/|bash $HOME/.claude/hooks/|g' "$REPO_DIR/settings.json.example" > "$SETTINGS"
+    else
+        cp "$REPO_DIR/settings.json.example" "$SETTINGS"
+    fi
+    ok "created $SETTINGS"
+else
+    BAK="$(backup_file "$SETTINGS")"
+    [ -n "$BAK" ] && note "backed up to $BAK"
+    TMP=$(mktemp)
+    jq --arg p "$HOOK_CMD_PREFIX" '
+        .hooks //= {}
+        | .hooks.Stop //= []
+        | .hooks.Notification //= []
+        | .hooks.UserPromptSubmit //= []
+        | (.hooks.Stop |=
+            if any(.[]?; .hooks[0].command == ($p + "goal-stop.sh"))
+            then . else . + [{hooks: [{type: "command", command: ($p + "goal-stop.sh")}]}] end)
+        | (.hooks.Notification |=
+            if any(.[]?; .hooks[0].command == ($p + "goal-notify.sh"))
+            then . else . + [{hooks: [{type: "command", command: ($p + "goal-notify.sh")}]}] end)
+        | (.hooks.UserPromptSubmit |=
+            if any(.[]?; .hooks[0].command == ($p + "goal-prompt.sh"))
+            then . else . + [{hooks: [{type: "command", command: ($p + "goal-prompt.sh")}]}] end)
+    ' "$SETTINGS" > "$TMP"
+    if diff -q "$SETTINGS" "$TMP" >/dev/null 2>&1; then
+        rm "$TMP"
+        note "hooks already registered — no merge needed"
+    else
+        mv "$TMP" "$SETTINGS"
+        ok "merged hooks into $SETTINGS"
+    fi
+fi
+
+# ---- 3. statusline (prompt before touching) -------------------------------
+
+head1 "Statusline integration"
+
+case "$SCOPE" in
+    user)    STATUSLINE_DST="$HOME/.claude/statusline.sh"; STATUSLINE_CMD='bash $HOOK_VAR_HOME/.claude/statusline.sh' ;;
+    project) STATUSLINE_DST="$TARGET/statusline.sh"; STATUSLINE_CMD='bash .claude/statusline.sh' ;;
+esac
+# Use literal $HOME (avoid shell expansion in the JSON value).
+STATUSLINE_CMD="${STATUSLINE_CMD/\$HOOK_VAR_HOME/\$HOME}"
+
+EXISTING_STATUSLINE=""
+if [ -f "$SETTINGS" ]; then
+    EXISTING_STATUSLINE=$(jq -r '.statusLine.command // empty' "$SETTINGS" 2>/dev/null || true)
+fi
+
+install_statusline_inline() {
+    cp "$REPO_DIR/statusline.sh" "$STATUSLINE_DST"
+    chmod +x "$STATUSLINE_DST"
+    local TMP; TMP=$(mktemp)
+    jq --arg cmd "$STATUSLINE_CMD" '.statusLine = {type: "command", command: $cmd}' "$SETTINGS" > "$TMP"
+    mv "$TMP" "$SETTINGS"
+    ok "installed bundled statusline -> $STATUSLINE_DST"
+}
+
+if [ -z "$EXISTING_STATUSLINE" ]; then
+    if [ "$NON_INTERACTIVE" = 1 ]; then
+        install_statusline_inline
+    else
+        printf 'No statusline configured. Install bundled one? [Y/n/skip] '
+        read -r ans || ans=""
+        case "${ans:-Y}" in
+            y|Y|yes|YES|"") install_statusline_inline ;;
+            *)              note "skipped statusline" ;;
+        esac
+    fi
+else
+    note "existing statusLine detected; not touching (re-run install.sh for the full 3-way prompt)"
+fi
+
+# ---- 4. MCP server build + registration -----------------------------------
+
+if [ "$HAS_NODE" = 1 ]; then
+    head1 "Building goal-mcp-server"
+
+    # Copy source tree to a stable location so the registered command keeps working
+    # even if the user moves or deletes the repo.
+    mkdir -p "$MCP_DST_DIR"
+    # Preserve a fresh copy of source; node_modules and dist are recreated below.
+    cp "$REPO_DIR/mcp/package.json" "$MCP_DST_DIR/"
+    [ -f "$REPO_DIR/mcp/package-lock.json" ] && cp "$REPO_DIR/mcp/package-lock.json" "$MCP_DST_DIR/"
+    cp "$REPO_DIR/mcp/tsconfig.json" "$MCP_DST_DIR/" 2>/dev/null || true
+    cp "$REPO_DIR/mcp/goal-server.ts" "$MCP_DST_DIR/" 2>/dev/null || true
+    [ -f "$REPO_DIR/mcp/README.md" ] && cp "$REPO_DIR/mcp/README.md" "$MCP_DST_DIR/"
+
+    note "running: npm install --omit=dev --no-audit --no-fund (in $MCP_DST_DIR)"
+    (cd "$MCP_DST_DIR" && npm install --no-audit --no-fund >/dev/null 2>&1) \
+        && ok "npm install complete" \
+        || { err "npm install failed — see $MCP_DST_DIR for details"; }
+
+    note "running: npm run build"
+    if (cd "$MCP_DST_DIR" && npm run build >/dev/null 2>&1); then
+        ok "tsc build complete"
+    else
+        err "tsc build failed — MCP server will not start; hooks-only fallback still works"
+    fi
+
+    head1 "Registering MCP server in $CLAUDE_JSON"
+
+    if [ ! -f "$CLAUDE_JSON" ]; then
+        printf '{}\n' > "$CLAUDE_JSON"
+        ok "created $CLAUDE_JSON"
+    fi
+
+    BAK="$(backup_file "$CLAUDE_JSON")"
+    [ -n "$BAK" ] && note "backed up to $BAK"
+
+    TMP=$(mktemp)
+    jq --arg cmd "node" \
+       --arg srv "$MCP_DST_DIR/dist/goal-server.js" \
+       --arg root "$MCP_DST_DIR" \
+       '.mcpServers //= {}
+        | .mcpServers.goal = {
+            command: $cmd,
+            args: [$srv],
+            env: { GOAL_PLUGIN_ROOT: $root }
+          }' \
+       "$CLAUDE_JSON" > "$TMP"
+
+    if jq -e . "$TMP" >/dev/null 2>&1; then
+        mv "$TMP" "$CLAUDE_JSON"
+        ok "registered mcpServers.goal -> $CLAUDE_JSON"
+    else
+        rm -f "$TMP"
+        err "failed to patch $CLAUDE_JSON (kept original)"
+    fi
+fi
+
+# ---- 5. project-scope .gitignore ------------------------------------------
+
+if [ "$SCOPE" = project ] && [ -d .git ]; then
+    head1 "Updating .gitignore (project scope)"
+    for pat in '.claude/goal.json' '.claude/goal-hook.log' '.claude/goal.pause' '.claude/goal-baseline-*' '.claude/goal-events.jsonl' '.claude/goal-otel-cursor'; do
+        if [ ! -f .gitignore ] || ! grep -qxF "$pat" .gitignore 2>/dev/null; then
+            printf '%s\n' "$pat" >> .gitignore
+            ok "added $pat to .gitignore"
+        fi
+    done
+fi
+
+# ---- done ------------------------------------------------------------------
+
+head1 "Install complete"
+cat <<NOTE
+Restart Claude Code (CLI or Desktop) to pick up the changes.
+
+Try it:
+  /goal Refactor the auth module to use the new session API; run tests
+  /goal status
+  /goal pause | resume | clear
+
+To roll back: see the *.bak.<timestamp> files alongside any modified config.
+NOTE
+exit 0

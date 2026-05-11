@@ -1,126 +1,114 @@
-# `/goal` for Claude Code
+<p align="center">
+  <img src="docs/banner.svg" alt="goal — persistent objectives for Claude Code" width="100%">
+</p>
 
-Give [Claude Code](https://claude.com/claude-code) a durable objective and walk away — it pursues across turns, survives `/clear` and auto-compaction, auto-pauses on rate-limit / API errors, and only stops when the goal is genuinely done. A faithful port of [OpenAI Codex CLI](https://github.com/openai/codex)'s `/goal` command (codex-cli 0.128.0) implemented as a slash command + a handful of hooks.
+<p align="center">
+  A <a href="https://code.claude.com/docs/en/plugins">Claude Code plugin</a> that bundles a <code>/goal</code> slash command, three hooks, an MCP server with a push channel, and a statusline indicator — so the model keeps pursuing a long objective across turns until it audits as done, hits its budget, or gets paused.
+</p>
 
-Works in both Claude Code CLI and the Claude desktop / IDE clients — they share the same `.claude/` configuration.
+---
+
+## What you get
+
+- **`/goal <objective>`** — set a durable goal. State persists at `.claude/goal.json` across `/clear`, `/compact`, `--resume`, and session restarts.
+- **Auto-continuation** — a `Stop` hook returns `{decision:"block"}` after each turn while the goal is `pursuing`. Same loop shape as Anthropic's own [ralph-wiggum](https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum) plugin, with explicit lifecycle states layered on top.
+- **Push channel** — the bundled MCP server declares the `claude/channel` capability and pushes short "keep working" messages into idle sessions, so unattended runs don't stall.
+- **Token budget that bites** — the hook reads the session transcript, deltas output tokens against a per-goal baseline, and flips status to `budget-limited` with a wrap-up steering message when the budget is hit.
+- **Audit-gated completion** — the model can only declare `achieved` after a prompt-to-artifact checklist clears. No false positives from "I implemented it" intuition.
+- **Concurrent-session safe** — all four writers (slash command, hooks, MCP server, `goalctl`) coordinate through a single mutex at `.claude/goal.lock`.
+- **CLI + Desktop** — both surfaces read the same `~/.claude.json`, so one install covers both.
+
+## Install
+
+```bash
+git clone https://github.com/pyyush/goal
+cd goal
+./bin/goal-setup            # one-command interactive install (recommended)
+# or: ./install.sh user     # minimal: hooks only, no MCP server
+```
+
+`goal-setup` flags: `--dry-run`, `--non-interactive`, `--scope user|project`.
+
+Restart Claude Code (CLI or quit-and-reopen Desktop) so the hooks + MCP server register.
 
 ## Quickstart
 
-```bash
-git clone https://github.com/pyyush/claude-goal-command
-cd claude-goal-command
-./install.sh user        # or: ./install.sh project
-```
-
-Restart Claude Code, then in any project:
-
-```
+```text
 /goal Refactor the auth module to use the new session API; run tests until green
 ```
 
-That's it. The model continues working on the goal across every turn until it audits as `achieved`, declares `unmet`, hits a rate limit (auto-pause), or you run `/goal pause`.
-
-## What this gives you
-
-- **Persistent objective.** Set it once with `/goal <objective>`. Stored in `.claude/goal.json` per project — survives `/clear`, session restart, `--resume`, auto-compaction.
-- **Auto-continuation.** A Stop hook injects a continuation prompt after every turn while the goal is `pursuing`, mirroring Codex's app-server runtime.
-- **Subscription-friendly defaults.** No token budget, no time limit. The goal keeps moving until it's done.
-- **Auto-pause on errors.** A Notification hook detects rate-limit / quota / 5xx / overload / auth / timeout patterns and pauses the goal cleanly.
-- **Status line indicator.** A drop-in helper for your statusLine command that shows `Pursuing goal (5m)` / `Goal paused (/goal resume)` / `Goal achieved (1h23m)` etc. — exact label wording from Codex's TUI bottom-pane indicator, single magenta color (theme-adaptive ANSI 35), compact token formatting (`12.5K / 50K`).
-- **Kill switch.** `touch .claude/goal.pause` halts the loop instantly from any terminal.
-- **Single-objective audit.** Before claiming `achieved`, the model is forced to build a prompt-to-artifact checklist mapping every requirement to concrete evidence — no false positives from "I implemented it" intuition.
+The model now keeps working on this across every turn until it can audit it as `achieved`, declares `unmet`, or you intervene with `/goal pause` / `/goal clear`.
 
 ## Commands
 
-```
-/goal <objective>     Set or replace the active goal; starts pursuing immediately
-/goal                 Show status (and tick the loop manually if no Stop hook)
-/goal status          Show status only — never tick
-/goal pause           Pause the auto-continuation loop
-/goal resume          Resume; the next turn picks up automatically
-/goal clear           Delete the goal (rm -f .claude/goal.json)
-/goal achieved        Manually mark complete — runs an audit first, refuses if it fails
-/goal unmet           Manually mark blocked
-/goal budget <N>      Set a positive-integer token budget (advisory soft stop)
-```
-
-Subcommands are case-insensitive on the first whitespace-separated token (`/goal Pause`, `  /goal resume  ` both work). Anything that isn't a recognized subcommand is treated as a new objective with original casing preserved.
-
-## Examples
-
-```
-/goal Migrate the user model from SQLAlchemy 1.4 to 2.0; update all callers; tests must pass
-```
-Goes turn after turn touching files, running tests, fixing failures. Auto-pauses if it hits a rate limit; resumes when you run `/goal resume`.
-
-```
-/goal Add full keyboard navigation to the dashboard component; ensure WCAG 2.2 AA conformance
-```
-The completion audit means it won't declare done until it can point at concrete WCAG criteria coverage, not just "looks good."
-
-```
-/goal Bisect the regression in test_auth.py introduced between v1.4.0 and v1.5.2 and open a PR with a fix
-```
-Long-running multi-tool flow: git, pytest, gh. Survives compactions because the goal context is re-injected every turn.
-
-```
-/goal pause
-# do something else, then later:
-/goal resume
+```text
+/goal <objective>          set or replace the active goal
+/goal                      show 1-line status (the Stop hook handles continuation)
+/goal status               full status, never continues
+/goal pause | resume       pause / unpause the auto-continuation loop
+/goal achieved             mark complete — runs the audit first, refuses on a fail
+/goal unmet [note]         mark blocked
+/goal budget <N>           set a positive-integer token budget
+/goal clear                delete the goal
 ```
 
-## Setup
+Subcommands are case-insensitive on the first token. Anything else is treated as a new objective.
 
-Two scopes are supported:
+## Architecture
 
-- **User scope** (`~/.claude/`) applies to every project on your machine. Recommended.
-- **Project scope** (`./.claude/`) is per-repo. Useful if you want different hooks per project, or to commit hook config.
+<p align="center">
+  <img src="docs/architecture.png" alt="goal architecture — four writers sharing .claude/goal.json under a lock" width="100%">
+</p>
 
-### One-command install
+`.claude/goal.json` is the single source of truth. All four writers — the slash command, the hooks, the MCP server, and the headless `goalctl` / HTTP shim — coordinate through a `proper-lockfile`-compatible mkdir mutex at `.claude/goal.lock`. Each write is atomic (`mktemp` + `rename(2)`) and CAS-guarded by `goal_id`, so a write from a stale view is rejected even if the lock somehow leaks.
+
+## Lifecycle
+
+<p align="center">
+  <img src="docs/lifecycle.png" alt="goal lifecycle — pursuing, paused, achieved, unmet, budget-limited" width="100%">
+</p>
+
+A goal lives in one of five states. Transitions are user-initiated (`pause` / `resume` / `clear` / `unmet`), model-initiated (only `achieved`, and only after an audit), or runtime-driven (`budget-limited` when `tokens_used ≥ token_budget`). The MCP `update_goal` tool is deliberately asymmetric — the model cannot pause, resume, or modify its own budget. Those are user / orchestrator decisions.
+
+## Concurrency
+
+Run multiple Claude Code sessions on the same project — CLI + Desktop side by side, two CLI sessions in different terminals — and `goal` stays consistent. Tunables: `GOAL_LOCK_TIMEOUT_MS` (default 5000), `GOAL_LOCK_STALE_MS` (default 30000). A stuck lock auto-recovers when the owning PID is gone or the hold exceeds the stale threshold.
+
+A concurrency stress test ships at [`scripts/smoke-phase-1.sh`](scripts/smoke-phase-1.sh) — 20 parallel atomic increments serialize to 20 with the lock; without it 18 of 20 updates are lost.
+
+## Headless / SDK drive (`goalctl`)
+
+For CI, scheduled jobs, IDE plugins, multi-agent orchestrators:
 
 ```bash
-./install.sh user      # or: ./install.sh project
+goalctl create "Ship the migration" --budget 5000
+goalctl status --json | jq '.remaining_tokens'
+goalctl pause / resume / clear
+goalctl set-budget 10000
+goalctl mark-unmet "blocked on review"
+goalctl listen --grep created          # tail .claude/goal-events.jsonl
+goalctl serve-http --port 7474         # local HTTP RPC (127.0.0.1 only)
 ```
 
-The installer copies the command + 4 hooks, merges hook entries into your `settings.json` (with a diff prompt if it already exists, plus a backup), and adds `.claude/goal.json` etc. to `.gitignore` for project installs.
+The HTTP shim exposes `GET / POST / PATCH /goal` and `GET /events?since=<iso>` (NDJSON stream). No auth — loopback bind only. See [`bin/goal-http-server.ts`](bin/goal-http-server.ts) for the full surface.
 
-### Manual install
+## MCP server (native tools + push channel)
 
-If you'd rather do it by hand:
+The MCP server in [`mcp/`](mcp/README.md) exposes three native tools the model calls as structured tool uses:
 
-```bash
-# user scope
-mkdir -p ~/.claude/commands ~/.claude/hooks
-cp goal.md      ~/.claude/commands/goal.md
-cp hooks/*.sh   ~/.claude/hooks/
-chmod +x ~/.claude/hooks/*.sh
-```
+| Tool | Behavior |
+|---|---|
+| `mcp__goal__create_goal` | Create a goal. Fails if one is already active. |
+| `mcp__goal__update_goal` | Mark complete. Asymmetric: only `status: "complete"` is accepted. |
+| `mcp__goal__get_goal` | Return current state + computed `remaining_tokens` and `elapsed_seconds`. |
 
-Then merge into `~/.claude/settings.json`. **User-scope hooks must use absolute paths** — Claude Code runs hook commands from the project's working directory, not from `~/.claude/`:
+The same server declares the `claude/channel` capability with channel id `goal/continue`. It pushes a short *"continue working — call `get_goal()` if you need the objective"* message into the session at boot, after `.claude/goal.json` mtime bumps (debounced against the Stop hook), and optionally on a timer (`GOAL_PUSH_INTERVAL_SECONDS=N`). This is what closes the *idle continuation* gap: when the model has finished a turn and no Stop hook has fired in a while, the channel re-engages it.
 
-```json
-{
-  "hooks": {
-    "Stop": [
-      { "hooks": [{ "type": "command", "command": "bash $HOME/.claude/hooks/goal-stop.sh" }] }
-    ],
-    "Notification": [
-      { "hooks": [{ "type": "command", "command": "bash $HOME/.claude/hooks/goal-notify.sh" }] }
-    ],
-    "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "bash $HOME/.claude/hooks/goal-prompt.sh" }] }
-    ]
-  }
-}
-```
+Channel kill switches: `touch .claude/goal.pause`, `GOAL_CHANNEL_DISABLE=1`, status not `pursuing`, budget exhausted, or any active ceiling. Every push outcome is logged to `.claude/goal-events.jsonl` for audit.
 
-For project scope, drop the `$HOME/` prefix. `settings.json.example` ships with project-scope paths.
+## Statusline
 
-The state file (`.claude/goal.json`) is per-project regardless of where the hooks live — it's read relative to whatever directory you launch Claude Code in.
-
-### Status line indicator
-
-The helper outputs a single colored segment matching Codex's TUI labels exactly:
+Adds one magenta segment to your statusline, showing the live goal state:
 
 | State | Label |
 |---|---|
@@ -128,183 +116,54 @@ The helper outputs a single colored segment matching Codex's TUI labels exactly:
 | `pursuing` (with budget) | `Pursuing goal (12.5K / 50K)` |
 | `paused` | `Goal paused (/goal resume)` |
 | `achieved` | `Goal achieved (1h23m)` |
-| `unmet` *(port-only)* | `Goal unmet (/goal status)` |
+| `unmet` | `Goal unmet (/goal status)` |
 | `budget-limited` | `Goal abandoned (50K / 50K)` |
 
-Color: a single magenta (named ANSI 35) for every state — same as Codex, and theme-adaptive (terminals remap named ANSI to be readable on both dark and light backgrounds, so it works on either).
-
-Set `GOAL_STATUSLINE_STYLE=dim` for a softer, reference-style look (`\033[2;35m`), or `GOAL_STATUSLINE_STYLE=plain` for monochrome.
-
-To wire it in, append to your existing statusLine command (typically `~/.claude/statusline-command.sh`):
-
-```bash
-if [ -x "$HOME/.claude/hooks/goal-statusline.sh" ]; then
-    cwd=$(echo "$input" | jq -r '.cwd // ""')
-    sid=$(echo "$input" | jq -r '.session_id // ""')
-    goal_seg=$(bash "$HOME/.claude/hooks/goal-statusline.sh" "$cwd" "$sid" 2>/dev/null)
-    [ -n "$goal_seg" ] && segments+=("$goal_seg")
-fi
-```
-
-(Adapt variable names to match your existing script — `$input` is the JSON Claude Code passes to your statusLine, `$cwd` is the session's working directory, `$sid` is the session UUID. Passing `sid` enables sticky goal lookup across `/cwd` shifts via the session pointer file.)
-
-If you don't have a statusLine command yet, set one up via `/statusline` inside Claude Code, or set `statusLine.command` in your `settings.json`.
+`goal-setup` wires it for you. `GOAL_STATUSLINE_STYLE=dim|plain` for softer / monochrome.
 
 ## Configuration
 
-Everything is opt-in. Default behavior assumes a subscription user who wants the goal to keep moving.
-
-| Setting | Default | What it does |
+| Var | Default | What |
 |---|---|---|
-| `GOAL_MAX_TICKS` | `0` (unlimited) | Optional cap on continuation cycles. Set to a positive integer to enable. |
-| `GOAL_MAX_SECONDS` | `0` (unlimited) | Optional wall-clock cap. Useful for API-billed runs. |
-| `GOAL_AUTOPAUSE_ON_PROMPT` | `0` (off) | Set to `1` for Codex-style "pause on every user input." Default keeps the goal moving across user prompts. |
-| `/goal budget <N>` | unset | Token-budget soft stop (advisory; the model updates `tokens_used` per turn). |
+| `GOAL_MAX_TICKS` | `0` (unlimited) | Hard cap on continuation cycles. |
+| `GOAL_MAX_SECONDS` | `0` (unlimited) | Wall-clock cap. Useful for API-billed runs. |
+| `GOAL_AUTOPAUSE_ON_PROMPT` | `0` | Set to `1` to pause on every user prompt. |
+| `GOAL_PUSH_INTERVAL_SECONDS` | unset | Channel timer push, off by default. |
+| `GOAL_CHANNEL_DISABLE` | `0` | Set to `1` to disable just the push channel. |
+| `GOAL_CHANNEL_DEBOUNCE_MS` | `5000` | Channel skip-window after a Stop-hook tick. |
+| `GOAL_LOCK_TIMEOUT_MS` | `5000` | Mutex acquire timeout. |
+| `GOAL_LOCK_STALE_MS` | `30000` | Stale-lock takeover threshold. |
+| `GOAL_OTEL_ENDPOINT` | unset | When set, `goal-otel-exporter` ships metrics to this OTLP HTTP endpoint. |
 
-Set env vars in your shell or in `~/.claude/settings.json`:
+## Safety
 
-```json
-{
-  "env": {
-    "GOAL_MAX_SECONDS": "86400",
-    "GOAL_AUTOPAUSE_ON_PROMPT": "1"
-  }
-}
-```
+- **`<untrusted_objective>` framing.** The objective is wrapped in nonce-tagged tags so a malicious goal can't smuggle higher-priority instructions. The model is explicitly told to treat the objective as data.
+- **Audit-gated `achieved`.** Every claim of completion forces a prompt-to-artifact checklist before the goal flips to terminal-success.
+- **Asymmetric model tool.** `update_goal` only accepts `complete`. The model cannot pause, resume, mark-unmet, or modify its own budget.
+- **Kill switch.** `touch .claude/goal.pause` halts the loop instantly from any terminal — no chat access required.
+- **Auto-pause on errors.** A `Notification` hook detects rate-limit / 5xx / overload / auth / timeout patterns and pauses the goal so it doesn't burn ticks against a degraded API.
+- **Local-only headless surfaces.** `goalctl serve-http` binds `127.0.0.1` only.
 
-## Behavior in adverse conditions
+## Observability
 
-The state file lives on disk, independent of conversation context. Most disruptions are transparent:
-
-| Scenario | What happens |
-|---|---|
-| `/clear` | Conversation cleared; goal persists. Stop hook re-injects the continuation prompt on the next turn. |
-| Auto-compaction | Same — compaction summarizes in-context history; goal context is re-injected fresh after compaction. |
-| Rate limit / 429 | Notification hook auto-pauses the goal. Run `/goal resume` after recovery. |
-| API error / 5xx | Same — Notification hook detects common error patterns and pauses. |
-| Session restart | Goal persists. Next time you open Claude Code in the project, the Stop hook fires after your first turn and continuation resumes. |
-| Crash / kill | State file is written atomically (`mktemp` + `mv` on the same filesystem); even mid-write crashes don't corrupt `goal.json`. |
-
-## Safety mechanisms
-
-1. **Notification hook** auto-pauses on `rate limit`, `quota`, `overloaded`, 5xx, auth/authorization errors, timeouts.
-2. **Kill switch** — `touch .claude/goal.pause` from any terminal halts the loop on the next Stop hook invocation. Remove the file to re-enable.
-3. **Optional ceilings** — `GOAL_MAX_TICKS` / `GOAL_MAX_SECONDS` env vars (off by default).
-4. **Recursion guard** — the Stop hook respects `stop_hook_active` to prevent tight recursion within a chain.
-5. **Atomic state writes** — same-filesystem `mktemp` + `mv` so concurrent or crashed writes can't truncate `goal.json`.
-6. **Symlink refusal** — the hook refuses to follow a symlinked `goal.json`.
-7. **`goal_id` CAS** — every goal has a UUID stamped on it at create/replace. All hook write paths assert the on-disk `goal_id` still matches the one they read at hook entry; if the goal was replaced mid-flight, the stale write is dropped and logged. Modeled on Codex's `goal_id` versioning in `state/src/runtime/goals.rs`.
-
-### Observability
-
-Each hook invocation appends one JSON line to `.claude/goal-hook.log`:
-
-```bash
-tail -f .claude/goal-hook.log
-```
-
-```json
-{"ts":"2026-05-06T20:15:03Z","pid":12345,"hook":"stop","event":"tick","note":"tick=3 tokens=1200 time=180s"}
-{"ts":"2026-05-06T20:18:07Z","pid":12350,"hook":"notify","event":"auto-pause-error","note":"rate limit"}
-```
-
-### Threat model
-
-- **Drive-by injection.** A repo with a planted `.claude/goal.json` will inject its objective into the model on the first turn after you `cd` into it (with user-scope hooks). Don't commit `.claude/goal.json` (the included `.gitignore` excludes it). The hook refuses symlinked state files but does trust file *contents* — treat `.claude/` from cloned repos like any other untrusted code.
-- **Prompt injection via objective.** The objective text is wrapped in `<untrusted_objective_<random-nonce>>...</untrusted_objective_<random-nonce>>` per turn, and any literal `</untrusted_objective...>` in the objective is stripped. Tag-close escapes are infeasible.
-
-## How it maps to Codex
-
-| Codex piece | This port |
-|---|---|
-| `/goal` slash command | `.claude/commands/goal.md` |
-| App-server runtime continuation (auto-loop) | `.claude/hooks/goal-stop.sh` (Stop hook returning `{"decision":"block"}`) |
-| `templates/goals/continuation.md` | Inline content of `goal-stop.sh` |
-| `templates/goals/budget_limit.md` | Inline content of `goal-stop.sh` (budget branch) |
-| `update_goal` tool | Claude rewrites `.claude/goal.json` via the Write tool |
-| Persistent state (app-server) | `.claude/goal.json` on disk |
-| Lifecycle states | `pursuing \| paused \| achieved \| unmet \| budget-limited` |
-| TUI `Goal paused (/goal resume)` indicator | `.claude/hooks/goal-statusline.sh` (statusLine helper) |
-| Pause on `Ctrl-C` interrupt | `.claude/hooks/goal-notify.sh` (Notification hook on rate-limit / API-error) |
-
-The Stop hook is the engine: when a turn ends with `status="pursuing"`, the hook returns `{"decision":"block","reason":"<continuation prompt>"}` and Claude Code forces another turn. Same shape as Codex's app-server, just routed through Claude Code's hook system.
-
-## Differences from Codex `/goal`
-
-| | Codex CLI | This port |
-|---|---|---|
-| Token tracking | Real, runtime-counted | Advisory; the model updates `tokens_used` per turn (best effort). Off by default. |
-| Budget transition | Intra-turn, mid-stream | At the end of the turn that exceeded the budget |
-| Auto-pause trigger | Explicit user interrupt (`Ctrl-C` mid-turn) | Notification hook on rate-limit / API errors; opt-in pause-on-every-prompt |
-| `unmet` state | Not a Codex state | Used here for hard-blocked goals |
-| Subcommands | `pause`, `resume`, `clear` only | Plus `status`, `achieved`, `unmet`, `budget` |
-| Status writes | Model can only mark `complete` via `update_goal` tool | Model writes status directly to `.claude/goal.json` (rule-enforced via dispatch instructions; `goal_id` CAS catches stale writes) |
-| Multiple concurrent goals | One per thread | One per project (file-based) |
-| Hard ceilings | None (runtime-bounded) | Optional, off by default |
-| Status-line label | "Pursuing goal", "Goal paused (/goal resume)", "Goal achieved", "Goal abandoned" | **Same wording**, magenta color (single-color match), via `hooks/goal-statusline.sh` |
-| Plan mode | Continuation suppressed | No equivalent — Claude Code hooks have no Plan-mode signal |
-| Concurrency | `goal_id` CAS in SQL UPDATE; per-thread row | `goal_id` CAS in jq filters; per-project file with same-FS atomic writes |
-
-## File layout (project scope)
-
-```
-your-project/
-├── .claude/
-│   ├── commands/
-│   │   └── goal.md              # the slash command
-│   ├── hooks/
-│   │   ├── goal-stop.sh         # auto-continuation engine
-│   │   ├── goal-notify.sh       # auto-pause on rate-limit / API error
-│   │   ├── goal-prompt.sh       # opt-in auto-pause on user input
-│   │   └── goal-statusline.sh   # statusLine helper
-│   ├── settings.json            # hook registration
-│   ├── goal.json                # state (gitignored)
-│   ├── goal-hook.log            # one JSON line per hook invocation (gitignored)
-│   └── goal.pause               # presence = kill switch (gitignored)
-└── .gitignore
-```
+`goal-otel-exporter` tails `.claude/goal-events.jsonl` and emits OpenTelemetry counters (`goal.created`, `goal.completed`, `goal.unmet`, `goal.budget_limited`) and histograms (`goal.token_count`, `goal.continuation_turns`, `goal.elapsed_seconds`), all keyed by `goal_id`. Without `GOAL_OTEL_ENDPOINT` set it emits OTLP/JSON to stdout for piping.
 
 ## Troubleshooting
 
-**The goal isn't auto-continuing.** Check that the Stop hook is registered:
-```bash
-jq '.hooks.Stop' ~/.claude/settings.json    # or .claude/settings.json for project scope
-```
-You should see one entry pointing to `goal-stop.sh`. If not, re-run `./install.sh`.
+**Loop isn't firing.** Check `jq '.hooks.Stop' ~/.claude/settings.json` — should reference `goal-stop.sh`. Restart Claude Code after install.
 
-**Restart Claude Code.** Hook changes are picked up at session start. After install or settings changes, fully quit and reopen.
+**Status line missing.** `~/.claude/hooks/goal-statusline.sh` must be executable and your statusLine command must pass `cwd` + `session_id` from its stdin JSON. The bundled statusline (`statusline.sh`) handles both.
 
-**Status line isn't showing the goal.** Confirm:
-1. `~/.claude/hooks/goal-statusline.sh` exists and is executable.
-2. Your statusLine command parses `cwd` from stdin and includes the snippet from the [Status line indicator](#status-line-indicator) section.
-3. There's actually a goal: `cat .claude/goal.json` — the helper outputs nothing when there's no goal.
+**Goal stuck in `paused` after rate-limit.** Run `/goal resume`. Auto-resume on API recovery isn't currently possible — Claude Code doesn't expose recovery events to hooks.
 
-**The hook fires but does nothing.** Tail the log:
-```bash
-tail -f .claude/goal-hook.log
-```
-Common events: `recursion-guard` (within an active continuation chain — normal), `not-pursuing` (status isn't `pursuing` — that's the intended exit), `malformed` (state file is corrupted — `/goal clear` and start over).
-
-**Goal is stuck in a paused state after a rate-limit pause.** Run `/goal resume`. If you want auto-resume after rate-limit recovery, that's not currently possible (Claude Code doesn't expose API-recovery events to hooks).
-
-**Bash 3.2 / `objective's` parse errors.** Already fixed — the heredoc has no apostrophes that bash 3.2 mis-tokenizes. If you're still seeing parse errors, you might be running an older copy. Re-run `./install.sh`.
-
-**Concurrent Claude Code sessions on the same project.** Both Stop hooks will fire on their own turn end and write to the same `goal.json`. Atomic writes prevent corruption, but tick counts can race. Don't expect tight reproducibility under concurrent use.
+**Hook fires but nothing happens.** `tail -f .claude/goal-hook.log`. Common: `recursion-guard` (inside a continuation chain — normal), `not-pursuing` (intended exit), `malformed` (`/goal clear` and start over).
 
 ## Requirements
 
-- `bash` 3.2 or newer (macOS default works; tested against 3.2 and 5.x).
-- `jq` on `PATH`. Install via `brew install jq` (macOS) or `apt-get install jq` (Linux).
-- On Windows: run via WSL, or rewrite the hooks in PowerShell / Python.
-
-## Contributing
-
-Issues and PRs welcome. The codebase is intentionally small (4 hooks, 1 slash command, 1 installer) and audit-driven — see commit history for the design rationale.
-
-## Source attribution
-
-The continuation and budget-limit prompts are adapted from [`codex-rs/core/templates/goals/`](https://github.com/openai/codex/tree/main/codex-rs/core/templates/goals) in the Codex repository. Lifecycle states and the `<untrusted_objective>` framing follow the same source (with a per-turn random nonce added for prompt-injection hardening).
+- macOS or Linux (Windows via WSL)
+- `bash` 3.2+, `jq`, `uuidgen`
+- Node 18+ (for the MCP server and HTTP shim — optional but recommended)
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE)

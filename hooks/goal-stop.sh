@@ -2,7 +2,8 @@
 # .claude/hooks/goal-stop.sh
 #
 # Stop hook for /goal — auto-continues Claude when status=pursuing.
-# Port of Codex CLI's templates/goals/{continuation,budget_limit}.md.
+# Returns {"decision":"block","reason":"..."} to force another turn
+# (same loop shape as the ralph-wiggum plugin's Stop hook).
 #
 # Resolves goal state via goal-resolve.sh: session pointer first
 # (sticky across /cwd), then walk-up from $cwd. Stops at $HOME.
@@ -20,18 +21,35 @@ MAX_SECONDS=${GOAL_MAX_SECONDS:-0}
 
 # ----- resolver --------------------------------------------------------------
 
-RESOLVER="$(dirname "$0")/goal-resolve.sh"
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+RESOLVER="$HOOK_DIR/goal-resolve.sh"
 if [ ! -f "$RESOLVER" ]; then
     exit 0
 fi
 # shellcheck disable=SC1090
 . "$RESOLVER"
 
+# Optional cross-writer mutex (proper-lockfile compatible).
+__GOAL_LOCK_FOUND=0
+if [ -r "$HOOK_DIR/goal-lock.sh" ]; then
+    # shellcheck disable=SC1090
+    . "$HOOK_DIR/goal-lock.sh"; __GOAL_LOCK_FOUND=1
+fi
+if [ "$__GOAL_LOCK_FOUND" -eq 0 ]; then
+    # Older install w/o the lock helper — degrade to CAS-only (still safe
+    # against corruption via atomic rename; possible lost-update under high
+    # concurrency).
+    goal_lock_acquire() { return 0; }
+    goal_lock_release() { :; }
+fi
+
 INPUT=$(cat || printf '')
 INPUT=${INPUT:-\{\}}
 
 SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // ""' 2>/dev/null)
 SESSION_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
+TRANSCRIPT_PATH=$(printf '%s' "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
 
 resolve_goal "$SESSION_ID" "${SESSION_CWD:-$PWD}" || exit 0
 
@@ -107,6 +125,25 @@ increment_tick() {
     fi
 }
 
+write_tokens() {
+    local new_used="$1" now tmp
+    if ! goal_id_matches; then
+        log "stale-write-rejected" "write_tokens (goal_id changed)"
+        return 1
+    fi
+    now=$(date -u +%FT%TZ)
+    tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
+    if jq --arg ts "$now" --argjson u "$new_used" --arg gid "${GOAL_ID:-}" \
+         'if (.goal_id // "") == $gid then
+              .tokens_used = $u | .updated_at = $ts
+          else . end' \
+         "$GOAL_FILE" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$GOAL_FILE"
+    else
+        rm -f "$tmp"
+    fi
+}
+
 sanitize_objective() {
     printf '%s' "$1" | sed -E 's|</untrusted_objective[^>]*>||g'
 }
@@ -127,6 +164,16 @@ if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
     log "recursion-guard" "stop_hook_active=true"
     exit 0
 fi
+
+# Acquire the cross-writer lock for the duration of the read-modify-write.
+# Coordinates with the MCP server (proper-lockfile) and bin/goalctl via the
+# shared lockdir at $GOAL_ROOT/.claude/goal.lock. Released before the stdout
+# emit since emit_block doesn't touch goal.json.
+if ! goal_lock_acquire "$GOAL_ROOT"; then
+    log "lock-timeout" "could not acquire goal.lock; skipping this tick"
+    exit 0
+fi
+trap 'goal_lock_release "$GOAL_ROOT"' EXIT INT TERM
 
 SHAPE=$(jq -r '
     if (type == "object" and (.objective | type) == "string" and (.status | type) == "string") then
@@ -160,6 +207,36 @@ fi
 is_int "$TOKENS_USED" || TOKENS_USED=0
 is_int "$TICK_COUNT" || TICK_COUNT=0
 is_int "$TIME_USED" || TIME_USED=0
+
+# ----- token accounting (transcript-derived) --------------------------------
+#
+# Token accounting: read the session
+# transcript JSONL and sum output_tokens from each assistant message. A
+# per-goal baseline file remembers the cumulative count at first observation
+# so tokens spent BEFORE the goal was set don't count against the budget.
+# Baseline is keyed by goal_id, so /goal replace naturally invalidates it.
+
+if [ -n "$TRANSCRIPT_PATH" ] && [ -r "$TRANSCRIPT_PATH" ] && [ -n "${GOAL_ID:-}" ]; then
+    BASELINE_FILE="$GOAL_ROOT/.claude/goal-baseline-${GOAL_ID}"
+    CURRENT_TOTAL=$(jq -r '.message.usage.output_tokens // empty' "$TRANSCRIPT_PATH" 2>/dev/null \
+                    | awk '/^[0-9]+$/ {s+=$1} END {print s+0}')
+    if is_int "$CURRENT_TOTAL"; then
+        if [ ! -f "$BASELINE_FILE" ]; then
+            printf '%s' "$CURRENT_TOTAL" > "$BASELINE_FILE" 2>/dev/null || true
+            COMPUTED_USED=0
+        else
+            BASELINE=$(cat "$BASELINE_FILE" 2>/dev/null || printf '0')
+            is_int "$BASELINE" || BASELINE=0
+            COMPUTED_USED=$((CURRENT_TOTAL - BASELINE))
+            [ "$COMPUTED_USED" -lt 0 ] && COMPUTED_USED=0
+        fi
+        if [ "$COMPUTED_USED" -gt "$TOKENS_USED" ]; then
+            DELTA=$((COMPUTED_USED - TOKENS_USED))
+            write_tokens "$COMPUTED_USED" && TOKENS_USED=$COMPUTED_USED
+            log "token-update" "tokens_used=${TOKENS_USED} (+${DELTA})"
+        fi
+    fi
+fi
 
 # ----- optional ceilings ----------------------------------------------------
 

@@ -2,30 +2,22 @@
 # .claude/hooks/goal-statusline.sh
 #
 # Helper for the Claude Code statusLine — outputs a single segment showing
-# the active /goal status, designed to mirror Codex's TUI bottom_pane
-# indicator (codex-rs/tui/src/bottom_pane/footer.rs:537-567).
+# the active /goal status.
 #
-# Faithful to Codex on:
-#   - Label wording per state ("Pursuing goal", "Goal paused", "Goal achieved",
-#     "Goal abandoned").
-#   - Color: magenta (named ANSI 35), the only color Codex uses for the
-#     indicator regardless of state. Named ANSI is theme-adaptive — terminals
-#     remap it to a readable hue on both dark and light backgrounds.
+# Conventions:
+#   - Label wording per state: "Pursuing goal", "Goal paused", "Goal achieved",
+#     "Goal abandoned", "Goal unmet".
+#   - Color: magenta (named ANSI 35) for every state. Named ANSI is
+#     theme-adaptive — terminals remap it to a readable hue on both dark and
+#     light backgrounds.
 #   - Compact token formatting (12.5K, 100K, 1.2M).
 #   - Compact elapsed formatting (12s, 5m, 1h23m, 2d4h).
-#
-# Differences from Codex:
-#   - Push vs pull: Codex pushes from runtime events; this is pull-based and
-#     refreshes only when Claude Code re-renders the statusLine.
-#   - Adds a port-specific "Goal unmet" label for the `unmet` state (model
-#     gave up); Codex has no equivalent state.
-#   - Codex hides the indicator in Plan mode; Claude Code's hook input
-#     doesn't expose mode, so we always render.
+#   - Pull-based: refreshes only when Claude Code re-renders the statusLine.
 #
 # Style override:
 #   GOAL_STATUSLINE_STYLE = magenta | dim | plain
-#     magenta (default): single ANSI 35 — matches Codex
-#     dim:               ANSI 35 + dim attribute — softer, reference-like
+#     magenta (default): single ANSI 35
+#     dim:               ANSI 35 + dim attribute — softer
 #     plain:             no color — for users who prefer monochrome
 #
 # Usage from your statusLine command:
@@ -76,8 +68,7 @@ fmt_elapsed() {
     fi
 }
 
-# Compact tokens, matching Codex's compact_tokens (goal_status.rs:66):
-# "950" / "12.5K" / "100K" / "1.2M"
+# Compact tokens: "950" / "12.5K" / "100K" / "1.2M".
 fmt_tokens() {
     awk -v n="$1" 'BEGIN {
         if (n < 1000)         { printf "%d", n; }
@@ -87,7 +78,7 @@ fmt_tokens() {
     }'
 }
 
-# Style — defaults to plain magenta (matches Codex). Theme-adaptive: named
+# Style — defaults to plain magenta. Theme-adaptive: named
 # ANSI 35 is remapped by the terminal to be readable on both dark and light
 # backgrounds.
 case "${GOAL_STATUSLINE_STYLE:-magenta}" in
@@ -96,8 +87,7 @@ case "${GOAL_STATUSLINE_STYLE:-magenta}" in
     magenta|*)    open=$'\033[35m'   ; close=$'\033[0m' ;;
 esac
 
-# Build the usage suffix used by Active / BudgetLimited (matches Codex's
-# active_goal_usage helper, goal_status.rs:66).
+# Build the usage suffix used by Active / BudgetLimited.
 usage_with_budget() {
     printf '%s / %s' "$(fmt_tokens "$TOKENS_USED")" "$(fmt_tokens "$TOKEN_BUDGET")"
 }
@@ -125,7 +115,6 @@ case "$STATUS" in
         fi
         ;;
     unmet)
-        # Port-specific state — Codex has no equivalent. Use neutral wording.
         label="Goal unmet (/goal status)"
         ;;
     budget-limited)

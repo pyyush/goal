@@ -2,6 +2,24 @@
 .claude/goal.json
 .claude/goal-hook.log
 .claude/goal.pause
+.claude/goal-baseline-*
+.claude/goal-events.jsonl
+.claude/goal-otel-cursor
+
+# Internal design docs / RFCs / plans — kept local, never committed
+proposal/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Node / TypeScript build artifacts
+mcp/node_modules/
+mcp/dist/
+bin/node_modules/
 
 # macOS
 .DS_Store

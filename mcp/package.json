@@ -1,0 +1,35 @@
+{
+  "name": "goal-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server exposing native model-side tools for the /goal persistent-objective system (create_goal, update_goal, get_goal).",
+  "type": "module",
+  "main": "dist/goal-server.js",
+  "bin": {
+    "goal-mcp-server": "./dist/goal-server.js"
+  },
+  "files": [
+    "dist/",
+    "goal-server.ts",
+    "tsconfig.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node ./dist/goal-server.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "proper-lockfile": "^4.1.2",
+    "uuid": "^11.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "^5.7.2"
+  },
+  "license": "MIT"
+}

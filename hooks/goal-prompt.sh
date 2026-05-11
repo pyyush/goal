@@ -4,7 +4,7 @@
 # UserPromptSubmit hook for /goal — opt-in auto-pause.
 #
 # Subscription-first default: this hook does NOTHING unless you opt in.
-# Set GOAL_AUTOPAUSE_ON_PROMPT=1 to restore Codex-style pause-on-input.
+# Set GOAL_AUTOPAUSE_ON_PROMPT=1 to pause the goal on every user prompt.
 #
 # Resolves goal state via goal-resolve.sh: session pointer first, then
 # walk-up from $cwd. Requires bash 3.2+, jq.
