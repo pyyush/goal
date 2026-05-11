@@ -16,6 +16,11 @@
  *   goal.unmet             → counter goal.unmet
  *   goal.budget_limited    → counter goal.budget_limited
  *   goal.tokens_updated    → histogram goal.token_count (tokens_used, attr goal_id)
+ *   goal.relayed           → counter goal.relayed (attrs: reason, from, to)
+ *   goal.queued            → counter goal.queued (attr: providers_throttled)
+ *   goal.handoff.peer_picked_up → histogram goal.handoff.gap_seconds
+ *   goal.relay.recovery_seconds → histogram goal.relay.recovery_seconds
+ *   goal.lane.conflict     → counter goal.lane.conflict
  *
  * Lifecycle: SIGINT / SIGTERM → flush and exit 0.
  *
@@ -206,6 +211,9 @@ function buildInstruments(): Instruments {
       queued: meter.createCounter("goal.queued", {
         description: "Goal queued events (all providers throttled) keyed by providers_throttled",
       }),
+      lane_conflict: meter.createCounter("goal.lane.conflict", {
+        description: "Lane-lease claim attempts denied due to glob conflict with an existing lease",
+      }),
     },
     histograms: {
       token_count: meter.createHistogram("goal.token_count", {
@@ -313,6 +321,9 @@ function dispatch(ev: GoalEvent): void {
       if (typeof ev.recovery_seconds === "number") {
         inst.histograms.relay_recovery_seconds.record(ev.recovery_seconds, attrs);
       }
+      break;
+    case "goal.lane.conflict":
+      inst.counters.lane_conflict.add(1, attrs);
       break;
     // Unrecognized event types are intentionally ignored.
   }

@@ -1290,16 +1290,31 @@ function validateClaimLaneArgs(args: unknown): ClaimLaneArgs {
 async function toolClaimLane(args: unknown): Promise<ClaimLaneResult> {
   const { glob, ttl_seconds, reason } = validateClaimLaneArgs(args);
   const goalDir = await resolveGoalDir();
+  const paths = pathsFor(discoverExistingGoalRoot()!.root);
 
-  return await withGoalLock(pathsFor(discoverExistingGoalRoot()!.root), () => {
+  return await withGoalLock(paths, () => {
     // Resolve current agent from state.json (current.agent or cwd-derived).
     let holder = "unknown-agent";
+    let goalId: string | undefined;
     try {
-      const state = readGoalState(pathsFor(discoverExistingGoalRoot()!.root));
+      const state = readGoalState(paths);
       if (state?.current?.agent) holder = state.current.agent;
+      if (state?.goal_id) goalId = state.goal_id;
     } catch (_) { /* use fallback */ }
 
-    return claimLaneInner(goalDir, holder, glob, ttl_seconds, reason);
+    const result = claimLaneInner(goalDir, holder, glob, ttl_seconds, reason);
+    if (result.ok === false) {
+      // P6 OTEL: emit goal.lane.conflict so the exporter increments the counter.
+      appendEvent(paths, {
+        ts: nowIso(),
+        type: "goal.lane.conflict",
+        goal_id: goalId ?? "unknown",
+        glob,
+        holder,
+        conflict_with: result.conflict_with,
+      });
+    }
+    return result;
   });
 }
 
