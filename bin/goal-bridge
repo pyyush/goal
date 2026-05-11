@@ -85,11 +85,28 @@ for (let i = 1; i < args.length; i++) {
   }
 }
 
-// ---- resolve patterns config ------------------------------------------------
+// ---- resolve patterns config + handoff template ----------------------------
+//
+// The handoff template (cowork/handoff/template.md) is the canonical shape per
+// spec §5.2. The bridge reads it once at startup and uses it to fill
+// placeholders when writing new envelope files, rather than duplicating the
+// format string inline (P4 refactor).
 
 const __dirname_bridge = dirname(fileURLToPath(import.meta.url));
 const PATTERNS_PATH = process.env.GOAL_BRIDGE_PATTERNS
   || join(__dirname_bridge, '..', 'cowork', 'bridge', 'patterns.json');
+
+const HANDOFF_TEMPLATE_PATH = process.env.GOAL_HANDOFF_TEMPLATE
+  || join(__dirname_bridge, '..', 'cowork', 'handoff', 'template.md');
+
+let handoffTemplate = null;
+try {
+  handoffTemplate = readFileSync(HANDOFF_TEMPLATE_PATH, 'utf8');
+} catch (_) {
+  // Template missing is non-fatal — we fall back to the inline format.
+  // This preserves T4 byte-compatibility if the template is absent in test envs.
+  handoffTemplate = null;
+}
 
 let patternsDoc;
 try {
@@ -118,7 +135,6 @@ const HANDOFF_DIR   = join(GOAL_DIR, 'handoff');
 const QUOTA_FILE    = join(GOAL_DIR, 'quota.json');
 const RELAY_LOG     = join(GOAL_DIR, 'relay-log.jsonl');
 const PAUSE_FILE    = join(GOAL_DIR, 'pause');
-const LOCK_DIR      = GOAL_DIR;  // .goal/ is the lock target (mkdir mutex)
 const LOG_FILE      = join(ROOT, '.claude', 'goal-hook.log');
 const EVENTS_FILE   = join(ROOT, '.claude', 'goal-events.jsonl');
 
@@ -499,40 +515,73 @@ function writeHandoffEnvelope({ seq, from, to, reason, goalId, state }) {
   const handoffPath = join(HANDOFF_DIR, `${seqStr}.md`);
 
   const objective = state?.objective || '';
-  const frontmatter = [
-    '---',
-    `seq: ${seqStr}`,
-    `from: ${from}`,
-    `to: ${to}`,
-    `at: ${ts}`,
-    `reason: ${reason}`,
-    `goal_id: ${goalId}`,
-    '---',
-  ].join('\n');
 
-  const body = [
-    '',
-    '## Did',
+  // Build section bullet strings for template placeholder substitution.
+  const didBullets = [
     `- Agent ${from} was pursuing goal: ${objective.slice(0, 200)}`,
     `- Stopped due to: ${reason}`,
-    '',
-    '## Did not',
-    '- (see open audit items in state.json)',
-    '',
-    '## Next',
-    `- Continue pursuing: ${objective.slice(0, 200)}`,
-    '',
-    '## Do not redo',
-    '- (check lineage in state.json for work already completed)',
-    '',
-    '## Open audit items',
-    '- See state.json .audit.checklist',
-    '',
-    '## Evidence',
-    `- Handoff triggered by: ${reason} from ${from}`,
   ].join('\n');
+  const didNotBullets   = '- (see open audit items in state.json)';
+  const nextBullets     = `- Continue pursuing: ${objective.slice(0, 200)}`;
+  const doNotRedoBullets = '- (check lineage in state.json for work already completed)';
+  const openAuditBullets = '- See state.json .audit.checklist';
+  const evidenceBullets  = `- Handoff triggered by: ${reason} from ${from}`;
 
-  const content = frontmatter + '\n' + body + '\n';
+  let content;
+
+  if (handoffTemplate) {
+    // Use the canonical template — fill {key} placeholders.
+    // Strip the leading comment block (<!-- ... -->) before filling.
+    const templateBody = handoffTemplate.replace(/^<!--[\s\S]*?-->\n?/, '');
+    content = templateBody
+      .replace('{seq}',         seqStr)
+      .replace('{from}',        from)
+      .replace('{to}',          to)
+      .replace('{at}',          ts)
+      .replace('{reason}',      reason)
+      .replace('{goal_id}',     goalId)
+      .replace('{did}',         didBullets)
+      .replace('{did_not}',     didNotBullets)
+      .replace('{next}',        nextBullets)
+      .replace('{do_not_redo}', doNotRedoBullets)
+      .replace('{open_audit}',  openAuditBullets)
+      .replace('{evidence}',    evidenceBullets);
+  } else {
+    // Fallback inline format (template absent — keeps T4 passing in sparse envs).
+    const frontmatter = [
+      '---',
+      `seq: ${seqStr}`,
+      `from: ${from}`,
+      `to: ${to}`,
+      `at: ${ts}`,
+      `reason: ${reason}`,
+      `goal_id: ${goalId}`,
+      '---',
+    ].join('\n');
+
+    const body = [
+      '',
+      '## Did',
+      didBullets,
+      '',
+      '## Did not',
+      didNotBullets,
+      '',
+      '## Next',
+      nextBullets,
+      '',
+      '## Do not redo',
+      doNotRedoBullets,
+      '',
+      '## Open audit items',
+      openAuditBullets,
+      '',
+      '## Evidence',
+      evidenceBullets,
+    ].join('\n');
+
+    content = frontmatter + '\n' + body + '\n';
+  }
 
   // Atomic write.
   mkdirSync(HANDOFF_DIR, { recursive: true });

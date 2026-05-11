@@ -28,6 +28,11 @@
 #   [ -n "$goal" ] && segments+=("$goal")
 #
 # Requires: bash 3.2+, jq, awk.
+#
+# Per spec §13: cowork and solo rendering are DISTINCT CODE PATHS. The cowork
+# branch is entered early and returns before any solo rendering code is reached.
+# Solo rendering is byte-identical to v1. Tests: hooks/test-statusline-cowork.sh
+# (cowork modes) and the pre-existing T8 suite (solo regression).
 
 set -euo pipefail
 
@@ -37,6 +42,235 @@ RESOLVER="$(dirname "$0")/goal-resolve.sh"
 . "$RESOLVER"
 
 resolve_goal "${2:-}" "${1:-$PWD}" || exit 0
+
+# ============================================================================
+# COWORK MODE DETECTION (spec §11, §13)
+# Detect cowork mode BEFORE reading state for the solo render path.
+# Cowork is active if ANY of:
+#   1. state.json has non-null current.agent
+#   2. state.json has any non-null roles.{lead,build,review}
+#   3. cowork.yml exists in .goal/
+#
+# If NONE of these are true → solo mode. Use the existing v1 render path,
+# unchanged, without touching it.
+# ============================================================================
+
+_is_cowork_mode() {
+    # Check for cowork.yml presence (P5 will populate it; P4 detects presence).
+    if [ -f "${GOAL_DIR}/cowork.yml" ]; then
+        return 0
+    fi
+    # Check state.json fields using jq.
+    local raw
+    raw=$(jq -r '
+        if (type == "object") then
+            (
+                ((.current.agent // "") != "") or
+                ((.roles.lead // "") != "") or
+                ((.roles.build // "") != "") or
+                ((.roles.review // "") != "")
+            ) | if . then "yes" else "no" end
+        else "no" end
+    ' "$GOAL_FILE" 2>/dev/null) || raw="no"
+    [ "$raw" = "yes" ]
+}
+
+# Cowork parse.sh path: GOAL_PARSE_SH env override wins, then walk-up.
+# The test harness and packagers that install the statusline outside the
+# repo layout should set GOAL_PARSE_SH explicitly.
+PARSE_SH=""
+if [ -n "${GOAL_PARSE_SH:-}" ] && [ -f "$GOAL_PARSE_SH" ]; then
+    PARSE_SH="$GOAL_PARSE_SH"
+else
+    for _p in \
+        "$(dirname "$0")/../cowork/handoff/parse.sh" \
+        "${GOAL_DIR}/../cowork/handoff/parse.sh"; do
+        if [ -f "$_p" ]; then
+            PARSE_SH="$(cd "$(dirname "$_p")" && pwd)/$(basename "$_p")"
+            break
+        fi
+    done
+fi
+
+# ============================================================================
+# COWORK RENDER PATH (spec §11, §13 — distinct from solo path below)
+# ============================================================================
+
+if _is_cowork_mode; then
+    # Read the fields we need for all cowork sub-modes.
+    # Use ASCII Unit Separator (\x1f) instead of tab. Bash `read` collapses
+    # consecutive whitespace separators (tab is whitespace), so a row like
+    # "pursuing\tagent\t\t\t2/4" with empty handoff_head + queued_until would
+    # eat the empties and put 2/4 in the wrong slot. \x1f is non-whitespace
+    # and never appears in user data.
+    SEP=$'\x1f'
+    COWORK_SHAPE=$(jq -r --arg sep "$SEP" '
+        if (type == "object" and (.status | type) == "string") then
+            [ .status,
+              (.current.agent // ""),
+              (.handoff_head // ""),
+              (.queued_until // ""),
+              (.audit.checklist // null | if . == null then ""
+               else ([ .[] | select(.status == "passed") ] | length | tostring)
+                    + "/" +
+                    (length | tostring)
+               end)
+            ] | join($sep)
+        else "MALFORMED"
+        end
+    ' "$GOAL_FILE" 2>/dev/null) || exit 0
+
+    [ "$COWORK_SHAPE" = "MALFORMED" ] && exit 0
+
+    IFS=$SEP read -r CW_STATUS CW_AGENT CW_HANDOFF_HEAD CW_QUEUED_UNTIL CW_AUDITED \
+        <<<"$COWORK_SHAPE"
+
+    # Style (same style var as solo path).
+    case "${GOAL_STATUSLINE_STYLE:-magenta}" in
+        plain)        open=''            ; close='' ;;
+        dim)          open=$'\033[2;35m' ; close=$'\033[0m' ;;
+        magenta|*)    open=$'\033[35m'   ; close=$'\033[0m' ;;
+    esac
+
+    case "$CW_STATUS" in
+
+        # ---- cowork-active (pursuing) ----------------------------------------
+        pursuing)
+            # Determine current agent's role from state.roles.
+            ROLE=$(jq -r --arg agent "$CW_AGENT" '
+                .roles // {} |
+                to_entries |
+                map(select(.value == $agent)) |
+                if length > 0 then .[0].key else "" end
+            ' "$GOAL_FILE" 2>/dev/null) || ROLE=""
+
+            # Build agent→role token.
+            if [ -n "$ROLE" ]; then
+                agent_token="${CW_AGENT}→${ROLE}"
+            else
+                agent_token="${CW_AGENT}"
+            fi
+
+            # Other agents: read agents/ dir for heartbeat files.
+            OTHER_AGENTS=""
+            if [ -d "${GOAL_DIR}/agents" ]; then
+                for _f in "${GOAL_DIR}/agents/"*.json; do
+                    [ -f "$_f" ] || continue
+                    _aid=$(jq -r '.agent_id // ""' "$_f" 2>/dev/null) || continue
+                    [ "$_aid" = "$CW_AGENT" ] && continue
+                    _role=$(jq -r --arg a "$_aid" '
+                        .roles // {} | to_entries |
+                        map(select(.value == $a)) |
+                        if length > 0 then .[0].key else "" end
+                    ' "$GOAL_FILE" 2>/dev/null) || _role=""
+                    # Determine if the other agent is active (heartbeat within 30s).
+                    _hb=$(jq -r '.heartbeat_at // ""' "$_f" 2>/dev/null) || _hb=""
+                    _state="idle"
+                    if [ -n "$_hb" ]; then
+                        _hb_epoch=$(date -d "$_hb" +%s 2>/dev/null || \
+                                    date -j -f "%Y-%m-%dT%H:%M:%SZ" "$_hb" +%s 2>/dev/null || echo 0)
+                        _now_epoch=$(date +%s)
+                        _age=$(( _now_epoch - _hb_epoch ))
+                        [ "$_age" -lt 30 ] && _state="active"
+                    fi
+                    if [ -n "$_role" ]; then
+                        _tok="${_aid}=${_role} ${_state}"
+                    else
+                        _tok="${_aid} ${_state}"
+                    fi
+                    if [ -z "$OTHER_AGENTS" ]; then
+                        OTHER_AGENTS="$_tok"
+                    else
+                        OTHER_AGENTS="${OTHER_AGENTS} | ${_tok}"
+                    fi
+                done
+            fi
+
+            # Build label.
+            label="cowork: ${agent_token}"
+            [ -n "$OTHER_AGENTS" ] && label="${label} | ${OTHER_AGENTS}"
+            if [ -n "$CW_AUDITED" ] && [ "$CW_AUDITED" != "/" ]; then
+                label="${label} | ${CW_AUDITED} audited"
+            fi
+            ;;
+
+        # ---- relaying --------------------------------------------------------
+        relaying)
+            # Read from/to from the latest handoff envelope via parse.sh.
+            RELAY_FROM=""
+            RELAY_TO=""
+            if [ -n "$PARSE_SH" ] && [ -f "$PARSE_SH" ] && [ -n "$CW_HANDOFF_HEAD" ]; then
+                # shellcheck disable=SC1090
+                . "$PARSE_SH"
+                _handoff_file="${GOAL_DIR}/handoff/${CW_HANDOFF_HEAD}.md"
+                if [ -f "$_handoff_file" ]; then
+                    RELAY_FROM=$(handoff_parse_field "$_handoff_file" from 2>/dev/null) || RELAY_FROM=""
+                    RELAY_TO=$(handoff_parse_field "$_handoff_file" to 2>/dev/null) || RELAY_TO=""
+                fi
+            fi
+            # Fallback: use current.agent from state if parse.sh unavailable.
+            if [ -z "$RELAY_FROM" ] || [ -z "$RELAY_TO" ]; then
+                RELAY_FROM=$(jq -r '
+                    if (.handoff_head != null) then
+                        (.lineage // [] | last | .agent // "")
+                    else "" end
+                ' "$GOAL_FILE" 2>/dev/null) || RELAY_FROM=""
+                RELAY_TO="$CW_AGENT"
+            fi
+            if [ -n "$RELAY_FROM" ] && [ -n "$RELAY_TO" ]; then
+                label="Relaying ${RELAY_FROM} → ${RELAY_TO}…"
+            else
+                label="Relaying…"
+            fi
+            ;;
+
+        # ---- queued ----------------------------------------------------------
+        queued)
+            # Parse queued_until into HH:MM local time.
+            RETRY_TIME=""
+            if [ -n "$CW_QUEUED_UNTIL" ]; then
+                RETRY_TIME=$(date -d "$CW_QUEUED_UNTIL" "+%H:%M" 2>/dev/null || \
+                             date -j -f "%Y-%m-%dT%H:%M:%SZ" "$CW_QUEUED_UNTIL" "+%H:%M" 2>/dev/null || \
+                             echo "$CW_QUEUED_UNTIL")
+            fi
+
+            # Read throttled provider names from quota.json.
+            THROTTLED=""
+            QUOTA_FILE="${GOAL_DIR}/quota.json"
+            if [ -f "$QUOTA_FILE" ]; then
+                THROTTLED=$(jq -r '
+                    .providers // {} |
+                    to_entries |
+                    map(select(.value.estimated_headroom == "exhausted") | .key) |
+                    join(" + ")
+                ' "$QUOTA_FILE" 2>/dev/null) || THROTTLED=""
+            fi
+
+            if [ -n "$RETRY_TIME" ] && [ -n "$THROTTLED" ]; then
+                label="Queued — retry at ${RETRY_TIME} (${THROTTLED} throttled)"
+            elif [ -n "$RETRY_TIME" ]; then
+                label="Queued — retry at ${RETRY_TIME}"
+            else
+                label="Queued"
+            fi
+            ;;
+
+        # ---- other statuses in cowork mode: delegate to readable labels ------
+        paused)         label="Goal paused (/goal resume)" ;;
+        achieved)       label="Goal achieved" ;;
+        unmet)          label="Goal unmet (/goal status)" ;;
+        budget-limited) label="Goal abandoned" ;;
+        *)              exit 0 ;;
+    esac
+
+    printf '%s%s%s' "$open" "$label" "$close"
+    exit 0
+fi
+
+# ============================================================================
+# SOLO RENDER PATH (v1 — unchanged, byte-identical to pre-P4)
+# Only reached when cowork mode is NOT detected above.
+# ============================================================================
 
 # In v2, GOAL_FILE may point at .goal/state.json. The jq filters below are
 # a strict superset so they work unchanged. The only P1 addition is handling

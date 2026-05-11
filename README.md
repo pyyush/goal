@@ -8,6 +8,16 @@
 
 ---
 
+## v2: cowork
+
+`/goal` v2 adds multi-agent cowork: multiple agents (Claude Code, Codex) can pursue the same goal sequentially, with state stored in a shared `.goal/` directory that any agent can read and continue from. The goal is the unit of work; agents are interchangeable runners against a shared protocol. A v1 solo user sees no behavior change — cowork is opt-in via a `cowork.yml` file.
+
+Cowork survives rate limits automatically. When one agent hits a 429 or 5xx error, the bridge writes a handoff envelope to `.goal/handoff/NNNN.md`, transitions state to `relaying`, and the peer agent picks up from exactly where the first left off. If all configured agents are throttled simultaneously, state transitions to `queued` with a `retry_at` timestamp. Normal pursuit resumes automatically once headroom is restored. A relay guardrail caps automatic handoffs at 3 per hour; beyond that the goal auto-pauses and notifies the user.
+
+See [`docs/cowork.md`](docs/cowork.md) for the full protocol, lifecycle, and configuration reference.
+
+---
+
 ## What you get
 
 - **`/goal <objective>`** — set a durable goal. State persists at `.claude/goal.json` across `/clear`, `/compact`, `--resume`, and session restarts.
@@ -129,6 +139,14 @@ Adds one magenta segment to your statusline, showing the live goal state:
 | `achieved` | `Goal achieved (1h 23m)` |
 | `unmet` | `Goal unmet (/goal status)` |
 | `budget-limited` | `Goal abandoned (50K / 50K)` |
+
+Cowork modes (when `cowork.yml` present or `current.agent` set):
+
+| State | Label |
+|---|---|
+| `pursuing` (cowork-active) | `cowork: codex→build \| claude=review idle \| 8/14 audited` |
+| `relaying` | `Relaying claude-code → codex…` |
+| `queued` | `Queued — retry at 14:47 (anthropic + openai throttled)` |
 
 The timer reflects **active pursuit time** — paused intervals are excluded, not wall-clock from when the goal was set. `goal-setup` wires it for you. `GOAL_STATUSLINE_STYLE=dim|plain` for softer / monochrome.
 
