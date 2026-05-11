@@ -21,6 +21,264 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
+// P5: Lane leases and cowork.yml (inline implementations to avoid TS path issues)
+// We inline the lane claim/release logic here rather than importing the
+// .ts modules (which would require tsx at runtime). The canonical types and
+// exported functions live in cowork/lanes.ts and cowork/cowork-yml.ts.
+
+// ── Lanes inline (mirrors cowork/lanes.ts) ───────────────────────────────────
+
+interface LaneLease {
+  lease_id: string;
+  glob: string;
+  holder: string;
+  acquired_at: string;
+  ttl_seconds: number;
+  reason: string;
+}
+
+interface LanesFile {
+  leases: LaneLease[];
+}
+
+type ClaimLaneResult =
+  | { ok: true; lease_id: string }
+  | { ok: false; conflict_with: string };
+
+function lanesFilePath(goalDir: string): string {
+  return join(goalDir, "lanes.json");
+}
+
+function readLanesFileInner(goalDir: string): LanesFile {
+  const fp = lanesFilePath(goalDir);
+  if (!existsSync(fp)) return { leases: [] };
+  try {
+    const raw = readFileSync(fp, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed !== "object" || parsed === null || !Array.isArray((parsed as Record<string, unknown>).leases)) {
+      return { leases: [] };
+    }
+    return parsed as LanesFile;
+  } catch (_) {
+    return { leases: [] };
+  }
+}
+
+function writeLanesFileInner(goalDir: string, data: LanesFile): void {
+  const fp = lanesFilePath(goalDir);
+  const dir = dirname(fp);
+  mkdirSync(dir, { recursive: true });
+  const tmpDir = mkdtempSync(join(dir, ".tmp-lanes-"));
+  const tmp = join(tmpDir, "lanes.json");
+  try {
+    writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf8");
+    renameSync(tmp, fp);
+  } finally {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch (_) { /* best-effort */ }
+    try { rmdirSync(tmpDir); } catch (_) { /* best-effort */ }
+  }
+}
+
+function getHolderHeartbeatAgeMs(goalDir: string, holder: string): number | null {
+  const agentFile = join(goalDir, "agents", `${holder}.json`);
+  if (!existsSync(agentFile)) return null;
+  try {
+    const obj = JSON.parse(readFileSync(agentFile, "utf8")) as Record<string, unknown>;
+    const hbAt = obj.heartbeat_at;
+    if (typeof hbAt !== "string") return null;
+    const hbMs = Date.parse(hbAt);
+    if (!Number.isFinite(hbMs)) return null;
+    return Date.now() - hbMs;
+  } catch (_) {
+    return null;
+  }
+}
+
+const HEARTBEAT_TTL_MS = parseInt(process.env.GOAL_HEARTBEAT_TTL_MS ?? "15000", 10);
+
+function readAndPruneLanesInner(goalDir: string): LanesFile {
+  const data = readLanesFileInner(goalDir);
+  const now = Date.now();
+  const active = data.leases.filter((lease) => {
+    const acquiredMs = Date.parse(lease.acquired_at);
+    if (Number.isFinite(acquiredMs) && now - acquiredMs > lease.ttl_seconds * 1000) return false;
+    const age = getHolderHeartbeatAgeMs(goalDir, lease.holder);
+    if (age !== null && age > HEARTBEAT_TTL_MS) return false;
+    return true;
+  });
+  if (active.length !== data.leases.length) {
+    writeLanesFileInner(goalDir, { leases: active });
+    return { leases: active };
+  }
+  return data;
+}
+
+function globToRegexInner(glob: string): RegExp {
+  let pattern = "^";
+  let i = 0;
+  while (i < glob.length) {
+    const ch = glob[i];
+    if (ch === "*") {
+      if (glob[i + 1] === "*") {
+        pattern += ".*";
+        i += 2;
+        if (glob[i] === "/") i++;
+      } else {
+        pattern += "[^/]*";
+        i++;
+      }
+    } else if (ch === "?") {
+      pattern += "[^/]";
+      i++;
+    } else if (/[.+^${}()|[\]\\]/.test(ch)) {
+      pattern += "\\" + ch;
+      i++;
+    } else {
+      pattern += ch;
+      i++;
+    }
+  }
+  pattern += "$";
+  return new RegExp(pattern);
+}
+
+function samplePathFromGlobInner(glob: string): string {
+  return glob.replace(/\*\*\//g, "a/b/").replace(/\*\*/g, "a/b").replace(/\*/g, "x").replace(/\?/g, "y");
+}
+
+function globsConflictInner(globA: string, globB: string): boolean {
+  const sA = samplePathFromGlobInner(globA);
+  const sB = samplePathFromGlobInner(globB);
+  try {
+    const rA = globToRegexInner(globA);
+    const rB = globToRegexInner(globB);
+    return rA.test(sB) || rB.test(sA);
+  } catch (_) {
+    return true; // conservative
+  }
+}
+
+function claimLaneInner(
+  goalDir: string, holder: string, glob: string, ttlSeconds: number, reason: string
+): ClaimLaneResult {
+  const data = readAndPruneLanesInner(goalDir);
+  for (const existing of data.leases) {
+    if (existing.holder === holder && existing.glob === glob) {
+      // Renewal by same holder.
+      const renewed = data.leases.map((l) =>
+        l.lease_id === existing.lease_id
+          ? { ...l, acquired_at: nowIso(), ttl_seconds: ttlSeconds, reason }
+          : l,
+      );
+      writeLanesFileInner(goalDir, { leases: renewed });
+      return { ok: true, lease_id: existing.lease_id };
+    }
+    if (existing.holder !== holder && globsConflictInner(glob, existing.glob)) {
+      return { ok: false, conflict_with: existing.lease_id };
+    }
+  }
+  const leaseId = randomUUID();
+  writeLanesFileInner(goalDir, {
+    leases: [...data.leases, { lease_id: leaseId, glob, holder, acquired_at: nowIso(), ttl_seconds: ttlSeconds, reason }],
+  });
+  return { ok: true, lease_id: leaseId };
+}
+
+function releaseLaneInner(goalDir: string, leaseId: string): boolean {
+  const data = readLanesFileInner(goalDir);
+  const after = data.leases.filter((l) => l.lease_id !== leaseId);
+  if (after.length === data.leases.length) return false;
+  writeLanesFileInner(goalDir, { leases: after });
+  return true;
+}
+
+// ── CoworkYml inline (mirrors cowork/cowork-yml.ts) ──────────────────────────
+
+interface CoworkAgentConfig { runner: string; model: string; }
+interface CoworkRoles { lead: string | null; build: string | null; review: string | null; }
+interface CoworkRelayConfig { on_rate_limit: boolean; on_5xx: boolean; small_model_offload: boolean; }
+interface CoworkConfig {
+  version: number;
+  agents: Record<string, CoworkAgentConfig>;
+  roles: CoworkRoles;
+  relay: CoworkRelayConfig;
+  heartbeat_ttl_seconds: number;
+}
+
+function parseCoworkYmlInner(text: string): CoworkConfig {
+  const lines = text.split(/\r?\n/);
+  const cleaned = lines.map((l) => l.replace(/\s*#[^\n]*$/, ""));
+  const result: { version?: number; agents: Record<string, CoworkAgentConfig>; roles: CoworkRoles; relay: CoworkRelayConfig; heartbeat_ttl_seconds?: number } = {
+    agents: {}, roles: { lead: null, build: null, review: null },
+    relay: { on_rate_limit: true, on_5xx: true, small_model_offload: false },
+  };
+  type Section = "top" | "agents" | "agents.entry" | "roles" | "relay";
+  let section: Section = "top";
+  let currentAgent = "";
+
+  for (const raw of cleaned) {
+    if (!raw.trim()) continue;
+    const indent = raw.search(/\S/);
+    const content = raw.trim();
+    const colonIdx = content.indexOf(":");
+    if (colonIdx < 0) continue;
+    const key = content.slice(0, colonIdx).trim();
+    const value = content.slice(colonIdx + 1).trim();
+
+    if (indent === 0) {
+      switch (key) {
+        case "version": result.version = parseFloat(value); section = "top"; break;
+        case "heartbeat_ttl_seconds": result.heartbeat_ttl_seconds = parseFloat(value); section = "top"; break;
+        case "agents": section = "agents"; currentAgent = ""; break;
+        case "roles": section = "roles"; break;
+        case "relay": section = "relay"; break;
+        default: section = "top"; break;
+      }
+    } else if (indent === 2) {
+      if (section === "agents" || section === "agents.entry") {
+        if (/^[a-zA-Z0-9_-]+$/.test(key)) {
+          currentAgent = key;
+          if (!result.agents[currentAgent]) result.agents[currentAgent] = { runner: "", model: "default" };
+          section = "agents.entry";
+        }
+      } else if (section === "roles") {
+        if (key === "lead" || key === "build" || key === "review") result.roles[key] = value || null;
+      } else if (section === "relay") {
+        if (key === "on_rate_limit" || key === "on_5xx" || key === "small_model_offload") {
+          (result.relay as unknown as Record<string, boolean>)[key] = value === "true" || value === "yes";
+        }
+      }
+    } else if (indent === 4) {
+      if ((section === "agents" || section === "agents.entry") && currentAgent) {
+        if (key === "runner") result.agents[currentAgent].runner = value;
+        if (key === "model") result.agents[currentAgent].model = value || "default";
+      }
+    }
+  }
+  return {
+    version: result.version ?? 1, agents: result.agents, roles: result.roles,
+    relay: result.relay, heartbeat_ttl_seconds: result.heartbeat_ttl_seconds ?? 15,
+  };
+}
+
+function loadCoworkYmlInner(goalDir: string): CoworkConfig | null {
+  const fp = join(goalDir, "cowork.yml");
+  if (!existsSync(fp)) return null;
+  try {
+    return parseCoworkYmlInner(readFileSync(fp, "utf8"));
+  } catch (_) {
+    return null;
+  }
+}
+
+function getRoleForAgentInner(config: CoworkConfig, agentId: string): string | null {
+  const roles = config.roles as unknown as Record<string, string | null>;
+  for (const [role, agent] of Object.entries(roles)) {
+    if (agent === agentId) return role;
+  }
+  return null;
+}
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -993,6 +1251,346 @@ async function toolGetGoal(): Promise<GoalView> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// P5: Five new MCP tool implementations (coordination only, not lifecycle)
+// Per spec §9 and §13: these are asymmetric-safe (model CAN call them);
+// model still cannot pause/resume/budget/mark-unmet (existing 3 tools).
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Resolve the .goal/ directory for P5 tools. */
+async function resolveGoalDir(): Promise<string> {
+  const discovered = discoverExistingGoalRoot();
+  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
+  const paths = await resolvePathsWithMigration(discovered.root);
+  return paths.goalDir;
+}
+
+// ── claim_lane ────────────────────────────────────────────────────────────────
+
+interface ClaimLaneArgs { glob: string; ttl_seconds: number; reason: string; }
+
+function validateClaimLaneArgs(args: unknown): ClaimLaneArgs {
+  const obj = asObject(args ?? {});
+  const glob = obj.glob;
+  if (typeof glob !== "string" || glob.trim().length === 0) {
+    throw new ToolError("invalid_input", '"glob" is required and must be a non-empty string');
+  }
+  if (glob.length > 512) throw new ToolError("invalid_input", '"glob" exceeds max length 512');
+  const ttlRaw = obj.ttl_seconds;
+  const ttl = typeof ttlRaw === "number" ? ttlRaw : parseInt(String(ttlRaw ?? "600"), 10);
+  if (!Number.isInteger(ttl) || ttl < 1 || ttl > 86400) {
+    throw new ToolError("invalid_input", '"ttl_seconds" must be an integer between 1 and 86400');
+  }
+  const reason = obj.reason;
+  if (typeof reason !== "string" || reason.trim().length === 0) {
+    throw new ToolError("invalid_input", '"reason" is required and must be a non-empty string');
+  }
+  return { glob: glob.trim(), ttl_seconds: ttl, reason: reason.trim() };
+}
+
+async function toolClaimLane(args: unknown): Promise<ClaimLaneResult> {
+  const { glob, ttl_seconds, reason } = validateClaimLaneArgs(args);
+  const goalDir = await resolveGoalDir();
+
+  return await withGoalLock(pathsFor(discoverExistingGoalRoot()!.root), () => {
+    // Resolve current agent from state.json (current.agent or cwd-derived).
+    let holder = "unknown-agent";
+    try {
+      const state = readGoalState(pathsFor(discoverExistingGoalRoot()!.root));
+      if (state?.current?.agent) holder = state.current.agent;
+    } catch (_) { /* use fallback */ }
+
+    return claimLaneInner(goalDir, holder, glob, ttl_seconds, reason);
+  });
+}
+
+// ── release_lane ──────────────────────────────────────────────────────────────
+
+function validateReleaseLaneArgs(args: unknown): { lease_id: string } {
+  const obj = asObject(args ?? {});
+  const lid = obj.lease_id;
+  if (typeof lid !== "string" || lid.trim().length === 0) {
+    throw new ToolError("invalid_input", '"lease_id" is required and must be a non-empty string');
+  }
+  return { lease_id: lid.trim() };
+}
+
+async function toolReleaseLane(args: unknown): Promise<{ ok: boolean }> {
+  const { lease_id } = validateReleaseLaneArgs(args);
+  const goalDir = await resolveGoalDir();
+
+  return await withGoalLock(pathsFor(discoverExistingGoalRoot()!.root), () => {
+    const ok = releaseLaneInner(goalDir, lease_id);
+    return { ok };
+  });
+}
+
+// ── write_handoff ─────────────────────────────────────────────────────────────
+
+interface WriteHandoffMcpArgs {
+  to: string;
+  did: string[];
+  did_not: string[];
+  next: string[];
+  do_not_redo: string[];
+  evidence: string[];
+}
+
+function validateWriteHandoffArgs(args: unknown): WriteHandoffMcpArgs {
+  const obj = asObject(args ?? {});
+  const requireStringArray = (key: string) => {
+    const v = obj[key];
+    if (!Array.isArray(v)) throw new ToolError("invalid_input", `"${key}" must be an array of strings`);
+    for (const item of v) {
+      if (typeof item !== "string") throw new ToolError("invalid_input", `"${key}[]" items must be strings`);
+    }
+    return v as string[];
+  };
+
+  const to = obj.to;
+  if (typeof to !== "string" || to.trim().length === 0) {
+    throw new ToolError("invalid_input", '"to" is required (target agent ID)');
+  }
+
+  return {
+    to: to.trim(),
+    did: requireStringArray("did"),
+    did_not: requireStringArray("did_not"),
+    next: requireStringArray("next"),
+    do_not_redo: requireStringArray("do_not_redo"),
+    evidence: requireStringArray("evidence"),
+  };
+}
+
+async function toolWriteHandoff(args: unknown): Promise<{ seq: string; path: string }> {
+  const wArgs = validateWriteHandoffArgs(args);
+  const discovered = discoverExistingGoalRoot();
+  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
+  const paths = await resolvePathsWithMigration(discovered.root);
+  const goalDir = paths.goalDir;
+  const handoffDir = join(goalDir, "handoff");
+
+  return await withGoalLock(paths, () => {
+    const state = readGoalState(paths);
+    if (!state) throw new ToolError("no_active_goal", "no active goal found");
+
+    // Compute from: current agent or "unknown".
+    const from = state.current?.agent ?? "unknown";
+    const goalId = state.goal_id;
+
+    // Compute next seq inside lock.
+    mkdirSync(handoffDir, { recursive: true });
+    let max = 0;
+    try {
+      const files = readdirSync(handoffDir).filter((f) => /^\d{4}\.md$/.test(f));
+      for (const f of files) { const n = parseInt(f, 10); if (n > max) max = n; }
+    } catch (_) { /* empty */ }
+    const seq = max + 1;
+    const seqStr = String(seq).padStart(4, "0");
+    const ts = nowIso();
+    const handoffPath = join(handoffDir, `${seqStr}.md`);
+
+    // Format bullets.
+    const fmt = (bullets: string[]) =>
+      bullets.length === 0 ? "- (none)" : bullets.map((b) => (b.startsWith("- ") ? b : `- ${b}`)).join("\n");
+
+    const content = [
+      "---",
+      `seq: ${seqStr}`,
+      `from: ${from}`,
+      `to: ${wArgs.to}`,
+      `at: ${ts}`,
+      `reason: planned`,
+      `goal_id: ${goalId}`,
+      "---",
+      "",
+      "## Did",
+      fmt(wArgs.did),
+      "",
+      "## Did not",
+      fmt(wArgs.did_not),
+      "",
+      "## Next",
+      fmt(wArgs.next),
+      "",
+      "## Do not redo",
+      fmt(wArgs.do_not_redo),
+      "",
+      "## Open audit items",
+      "- See state.json .audit.checklist",
+      "",
+      "## Evidence",
+      fmt(wArgs.evidence),
+      "",
+    ].join("\n");
+
+    // Atomic write.
+    const tmpDir = mkdtempSync(join(handoffDir, ".tmp-handoff-"));
+    const tmp = join(tmpDir, "handoff.md");
+    try {
+      writeFileSync(tmp, content, "utf8");
+      renameSync(tmp, handoffPath);
+    } catch (e) {
+      try { if (existsSync(tmp)) unlinkSync(tmp); } catch (_) { /* best-effort */ }
+      try { rmdirSync(tmpDir); } catch (_) { /* best-effort */ }
+      throw new ToolError("io_error", `handoff write failed: ${(e as Error).message}`);
+    }
+    try { rmdirSync(tmpDir); } catch (_) { /* best-effort */ }
+
+    // Update handoff_head in state.
+    try {
+      const updated = { ...state, handoff_head: seqStr, updated_at: nowIso() };
+      atomicWriteStateV2(paths.goalFile, updated);
+    } catch (_) { /* non-fatal — handoff is written */ }
+
+    return { seq: seqStr, path: handoffPath };
+  });
+}
+
+// ── peer_status ───────────────────────────────────────────────────────────────
+
+interface PeerStatus {
+  peer_agent: string | null;
+  last_heartbeat: string | null;
+  current_role: string | null;
+  headroom: string;
+}
+
+async function toolPeerStatus(): Promise<PeerStatus> {
+  const discovered = discoverExistingGoalRoot();
+  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
+  const paths = await resolvePathsWithMigration(discovered.root);
+  const goalDir = paths.goalDir;
+
+  return await withGoalLock(paths, () => {
+    const state = readGoalState(paths);
+    const currentAgent = state?.current?.agent ?? null;
+
+    // Read quota.json for headroom.
+    let headroom = "high";
+    try {
+      const quotaRaw = readFileSync(join(goalDir, "quota.json"), "utf8");
+      const quota = JSON.parse(quotaRaw) as Record<string, unknown>;
+      const providers = quota.providers as Record<string, Record<string, unknown>> | undefined;
+      if (providers) {
+        // headroom = lowest headroom across all providers.
+        const order = ["high", "medium", "low", "exhausted"];
+        for (const p of Object.values(providers)) {
+          const h = String(p.estimated_headroom ?? "high");
+          if (order.indexOf(h) > order.indexOf(headroom)) headroom = h;
+        }
+      }
+    } catch (_) { /* quota.json absent = high */ }
+
+    // Scan agents/ dir for peer heartbeats.
+    const agentsDir = join(goalDir, "agents");
+    let peerAgent: string | null = null;
+    let lastHeartbeat: string | null = null;
+
+    try {
+      const agentFiles = readdirSync(agentsDir).filter((f) => f.endsWith(".json"));
+      // Pick the peer with the most recent heartbeat (excluding current agent).
+      let bestHbMs = 0;
+      for (const f of agentFiles) {
+        try {
+          const obj = JSON.parse(readFileSync(join(agentsDir, f), "utf8")) as Record<string, unknown>;
+          const agentId = String(obj.agent_id ?? "");
+          if (agentId === currentAgent) continue; // skip self
+          const hbAt = String(obj.heartbeat_at ?? "");
+          const hbMs = hbAt ? Date.parse(hbAt) : 0;
+          if (hbMs > bestHbMs) {
+            bestHbMs = hbMs;
+            peerAgent = agentId;
+            lastHeartbeat = hbAt || null;
+          }
+        } catch (_) { /* skip malformed agent file */ }
+      }
+    } catch (_) { /* agents dir absent */ }
+
+    // current_role from cowork.yml.
+    let currentRole: string | null = null;
+    try {
+      const coworkCfg = loadCoworkYmlInner(goalDir);
+      if (coworkCfg && currentAgent) {
+        currentRole = getRoleForAgentInner(coworkCfg, currentAgent);
+      }
+    } catch (_) { /* cowork.yml absent or invalid */ }
+
+    return { peer_agent: peerAgent, last_heartbeat: lastHeartbeat, current_role: currentRole, headroom };
+  });
+}
+
+// ── relay_now ─────────────────────────────────────────────────────────────────
+
+const VALID_RELAY_REASONS = new Set(["planned", "rate_limit", "budget_step_down", "error", "user"]);
+
+function validateRelayNowArgs(args: unknown): { reason: string } {
+  const obj = asObject(args ?? {});
+  const reason = obj.reason;
+  if (typeof reason !== "string" || !VALID_RELAY_REASONS.has(reason)) {
+    throw new ToolError("invalid_input", `"reason" must be one of: ${[...VALID_RELAY_REASONS].join(", ")}`);
+  }
+  return { reason };
+}
+
+async function toolRelayNow(args: unknown): Promise<{ ok: boolean; handoff_seq: string | null }> {
+  const { reason } = validateRelayNowArgs(args);
+  const discovered = discoverExistingGoalRoot();
+  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
+  const paths = await resolvePathsWithMigration(discovered.root);
+  const goalDir = paths.goalDir;
+
+  // Write a fault file that the running bridge can detect.
+  // relay_now only works when a bridge is running for the current agent.
+  const state = await withGoalLock(paths, () => readGoalState(paths));
+  if (!state) throw new ToolError("no_active_goal", "no active goal found");
+
+  const currentAgent = state.current?.agent;
+  if (!currentAgent) {
+    throw new ToolError("no_active_goal", "no current.agent set — is a bridge running?");
+  }
+
+  // Write a .fault file for the bridge to detect and act on.
+  const faultFile = join(goalDir, "agents", `${currentAgent}.fault`);
+  const faultData = JSON.stringify({
+    kind: reason === "rate_limit" ? "rate_limit" : "other",
+    at: nowIso(),
+    payload: `relay_now: ${reason}`,
+    event_type: "mcp_relay_now",
+  }, null, 2) + "\n";
+
+  try {
+    mkdirSync(dirname(faultFile), { recursive: true });
+    const faultTmpDir = mkdtempSync(join(dirname(faultFile), ".tmp-fault-"));
+    const faultTmp = join(faultTmpDir, "fault.json");
+    try {
+      writeFileSync(faultTmp, faultData, "utf8");
+      renameSync(faultTmp, faultFile);
+    } finally {
+      try { if (existsSync(faultTmp)) unlinkSync(faultTmp); } catch (_) { /* best-effort */ }
+      try { rmdirSync(faultTmpDir); } catch (_) { /* best-effort */ }
+    }
+  } catch (e) {
+    throw new ToolError("io_error", `relay_now: could not write fault file: ${(e as Error).message}`);
+  }
+
+  // Poll for bridge to pick it up (up to 5s).
+  const deadline = Date.now() + 5000;
+  let handoffSeq: string | null = null;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+    try {
+      const fresh = readGoalState(paths);
+      if (fresh && (fresh.status === "relaying" || fresh.status === "pursuing") && fresh.handoff_head) {
+        handoffSeq = fresh.handoff_head;
+        break;
+      }
+    } catch (_) { /* retry */ }
+  }
+
+  return { ok: true, handoff_seq: handoffSeq };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // MCP wiring
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -1046,6 +1644,95 @@ const TOOLS: Tool[] = [
       additionalProperties: false,
     },
   },
+  // ── P5: Coordination-only tools (not lifecycle — asymmetric constraints preserved) ──
+  {
+    name: "claim_lane",
+    description:
+      "Claim an exclusive lane lease on a file glob before making edits. Prevents concurrent agents from editing the same paths. Returns {ok:true, lease_id} on success or {ok:false, conflict_with} when another agent holds a conflicting lease. Always release the lease when done (use release_lane).",
+    inputSchema: {
+      type: "object",
+      required: ["glob", "ttl_seconds", "reason"],
+      properties: {
+        glob: {
+          type: "string",
+          description: "File glob pattern to lock (e.g. 'src/auth/**', '*.ts'). Supports ** (any path), * (any filename chars), ? (single char).",
+          maxLength: 512,
+        },
+        ttl_seconds: {
+          type: "integer",
+          minimum: 1,
+          maximum: 86400,
+          description: "Lease TTL in seconds (1–86400). Lease auto-expires after this duration.",
+        },
+        reason: {
+          type: "string",
+          description: "Human-readable reason for the lease (e.g. 'implementing session refresh').",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "release_lane",
+    description:
+      "Release a lane lease by lease_id. Call this after finishing edits to the locked glob, so other agents can proceed. Returns {ok:true} if found and released, {ok:false} if lease_id was not found (already expired or released).",
+    inputSchema: {
+      type: "object",
+      required: ["lease_id"],
+      properties: {
+        lease_id: {
+          type: "string",
+          description: "UUID lease_id returned by claim_lane.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "write_handoff",
+    description:
+      "Write a handoff envelope to .goal/handoff/NNNN.md — a structured note for the peer agent. Use this before yielding to another agent (e.g. before relay_now). Returns {seq, path}.",
+    inputSchema: {
+      type: "object",
+      required: ["to", "did", "did_not", "next", "do_not_redo", "evidence"],
+      properties: {
+        to: { type: "string", description: "Target agent ID receiving the handoff." },
+        did: { type: "array", items: { type: "string" }, description: "What was accomplished (bullet list)." },
+        did_not: { type: "array", items: { type: "string" }, description: "What was explicitly NOT done (bullet list)." },
+        next: { type: "array", items: { type: "string" }, description: "What the receiving agent should do next (bullet list)." },
+        do_not_redo: { type: "array", items: { type: "string" }, description: "Work that should not be repeated (bullet list)." },
+        evidence: { type: "array", items: { type: "string" }, description: "File paths or artifacts that prove the work was done (bullet list)." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "peer_status",
+    description:
+      "Get the status of the peer agent: last heartbeat, their current role from cowork.yml, and estimated provider headroom. Returns {peer_agent, last_heartbeat, current_role, headroom}. Returns {peer_agent:null} if no peer is running.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "relay_now",
+    description:
+      "Force an immediate relay to the peer agent for the given reason. Writes a fault signal that the running bridge picks up and converts to a handoff. Waits up to 5s for the bridge to confirm the relay. Only works when a bridge is running for the current agent. Returns {ok, handoff_seq}.",
+    inputSchema: {
+      type: "object",
+      required: ["reason"],
+      properties: {
+        reason: {
+          type: "string",
+          enum: ["planned", "rate_limit", "budget_step_down", "error", "user"],
+          description: "Relay reason. Use 'planned' for an intentional yield, 'rate_limit' if you are being throttled.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 function toolResultFromObject(value: unknown): CallToolResult {
@@ -1079,6 +1766,17 @@ async function dispatch(name: string, args: unknown): Promise<CallToolResult> {
         return toolResultFromObject(await toolUpdateGoal(args));
       case "get_goal":
         return toolResultFromObject(await toolGetGoal());
+      // P5: coordination tools
+      case "claim_lane":
+        return toolResultFromObject(await toolClaimLane(args));
+      case "release_lane":
+        return toolResultFromObject(await toolReleaseLane(args));
+      case "write_handoff":
+        return toolResultFromObject(await toolWriteHandoff(args));
+      case "peer_status":
+        return toolResultFromObject(await toolPeerStatus());
+      case "relay_now":
+        return toolResultFromObject(await toolRelayNow(args));
       default:
         return errorResult(new ToolError("invalid_input", `unknown tool: ${name}`));
     }

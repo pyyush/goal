@@ -136,13 +136,71 @@ if _is_cowork_mode; then
 
         # ---- cowork-active (pursuing) ----------------------------------------
         pursuing)
-            # Determine current agent's role from state.roles.
-            ROLE=$(jq -r --arg agent "$CW_AGENT" '
-                .roles // {} |
-                to_entries |
-                map(select(.value == $agent)) |
-                if length > 0 then .[0].key else "" end
-            ' "$GOAL_FILE" 2>/dev/null) || ROLE=""
+            # ---- P5: Parse cowork.yml for role names (a14 full) ----------------
+            # Precedence: cowork.yml roles > state.json roles > empty.
+            # cowork.yml maps agent-name→role; agent files map agent_id→runner.
+            # We do a two-step lookup:
+            #   1. Find which agent-name in cowork.yml has runner matching
+            #      the runner prefix of CW_AGENT (e.g. "claude-code" in agent_id).
+            #   2. Use that agent-name to look up roles.lead/build/review.
+            # This is a heuristic: robust when agent_id = <runner>-<host>-<pid>.
+            _COWORK_YML="${GOAL_DIR}/cowork.yml"
+
+            # Helper: given an agent_id, return its role from cowork.yml or state.roles.
+            _lookup_role_for_agent() {
+                local _agent_id="$1"
+                local _role_out=""
+                # Try cowork.yml first (P5 path).
+                if [ -f "$_COWORK_YML" ]; then
+                    # Parse cowork.yml roles section with awk.
+                    # roles section: lead/build/review → agent-name.
+                    # agents section: agent-name → runner.
+                    # Match by finding which agent-name's runner is a prefix of _agent_id.
+                    _role_out=$(awk -v agent_id="$_agent_id" '
+                        /^agents:/ { in_agents=1; in_roles=0; in_agent_entry=0; next }
+                        /^roles:/ { in_roles=1; in_agents=0; in_agent_entry=0; next }
+                        /^[a-zA-Z]/ && !/^agents:/ && !/^roles:/ { in_agents=0; in_roles=0; in_agent_entry=0 }
+                        in_agents && /^  [a-zA-Z0-9_-]+:/ {
+                            gsub(/^  /,""); gsub(/:.*$/,""); current_agent_name=$0; in_agent_entry=1; next
+                        }
+                        in_agents && in_agent_entry && /^    runner:/ {
+                            gsub(/^    runner:[[:space:]]*/,""); gsub(/[[:space:]]*$/,"")
+                            runner = $0
+                            # Store runner for this agent name.
+                            agent_runners[current_agent_name] = runner
+                        }
+                        in_roles && /^  (lead|build|review):/ {
+                            gsub(/^  /,""); split($0, kv, /:[[:space:]]*/); role_name = kv[1]; role_agent = kv[2]
+                            gsub(/[[:space:]]*$/,"",role_agent)
+                            role_assignments[role_name] = role_agent
+                        }
+                        END {
+                            # Try to match agent_id by runner prefix.
+                            for (aname in agent_runners) {
+                                runner = agent_runners[aname]
+                                if (index(agent_id, runner) == 1) {
+                                    # This agent_name matches. Find its role.
+                                    for (role in role_assignments) {
+                                        if (role_assignments[role] == aname) { print role; exit }
+                                    }
+                                }
+                            }
+                        }
+                    ' "$_COWORK_YML" 2>/dev/null) || _role_out=""
+                fi
+                # Fallback: state.json roles (P4 path).
+                if [ -z "$_role_out" ]; then
+                    _role_out=$(jq -r --arg a "$_agent_id" '
+                        .roles // {} | to_entries |
+                        map(select(.value == $a)) |
+                        if length > 0 then .[0].key else "" end
+                    ' "$GOAL_FILE" 2>/dev/null) || _role_out=""
+                fi
+                printf '%s' "$_role_out"
+            }
+
+            # Determine current agent's role.
+            ROLE=$(_lookup_role_for_agent "$CW_AGENT") || ROLE=""
 
             # Build agent→role token.
             if [ -n "$ROLE" ]; then
@@ -158,11 +216,7 @@ if _is_cowork_mode; then
                     [ -f "$_f" ] || continue
                     _aid=$(jq -r '.agent_id // ""' "$_f" 2>/dev/null) || continue
                     [ "$_aid" = "$CW_AGENT" ] && continue
-                    _role=$(jq -r --arg a "$_aid" '
-                        .roles // {} | to_entries |
-                        map(select(.value == $a)) |
-                        if length > 0 then .[0].key else "" end
-                    ' "$GOAL_FILE" 2>/dev/null) || _role=""
+                    _role=$(_lookup_role_for_agent "$_aid") || _role=""
                     # Determine if the other agent is active (heartbeat within 30s).
                     _hb=$(jq -r '.heartbeat_at // ""' "$_f" 2>/dev/null) || _hb=""
                     _state="idle"

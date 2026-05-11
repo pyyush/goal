@@ -35,10 +35,18 @@ commands:
   serve-http [--port N]             local HTTP shim (loopback only, default 7474)
   bridge start <runner>             start goal-bridge for <runner> in background
   bridge stop <runner>              stop goal-bridge for <runner>
+  handoff list [--json]             list handoff envelopes in .goal/handoff/
+  handoff show <seq> [--json]       show a specific handoff envelope
+  lanes [--json]                    list current lane leases
+  lanes release <lease_id>          release a lane lease
+  relay [--json]                    force relay to peer (writes fault signal)
+  quota [--json]                    show provider headroom from .goal/quota.json
+  cowork init                       write default .goal/cowork.yml
 
 options:
   --root <dir>     use <dir>/.claude/goal.json instead of walking up
-  --json           machine-readable output (applies to: get, status, bridge start/stop)
+  --json           machine-readable output (applies to: get, status, bridge start/stop,
+                   handoff list/show, lanes, relay, quota)
 EOF
 }
 
@@ -82,9 +90,9 @@ resolve_root() {
         fi
         d=$(dirname "$d")
     done
-    # No existing goal found — for create/listen/serve-http, use $PWD. Else fail.
+    # No existing goal found — for create/listen/serve-http/cowork init, use $PWD. Else fail.
     case "$CMD" in
-        create|listen|serve-http) printf '%s' "$PWD" ;;
+        create|listen|serve-http|cowork) printf '%s' "$PWD" ;;
         *) die "no goal state found (walked up from $PWD). Did you mean: goalctl create <objective>?" ;;
     esac
 }
@@ -757,6 +765,294 @@ bridge)
 
     *)
         die "bridge: unknown subcommand '$BRIDGE_SUBCMD' (use start|stop)"
+        ;;
+    esac
+    ;;
+
+handoff)
+    # handoff list | handoff show <seq>
+    # P5: §10 goalctl additions.
+    HANDOFF_SUBCMD="${ARGS[0]:-}"
+    [ -n "$HANDOFF_SUBCMD" ] || die "handoff: subcommand required (list|show)"
+
+    _HANDOFF_DIR="$ROOT/.goal/handoff"
+
+    case "$HANDOFF_SUBCMD" in
+
+    list)
+        # List all handoff envelopes sorted by seq ascending.
+        if [ ! -d "$_HANDOFF_DIR" ]; then
+            if [ "$JSON_OUTPUT" -eq 1 ]; then
+                printf '{"handoffs":[]}\n'
+            else
+                printf 'No handoff envelopes found.\n'
+            fi
+            exit 0
+        fi
+        _FILES=$(ls -1 "$_HANDOFF_DIR"/*.md 2>/dev/null | sort || true)
+        if [ -z "$_FILES" ]; then
+            if [ "$JSON_OUTPUT" -eq 1 ]; then
+                printf '{"handoffs":[]}\n'
+            else
+                printf 'No handoff envelopes found.\n'
+            fi
+            exit 0
+        fi
+        if [ "$JSON_OUTPUT" -eq 1 ]; then
+            # Build JSON array from frontmatter fields.
+            printf '{"handoffs":['
+            _first=1
+            for _f in $_FILES; do
+                [ -f "$_f" ] || continue
+                _seq=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^seq:/{gsub(/^seq:[[:space:]]*/,"");print;exit}' "$_f" 2>/dev/null || echo "")
+                _from=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^from:/{gsub(/^from:[[:space:]]*/,"");print;exit}' "$_f" 2>/dev/null || echo "")
+                _to=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^to:/{gsub(/^to:[[:space:]]*/,"");print;exit}' "$_f" 2>/dev/null || echo "")
+                _at=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^at:/{gsub(/^at:[[:space:]]*/,"");print;exit}' "$_f" 2>/dev/null || echo "")
+                _reason=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^reason:/{gsub(/^reason:[[:space:]]*/,"");print;exit}' "$_f" 2>/dev/null || echo "")
+                [ "$_first" -eq 1 ] || printf ','
+                _first=0
+                jq -n --arg seq "$_seq" --arg from "$_from" --arg to "$_to" \
+                      --arg at "$_at" --arg reason "$_reason" --arg path "$_f" \
+                    '{seq:$seq,from:$from,to:$to,at:$at,reason:$reason,path:$path}'
+            done
+            printf ']}\n'
+        else
+            for _f in $_FILES; do
+                [ -f "$_f" ] || continue
+                _seq=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^seq:/{gsub(/^seq:[[:space:]]*/,"");print;exit}' "$_f" 2>/dev/null || echo "?")
+                _from=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^from:/{gsub(/^from:[[:space:]]*/,"");print;exit}' "$_f" 2>/dev/null || echo "?")
+                _to=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^to:/{gsub(/^to:[[:space:]]*/,"");print;exit}' "$_f" 2>/dev/null || echo "?")
+                _reason=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^reason:/{gsub(/^reason:[[:space:]]*/,"");print;exit}' "$_f" 2>/dev/null || echo "?")
+                printf '%s  %s→%s  %s\n' "$_seq" "$_from" "$_to" "$_reason"
+            done
+        fi
+        ;;
+
+    show)
+        _SEQ="${ARGS[1]:-}"
+        [ -n "$_SEQ" ] || die "handoff show: sequence number required"
+        # Pad to 4 digits.
+        _SEQ_PAD=$(printf '%04d' "$_SEQ" 2>/dev/null || printf '%s' "$_SEQ")
+        _HFILE="$_HANDOFF_DIR/${_SEQ_PAD}.md"
+        [ -f "$_HFILE" ] || die "handoff show: no envelope at $_HFILE"
+        if [ "$JSON_OUTPUT" -eq 1 ]; then
+            # Extract all frontmatter fields and content.
+            _seq=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^seq:/{gsub(/^seq:[[:space:]]*/,"");print;exit}' "$_HFILE" 2>/dev/null || echo "")
+            _from=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^from:/{gsub(/^from:[[:space:]]*/,"");print;exit}' "$_HFILE" 2>/dev/null || echo "")
+            _to=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^to:/{gsub(/^to:[[:space:]]*/,"");print;exit}' "$_HFILE" 2>/dev/null || echo "")
+            _at=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^at:/{gsub(/^at:[[:space:]]*/,"");print;exit}' "$_HFILE" 2>/dev/null || echo "")
+            _reason=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^reason:/{gsub(/^reason:[[:space:]]*/,"");print;exit}' "$_HFILE" 2>/dev/null || echo "")
+            _gid=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^goal_id:/{gsub(/^goal_id:[[:space:]]*/,"");print;exit}' "$_HFILE" 2>/dev/null || echo "")
+            _content=$(cat "$_HFILE")
+            jq -n --arg seq "$_seq" --arg from "$_from" --arg to "$_to" \
+                  --arg at "$_at" --arg reason "$_reason" --arg goal_id "$_gid" \
+                  --arg content "$_content" --arg path "$_HFILE" \
+                '{seq:$seq,from:$from,to:$to,at:$at,reason:$reason,goal_id:$goal_id,path:$path,content:$content}'
+        else
+            cat "$_HFILE"
+        fi
+        ;;
+
+    *)
+        die "handoff: unknown subcommand '$HANDOFF_SUBCMD' (use list|show)"
+        ;;
+    esac
+    ;;
+
+lanes)
+    # lanes                  — list active leases
+    # lanes release <id>     — release a lease
+    # P5: §10 goalctl additions. All under .goal/lanes.json.
+
+    _LANES_SUBCMD="${ARGS[0]:-}"
+    _LANES_FILE="$ROOT/.goal/lanes.json"
+    _AGENTS_DIR="$ROOT/.goal/agents"
+
+    _prune_lanes() {
+        # Inline lazy pruning: remove expired or stale leases.
+        [ -f "$_LANES_FILE" ] || return 0
+        local _now_epoch
+        _now_epoch=$(date +%s)
+        local _hb_ttl="${GOAL_HEARTBEAT_TTL_MS:-15000}"
+        _hb_ttl_s=$(( _hb_ttl / 1000 ))
+
+        jq --argjson now "$_now_epoch" --argjson hb_ttl_s "$_hb_ttl_s" \
+            --arg agents_dir "$_AGENTS_DIR" '
+            .leases |= map(
+              . as $lease |
+              (try ($lease.acquired_at | fromdateiso8601) catch null) as $acq |
+              ($acq != null and ($now - $acq) > $lease.ttl_seconds) as $expired |
+              if $expired then empty
+              else .
+              end
+            )
+        ' "$_LANES_FILE" > "$_LANES_FILE.tmp" 2>/dev/null && \
+        mv "$_LANES_FILE.tmp" "$_LANES_FILE" 2>/dev/null || \
+        rm -f "$_LANES_FILE.tmp" 2>/dev/null || true
+    }
+
+    case "${_LANES_SUBCMD}" in
+
+    release)
+        _LEASE_ID="${ARGS[1]:-}"
+        [ -n "$_LEASE_ID" ] || die "lanes release: lease_id required"
+        [ -f "$_LANES_FILE" ] || die "lanes release: no lanes.json at $_LANES_FILE"
+        if ! goal_lock_acquire "$ROOT"; then
+            die "lanes release: could not acquire lock"
+        fi
+        trap 'goal_lock_release "$ROOT"' EXIT INT TERM
+        _prune_lanes
+
+        _BEFORE=$(jq '.leases | length' "$_LANES_FILE" 2>/dev/null || echo 0)
+        jq --arg lid "$_LEASE_ID" '.leases |= map(select(.lease_id != $lid))' \
+            "$_LANES_FILE" > "$_LANES_FILE.tmp" 2>/dev/null && \
+            mv "$_LANES_FILE.tmp" "$_LANES_FILE" 2>/dev/null || \
+            { rm -f "$_LANES_FILE.tmp" 2>/dev/null; die "lanes release: jq failed"; }
+        _AFTER=$(jq '.leases | length' "$_LANES_FILE" 2>/dev/null || echo 0)
+
+        goal_lock_release "$ROOT"
+        trap - EXIT INT TERM
+
+        if [ "$_BEFORE" -gt "$_AFTER" ]; then
+            if [ "$JSON_OUTPUT" -eq 1 ]; then
+                jq -n --arg lid "$_LEASE_ID" '{ok:true,released:$lid}'
+            else
+                printf 'released: %s\n' "$_LEASE_ID"
+            fi
+        else
+            if [ "$JSON_OUTPUT" -eq 1 ]; then
+                jq -n --arg lid "$_LEASE_ID" '{ok:false,note:"lease not found"}'
+            else
+                printf 'lease not found: %s\n' "$_LEASE_ID"
+            fi
+            exit 1
+        fi
+        ;;
+
+    "")
+        # List active leases (with lazy pruning).
+        _prune_lanes
+
+        if [ ! -f "$_LANES_FILE" ]; then
+            if [ "$JSON_OUTPUT" -eq 1 ]; then
+                printf '{"leases":[]}\n'
+            else
+                printf 'No active lane leases.\n'
+            fi
+            exit 0
+        fi
+
+        if [ "$JSON_OUTPUT" -eq 1 ]; then
+            cat "$_LANES_FILE"
+        else
+            _COUNT=$(jq '.leases | length' "$_LANES_FILE" 2>/dev/null || echo 0)
+            if [ "$_COUNT" -eq 0 ]; then
+                printf 'No active lane leases.\n'
+            else
+                printf 'Active lane leases (%s):\n' "$_COUNT"
+                jq -r '.leases[] | "  \(.lease_id | .[0:8])...  glob=\(.glob)  holder=\(.holder)  ttl=\(.ttl_seconds)s  reason=\(.reason)"' \
+                    "$_LANES_FILE" 2>/dev/null || cat "$_LANES_FILE"
+            fi
+        fi
+        ;;
+
+    *)
+        die "lanes: unknown subcommand '${_LANES_SUBCMD}' (use: lanes | lanes release <lease_id>)"
+        ;;
+    esac
+    ;;
+
+relay)
+    # Force relay to peer by writing a fault signal.
+    # P5: §10 goalctl additions.
+    ensure_exists
+
+    _STATE_AGENT=$(jq -r '.current.agent // ""' "$FILE" 2>/dev/null)
+    [ -n "$_STATE_AGENT" ] || die "relay: no current.agent in state.json — is a bridge running?"
+
+    _FAULT_FILE="$ROOT/.goal/agents/${_STATE_AGENT}.fault"
+    mkdir -p "$(dirname "$_FAULT_FILE")" 2>/dev/null || true
+
+    _FAULT_JSON=$(jq -n --arg ts "$(date -u +%FT%TZ)" --arg agent "$_STATE_AGENT" \
+        '{kind:"other",at:$ts,payload:"goalctl relay: forced relay",event_type:"goalctl_relay"}')
+    printf '%s\n' "$_FAULT_JSON" > "$_FAULT_FILE.tmp" && \
+        mv "$_FAULT_FILE.tmp" "$_FAULT_FILE" 2>/dev/null || \
+        { rm -f "$_FAULT_FILE.tmp" 2>/dev/null; die "relay: could not write fault file"; }
+
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        jq -n --arg agent "$_STATE_AGENT" --arg fault "$_FAULT_FILE" \
+            '{ok:true,note:"fault signal written; bridge will pick up within one tick",agent:$agent,fault_file:$fault}'
+    else
+        printf 'relay: fault signal written for agent %s\n' "$_STATE_AGENT"
+        printf '       bridge will pick up within one tick (500ms debounce).\n'
+    fi
+    ;;
+
+quota)
+    # Show provider headroom from .goal/quota.json.
+    # P5: §10 goalctl additions.
+    _QUOTA_FILE="$ROOT/.goal/quota.json"
+    if [ ! -f "$_QUOTA_FILE" ]; then
+        if [ "$JSON_OUTPUT" -eq 1 ]; then
+            printf '{"providers":{},"note":"quota.json not found"}\n'
+        else
+            printf 'No quota.json found at %s\n' "$_QUOTA_FILE"
+        fi
+        exit 0
+    fi
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        cat "$_QUOTA_FILE"
+    else
+        jq -r '
+            .providers // {} | to_entries[] |
+            "  \(.key): headroom=\(.value.estimated_headroom // "unknown")  consecutive_429=\(.value.consecutive_429 // 0)  reset_at=\(.value.limit_reset_at // "N/A")"
+        ' "$_QUOTA_FILE" 2>/dev/null | { printf 'Provider quota:\n'; cat; } || cat "$_QUOTA_FILE"
+    fi
+    ;;
+
+cowork)
+    # cowork init — write default .goal/cowork.yml
+    # P5: §10 goalctl additions.
+    _COWORK_SUBCMD="${ARGS[0]:-}"
+    case "$_COWORK_SUBCMD" in
+    init)
+        _GOAL_DIR="$ROOT/.goal"
+        mkdir -p "$_GOAL_DIR" 2>/dev/null || true
+        _COWORK_FILE="$_GOAL_DIR/cowork.yml"
+        if [ -f "$_COWORK_FILE" ]; then
+            die "cowork init: $_COWORK_FILE already exists. Delete it first to re-initialize."
+        fi
+        cat > "$_COWORK_FILE" <<'COWORK_YML'
+version: 1
+agents:
+  claude:
+    runner: claude-code
+    model: default
+  codex:
+    runner: codex
+    model: default
+roles:
+  lead:   claude
+  build:  codex
+  review: claude
+relay:
+  on_rate_limit:        true
+  on_5xx:               true
+  small_model_offload:  false   # opt-in
+heartbeat_ttl_seconds:  15
+COWORK_YML
+        if [ "$JSON_OUTPUT" -eq 1 ]; then
+            jq -n --arg path "$_COWORK_FILE" '{ok:true,path:$path,note:"default cowork.yml written"}'
+        else
+            printf 'cowork.yml written: %s\n' "$_COWORK_FILE"
+            printf 'Edit it to assign runners and roles for your agents.\n'
+        fi
+        ;;
+    "")
+        die "cowork: subcommand required (init)"
+        ;;
+    *)
+        die "cowork: unknown subcommand '$_COWORK_SUBCMD' (use: cowork init)"
         ;;
     esac
     ;;
