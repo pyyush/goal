@@ -1,7 +1,7 @@
 // Smoke test: spawn the compiled server, send JSON-RPC over stdio, assert tool
 // list and create_goal behaviour. Runs in a tmpdir injected via $GOAL_ROOT.
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -123,6 +123,12 @@ async function run() {
   expect(createdObj.tokens_used === 0, "create_goal: tokens_used should be 0");
   expect(createdObj.remaining_tokens === 5000, "create_goal: remaining_tokens should be 5000");
   expect(typeof createdObj.elapsed_seconds === "number", "create_goal: elapsed_seconds missing");
+  // pursuit timer fields: created should have pursuing_seconds=0 and pursuing_since=created_at.
+  expect(createdObj.pursuing_seconds === 0, `create_goal: pursuing_seconds should be 0, got ${createdObj.pursuing_seconds}`);
+  expect(typeof createdObj.pursuing_since === "string" && createdObj.pursuing_since.length > 0,
+         `create_goal: pursuing_since should be a non-empty ISO string, got ${createdObj.pursuing_since}`);
+  expect(createdObj.pursuing_since === createdObj.created_at,
+         `create_goal: pursuing_since should equal created_at on fresh goal (${createdObj.pursuing_since} vs ${createdObj.created_at})`);
 
   // 5) verify goal.json was atomically written into GOAL_ROOT/.claude/
   const goalFile = join(goalRoot, ".claude", "goal.json");
@@ -149,6 +155,66 @@ async function run() {
   assert(!getNow.result.isError, `get_goal: unexpected error: ${getNow.result.content?.[0]?.text}`);
   const got = JSON.parse(getNow.result.content[0].text);
   expect(got.goal_id === createdObj.goal_id, "get_goal: goal_id mismatch");
+
+  // 7b) Active-pursuit timer: pause for a moment, then resume; elapsed_seconds
+  //     should reflect only the time the goal was in `pursuing` (not the
+  //     interval it was paused for). We simulate pause/resume by editing the
+  //     on-disk goal.json (the MCP server doesn't expose pause/resume tools)
+  //     and then call get_goal to inspect the computed view.
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // 7b.1: capture baseline pursuit seconds (likely 0 or 1).
+    const beforePauseView = JSON.parse((await rpc("tools/call", { name: "get_goal", arguments: {} })).result.content[0].text);
+    const baselineElapsed = beforePauseView.elapsed_seconds;
+
+    // 7b.2: write `status: "paused"` + accumulate pursuing_seconds onto disk.
+    await sleep(1100);
+    const cur = JSON.parse(readFileSync(goalFile, "utf8"));
+    const accSeconds = (cur.pursuing_seconds ?? 0) +
+                       Math.max(0, Math.floor((Date.now() - Date.parse(cur.pursuing_since)) / 1000));
+    const pausedRecord = {
+      ...cur,
+      status: "paused",
+      pursuing_seconds: accSeconds,
+      pursuing_since: null,
+      updated_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+    };
+    writeFileSync(goalFile, JSON.stringify(pausedRecord, null, 2) + "\n", "utf8");
+
+    // 7b.3: while paused, sleep — this time MUST NOT count.
+    await sleep(2200);
+
+    // 7b.4: now check via get_goal that elapsed_seconds did NOT increase
+    // beyond accSeconds. The MCP server computes elapsed = pursuing_seconds
+    // for non-pursuing states.
+    const pausedView = JSON.parse((await rpc("tools/call", { name: "get_goal", arguments: {} })).result.content[0].text);
+    expect(pausedView.status === "paused", `expected paused, got ${pausedView.status}`);
+    expect(pausedView.elapsed_seconds === accSeconds,
+           `paused elapsed should equal pursuing_seconds (${accSeconds}), got ${pausedView.elapsed_seconds}`);
+    expect(pausedView.elapsed_seconds < baselineElapsed + 3,
+           `paused elapsed (${pausedView.elapsed_seconds}) should not have grown by 2s+ during the pause (baseline ${baselineElapsed})`);
+
+    // 7b.5: resume by writing pursuing_since=now back onto disk.
+    const resumedRecord = {
+      ...pausedRecord,
+      status: "pursuing",
+      pursuing_since: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+      updated_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+    };
+    writeFileSync(goalFile, JSON.stringify(resumedRecord, null, 2) + "\n", "utf8");
+
+    // 7b.6: wait, then verify elapsed_seconds resumed ticking from accSeconds.
+    await sleep(1200);
+    const resumedView = JSON.parse((await rpc("tools/call", { name: "get_goal", arguments: {} })).result.content[0].text);
+    expect(resumedView.status === "pursuing", `expected pursuing after resume, got ${resumedView.status}`);
+    expect(resumedView.elapsed_seconds >= accSeconds + 1,
+           `resumed elapsed should be at least accSeconds+1 (${accSeconds + 1}), got ${resumedView.elapsed_seconds}`);
+    // And the resumed elapsed must be strictly less than wall-clock from create.
+    const wallClock = Math.floor((Date.now() - Date.parse(createdObj.created_at)) / 1000);
+    expect(resumedView.elapsed_seconds < wallClock,
+           `pursuit-time elapsed (${resumedView.elapsed_seconds}) should be less than wall-clock (${wallClock}) because of the pause`);
+  }
 
   // 8) create_goal again — should fail with goal_exists_and_active
   const dup = await rpc("tools/call", {

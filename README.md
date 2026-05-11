@@ -126,11 +126,11 @@ Adds one magenta segment to your statusline, showing the live goal state:
 | `pursuing` (no budget) | `Pursuing goal (5m)` |
 | `pursuing` (with budget) | `Pursuing goal (12.5K / 50K)` |
 | `paused` | `Goal paused (/goal resume)` |
-| `achieved` | `Goal achieved (1h23m)` |
+| `achieved` | `Goal achieved (1h 23m)` |
 | `unmet` | `Goal unmet (/goal status)` |
 | `budget-limited` | `Goal abandoned (50K / 50K)` |
 
-`goal-setup` wires it for you. `GOAL_STATUSLINE_STYLE=dim|plain` for softer / monochrome.
+The timer reflects **active pursuit time** — paused intervals are excluded, not wall-clock from when the goal was set. `goal-setup` wires it for you. `GOAL_STATUSLINE_STYLE=dim|plain` for softer / monochrome.
 
 ## Configuration
 

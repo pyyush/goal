@@ -60,13 +60,16 @@ say "remaining_tokens=$RT ✓"
 step "3. MCP server: tools/list returns create_goal, update_goal, get_goal"
 
 # Pipe a single JSON-RPC initialize + tools/list, capture stdout.
-MCP_OUT=$(GOAL_ROOT="$TMP" \
+# IMPORTANT: bash command-prefix env vars (`VAR=x cmd1 | cmd2`) only apply to
+# cmd1, not the pipeline. Export GOAL_ROOT so the spawned node child inherits
+# it instead of walking up from cwd into an unrelated goal.
+export GOAL_ROOT="$TMP"
+MCP_OUT=$(
   printf '%s\n%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   | node "$REPO_ROOT/mcp/dist/goal-server.js" 2>/dev/null \
-  || GOAL_ROOT="$TMP" \
-  printf '%s\n%s\n' \
+  || printf '%s\n%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   | npx --prefix "$REPO_ROOT/mcp" tsx "$REPO_ROOT/mcp/goal-server.ts" 2>/dev/null
@@ -81,7 +84,8 @@ say "tools advertised: create_goal, update_goal, get_goal ✓"
 # -------- 4. MCP get_goal sees the goal that goalctl created ----------------
 
 step "4. MCP get_goal reads the same .claude/goal.json that goalctl wrote"
-GET_OUT=$(GOAL_ROOT="$TMP" printf '%s\n%s\n%s\n' \
+# GOAL_ROOT exported above is inherited by the node child here.
+GET_OUT=$(printf '%s\n%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_goal","arguments":{}}}' \
     | (node "$REPO_ROOT/mcp/dist/goal-server.js" 2>/dev/null \
@@ -117,9 +121,9 @@ say "HTTP CRUD round-trip ✓"
 
 # -------- 6. Events: at least one event line per lifecycle transition -------
 
-step "6. goal-events.jsonl: create + pause both emit events"
+step "6. goal-events.jsonl: HTTP pause emits goal.paused"
 [ -f "$EVENTS_FILE" ] || { red "FAIL: no events file at $EVENTS_FILE"; exit 6; }
-grep -q 'goal.created'   "$EVENTS_FILE" || { red "FAIL: no goal.created event"; cat "$EVENTS_FILE"; exit 6; }
+grep -q 'goal.paused' "$EVENTS_FILE" || { red "FAIL: no goal.paused event"; cat "$EVENTS_FILE"; exit 6; }
 say "events emitted ✓ ($(wc -l <"$EVENTS_FILE") lines)"
 
 # -------- 7. Concurrency: CAS rejects stale write ---------------------------
@@ -134,4 +138,42 @@ NEW_ID=$(jq -r .goal_id "$GOAL_FILE")
 say "goal_id rotated $OLD_ID → $NEW_ID ✓"
 
 kill $HTTP_PID 2>/dev/null || true
+
+# -------- 8. Pursuit timer: pause/resume only counts active time -----------
+
+step "8. Pursuit timer: pause+sleep+resume should NOT count paused interval"
+# Fresh goal: create, sleep ≥ 1s, pause, sleep ≥ 2s (must NOT count),
+# resume, sleep ≥ 1s, then read pursuing_seconds via --json status.
+"$GOALCTL" --root "$TMP" clear >/dev/null || true
+"$GOALCTL" --root "$TMP" create "pursuit timer test" >/dev/null
+sleep 2
+"$GOALCTL" --root "$TMP" pause >/dev/null
+AFTER_PAUSE=$(jq -r '.pursuing_seconds // 0' "$GOAL_FILE")
+[ "$AFTER_PAUSE" -ge 1 ] || { red "FAIL: after pause, pursuing_seconds should be >= 1 (got $AFTER_PAUSE)"; exit 8; }
+say "after pause: pursuing_seconds=$AFTER_PAUSE ✓"
+
+sleep 3
+# pursuing_seconds must NOT have grown while paused.
+STILL_PAUSED=$(jq -r '.pursuing_seconds // 0' "$GOAL_FILE")
+[ "$STILL_PAUSED" -eq "$AFTER_PAUSE" ] || { red "FAIL: paused → pursuing_seconds grew from $AFTER_PAUSE to $STILL_PAUSED"; exit 8; }
+say "after 3s paused: pursuing_seconds still=$STILL_PAUSED ✓"
+
+"$GOALCTL" --root "$TMP" resume >/dev/null
+sleep 2
+"$GOALCTL" --root "$TMP" pause >/dev/null
+AFTER_RESUME_PAUSE=$(jq -r '.pursuing_seconds // 0' "$GOAL_FILE")
+# Should be AFTER_PAUSE + ~2 (the active resume interval), but NOT including
+# the 3s paused interval.
+DELTA=$((AFTER_RESUME_PAUSE - AFTER_PAUSE))
+[ "$DELTA" -ge 1 ] || { red "FAIL: resume interval should add ≥ 1s active time (added $DELTA)"; exit 8; }
+[ "$DELTA" -le 4 ] || { red "FAIL: resume delta $DELTA s too large — paused time may have leaked in"; exit 8; }
+say "resume cycle added $DELTA s of pursuit time ✓ (paused 3s correctly excluded)"
+
+# elapsed_seconds in --json status should equal pursuing_seconds for non-pursuing states.
+JSON_STATUS=$("$GOALCTL" --root "$TMP" status --json)
+ELAPSED=$(echo "$JSON_STATUS" | jq -r '.elapsed_seconds // 0')
+PSECS=$(echo "$JSON_STATUS" | jq -r '.pursuing_seconds // 0')
+[ "$ELAPSED" = "$PSECS" ] || { red "FAIL: status --json elapsed_seconds ($ELAPSED) should equal pursuing_seconds ($PSECS) when paused"; exit 8; }
+say "status --json elapsed_seconds=$ELAPSED matches pursuing_seconds ✓"
+
 green "ALL SMOKE CHECKS PASSED"

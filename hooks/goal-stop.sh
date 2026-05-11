@@ -93,10 +93,25 @@ write_state() {
     fi
     now=$(date -u +%FT%TZ)
     tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
+    # When transitioning OUT of pursuing into a terminal/paused state, accumulate
+    # pursuing_seconds based on the on-disk pursuing_since. We do this inside the
+    # jq filter so the read-modify-write is atomic and CAS-guarded by goal_id.
     if jq --arg ts "$now" --arg s "$status" --arg a "$action" --arg n "$note" --arg gid "${GOAL_ID:-}" \
          'if (.goal_id // "") == $gid then
-              .status = $s
+              ( (try (.pursuing_since | fromdateiso8601) catch null) ) as $since
+              | ( .pursuing_seconds // 0 ) as $base
+              | ( if (.status == "pursuing") and ($since != null) and ($s != "pursuing")
+                    then $base + ((now - ($since | floor)) | floor | (if . < 0 then 0 else . end))
+                    else $base
+                  end ) as $new_seconds
+              | ( if $s == "pursuing"
+                    then (if (.pursuing_since // null) == null then $ts else .pursuing_since end)
+                    else null
+                  end ) as $new_since
+              | .status = $s
               | .updated_at = $ts
+              | .pursuing_seconds = $new_seconds
+              | .pursuing_since = $new_since
               | .history = ((.history // []) + [{ts: $ts, action: $a, note: $n}])
           else . end' \
          "$GOAL_FILE" > "$tmp" 2>/dev/null; then
@@ -177,17 +192,20 @@ trap 'goal_lock_release "$GOAL_ROOT"' EXIT INT TERM
 
 SHAPE=$(jq -r '
     if (type == "object" and (.objective | type) == "string" and (.status | type) == "string") then
-        [ .status,
-          .objective,
-          (.token_budget // null | tostring),
-          (.tokens_used // 0 | tostring),
-          (.tick_count // 0 | tostring),
-          (if (.created_at // null | type) == "string"
-            then ((now - (.created_at | fromdateiso8601)) | floor | tostring)
-            else "0"
-          end),
-          (.goal_id // "")
-        ] | @tsv
+        ( (try (.pursuing_since | fromdateiso8601) catch null) ) as $since
+        | ( .pursuing_seconds // 0 ) as $base
+        | ( if .status == "pursuing" and $since != null
+              then $base + ((now - ($since | floor)) | floor | (if . < 0 then 0 else . end))
+              else $base
+            end ) as $elapsed
+        | [ .status,
+            .objective,
+            (.token_budget // null | tostring),
+            (.tokens_used // 0 | tostring),
+            (.tick_count // 0 | tostring),
+            ($elapsed | tostring),
+            (.goal_id // "")
+          ] | @tsv
     else "MALFORMED"
     end
 ' "$GOAL_FILE" 2>/dev/null) || SHAPE="MALFORMED"
@@ -202,6 +220,29 @@ IFS=$'\t' read -r STATUS OBJECTIVE TOKEN_BUDGET TOKENS_USED TICK_COUNT TIME_USED
 if [ "$STATUS" != "pursuing" ]; then
     log "not-pursuing" "$STATUS"
     exit 0
+fi
+
+# Backward-compat: if pursuing_since is missing on a pursuing goal (legacy
+# file from v0.1.0), seed it with created_at on the next write so the active
+# timer ticks correctly from this point forward.
+HAS_SINCE=$(jq -r '(.pursuing_since // null) != null' "$GOAL_FILE" 2>/dev/null || printf 'true')
+if [ "$HAS_SINCE" = "false" ]; then
+    tmp_migrate=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || tmp_migrate=""
+    if [ -n "$tmp_migrate" ]; then
+        if jq --arg gid "${GOAL_ID:-}" \
+             'if (.goal_id // "") == $gid then
+                  .pursuing_seconds = (.pursuing_seconds // 0)
+                  | (if (.pursuing_since // null) == null
+                        then .pursuing_since = (.created_at // (now | todateiso8601))
+                        else . end)
+              else . end' \
+             "$GOAL_FILE" > "$tmp_migrate" 2>/dev/null; then
+            mv "$tmp_migrate" "$GOAL_FILE"
+            log "compat-migrate" "seeded pursuing_since from created_at"
+        else
+            rm -f "$tmp_migrate"
+        fi
+    fi
 fi
 
 is_int "$TOKENS_USED" || TOKENS_USED=0

@@ -44,10 +44,22 @@ esac
 
 NOW=$(date -u +%FT%TZ)
 TMP=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || exit 0
+# Auto-pause: accumulate pursuit time from pursuing_since (with legacy
+# fallback to created_at) before clearing it.
 if jq --arg ts "$NOW" --arg r "$reason" --arg gid "$GOAL_ID" \
      'if (.goal_id // "") == $gid then
-          .status = "paused"
+          ( (try (.pursuing_since | fromdateiso8601) catch null) ) as $since
+          | ( (try (.created_at | fromdateiso8601) catch null) ) as $created
+          | ( $since // $created ) as $start
+          | ( .pursuing_seconds // 0 ) as $base
+          | ( if $start != null
+                then $base + ((now - ($start | floor)) | floor | (if . < 0 then 0 else . end))
+                else $base
+              end ) as $new_seconds
+          | .status = "paused"
           | .updated_at = $ts
+          | .pursuing_seconds = $new_seconds
+          | .pursuing_since = null
           | .history = ((.history // []) + [{ts: $ts, action: "auto-pause-error", note: $r}])
       else . end' \
      "$GOAL_FILE" > "$TMP" 2>/dev/null; then

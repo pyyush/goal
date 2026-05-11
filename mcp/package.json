@@ -1,6 +1,6 @@
 {
   "name": "goal-mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server exposing native model-side tools for the /goal persistent-objective system (create_goal, update_goal, get_goal).",
   "type": "module",
   "main": "dist/goal-server.js",

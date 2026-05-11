@@ -154,6 +154,10 @@ async function run() {
   expect(!created.result.isError, `create_goal: unexpected error: ${created.result.content?.[0]?.text}`);
   const createdObj = JSON.parse(created.result.content[0].text);
   expect(createdObj.status === "pursuing", `create_goal: status should be pursuing, got ${createdObj.status}`);
+  // Pursuit timer fields are present on the create view.
+  expect(createdObj.pursuing_seconds === 0, `create_goal: pursuing_seconds should be 0, got ${createdObj.pursuing_seconds}`);
+  expect(typeof createdObj.pursuing_since === "string" && createdObj.pursuing_since.length > 0,
+         `create_goal: pursuing_since should be a non-empty ISO string, got ${createdObj.pursuing_since}`);
 
   // ── 4) Wait for the boot push (2s grace inside the server) and/or the
   //       filewatch push that create_goal itself triggers. Either way we

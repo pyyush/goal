@@ -53,6 +53,16 @@ interface GoalState {
   token_budget: number | null;
   tokens_used: number;
   tick_count: number;
+  /**
+   * Cumulative seconds the goal has spent in `pursuing` status across all
+   * pursue/pause cycles. Default 0. Maintained by every writer.
+   */
+  pursuing_seconds: number;
+  /**
+   * ISO8601 UTC timestamp at which the current pursuing session began.
+   * Non-null ONLY when `status === "pursuing"`.
+   */
+  pursuing_since: string | null;
   history: HistoryEntry[];
 }
 
@@ -312,11 +322,27 @@ function validateGoalState(value: unknown): GoalState {
     throw new ToolError("io_error", `goal.json: invalid status "${status}"`);
   }
   const token_budget = v.token_budget;
-  if (token_budget !== null && !(typeof token_budget === "number" && Number.isInteger(token_budget))) {
+  if (token_budget !== null && token_budget !== undefined && !(typeof token_budget === "number" && Number.isInteger(token_budget))) {
     throw new ToolError("io_error", "goal.json: token_budget must be integer or null");
   }
   const tokens_used = typeof v.tokens_used === "number" ? v.tokens_used : 0;
   const tick_count = typeof v.tick_count === "number" ? v.tick_count : 0;
+  // Backward-compat for legacy goal.json (no pursuit timer fields):
+  //   - missing pursuing_seconds → 0
+  //   - missing pursuing_since AND status === "pursuing" → seed from created_at
+  //     (loses any pre-existing paused time but ticks correctly from here on)
+  //   - missing pursuing_since AND status !== "pursuing" → null
+  const pursuing_seconds = typeof v.pursuing_seconds === "number" && Number.isFinite(v.pursuing_seconds)
+    ? Math.max(0, Math.floor(v.pursuing_seconds))
+    : 0;
+  let pursuing_since: string | null;
+  if (typeof v.pursuing_since === "string" && v.pursuing_since.length > 0) {
+    pursuing_since = v.pursuing_since;
+  } else if (status === "pursuing" && typeof v.created_at === "string") {
+    pursuing_since = v.created_at as string;
+  } else {
+    pursuing_since = null;
+  }
   const history = Array.isArray(v.history) ? (v.history as HistoryEntry[]) : [];
   return {
     goal_id: v.goal_id as string,
@@ -327,6 +353,8 @@ function validateGoalState(value: unknown): GoalState {
     token_budget: (token_budget as number | null) ?? null,
     tokens_used,
     tick_count,
+    pursuing_seconds,
+    pursuing_since,
     history,
   };
 }
@@ -338,8 +366,15 @@ function nowIso(): string {
 
 function makeView(state: GoalState): GoalView {
   const remaining = state.token_budget == null ? null : Math.max(0, state.token_budget - state.tokens_used);
-  const created = Date.parse(state.created_at);
-  const elapsed = Number.isFinite(created) ? Math.max(0, Math.floor((Date.now() - created) / 1000)) : 0;
+  // Active pursuit time only — paused intervals are excluded.
+  let elapsed = state.pursuing_seconds;
+  if (state.status === "pursuing" && state.pursuing_since !== null) {
+    const sinceMs = Date.parse(state.pursuing_since);
+    if (Number.isFinite(sinceMs)) {
+      const delta = Math.floor((Date.now() - sinceMs) / 1000);
+      if (delta > 0) elapsed += delta;
+    }
+  }
   return { ...state, remaining_tokens: remaining, elapsed_seconds: elapsed };
 }
 
@@ -463,6 +498,8 @@ async function toolCreateGoal(args: unknown): Promise<GoalView> {
       token_budget,
       tokens_used: 0,
       tick_count: 0,
+      pursuing_seconds: 0,
+      pursuing_since: ts,
       history: [
         {
           ts,
@@ -519,10 +556,21 @@ async function toolUpdateGoal(args: unknown): Promise<GoalView & { final_report:
     }
 
     const ts = nowIso();
+    // Accumulate pursuit time if we're transitioning out of pursuing.
+    let newPursuingSeconds = fresh.pursuing_seconds;
+    if (fresh.status === "pursuing" && fresh.pursuing_since !== null) {
+      const sinceMs = Date.parse(fresh.pursuing_since);
+      if (Number.isFinite(sinceMs)) {
+        const delta = Math.floor((Date.now() - sinceMs) / 1000);
+        if (delta > 0) newPursuingSeconds += delta;
+      }
+    }
     const updated: GoalState = {
       ...fresh,
       status: "achieved",
       updated_at: ts,
+      pursuing_seconds: newPursuingSeconds,
+      pursuing_since: null,
       history: [
         ...fresh.history,
         { ts, action: "mark-achieved", note: "via mcp__goal__update_goal" },

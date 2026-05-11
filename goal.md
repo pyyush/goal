@@ -26,11 +26,15 @@ Without the Stop hook, the user advances the loop manually by running `/goal` (n
   "token_budget": null,
   "tokens_used": 0,
   "tick_count": 0,
+  "pursuing_seconds": "integer — cumulative seconds the goal has spent in 'pursuing' status across all pursue/pause cycles. Default 0.",
+  "pursuing_since": "ISO8601 UTC string (or null). Set ONLY when status === 'pursuing'; the wall-clock timestamp at which the current pursuing session began.",
   "history": [{"ts": "ISO8601", "action": "string", "note": "string"}]
 }
 ```
 
 `tick_count` is maintained by the Stop hook; do not write it from this command. `goal_id` must be preserved unchanged on lifecycle transitions (pause/resume/budget/etc.) and **regenerated** only on `create` and `replace`.
+
+`pursuing_seconds` and `pursuing_since` together implement an "active-pursuit timer" that excludes time spent in `paused` / terminal states. The statusline, the Stop hook, and `goalctl` all maintain these — your direct writes from this slash command must too. See "Writing state" below for the transition rules.
 
 ## Current state on disk
 
@@ -86,6 +90,8 @@ When the dispatch routes here:
    - `token_budget`: `null`
    - `tokens_used`: `0`
    - `tick_count`: `0`
+   - `pursuing_seconds`: `0`
+   - `pursuing_since`: same as `created_at` (the current UTC timestamp)
    - `history`: `[{ts, action: "create" or "replace", note: "via /goal slash command"}]`
 
    If a previous goal existed, mention it in the model response: `(replaced previous goal: "<old objective>")`.
@@ -106,9 +112,24 @@ Always:
 - update `updated_at` to the timestamp above
 - append a `history` entry: `{ts, action, note}` where action is `create | replace | pause | resume | mark-achieved | mark-unmet | set-budget | budget-limit-hit`
 - preserve fields you aren't changing (especially `goal_id` and `tick_count`)
+- maintain `pursuing_seconds` and `pursuing_since` per the transition rules below
 - pretty-print with 2-space indent
 
 Do not append `tick` history entries — those are managed by the Stop hook via the `tick_count` field. Do not change `goal_id` except on `create` or `replace`.
+
+#### Active-pursuit timer transitions
+
+`pursuing_seconds` is the cumulative active time; `pursuing_since` is the start of the current pursuing session (or `null` when not pursuing). Maintain them on every transition — the Stop hook and `goalctl` follow these same rules:
+
+| Transition | Update |
+|---|---|
+| `create` / `replace` (new goal, status=pursuing) | `pursuing_seconds = 0`, `pursuing_since = created_at` |
+| `pause` (pursuing → paused) | `pursuing_seconds += floor(now_epoch - parse(pursuing_since))`, then `pursuing_since = null` |
+| `resume` (paused → pursuing) | `pursuing_since = now`, leave `pursuing_seconds` as-is |
+| `mark-achieved` / `mark-unmet` / `budget-limit-hit` FROM `pursuing` | `pursuing_seconds += floor(now_epoch - parse(pursuing_since))`, then `pursuing_since = null` |
+| `mark-achieved` / `mark-unmet` FROM `paused` | `pursuing_since` is already `null`; `pursuing_seconds` stays put |
+
+Backward-compat: if you read a goal file that lacks these fields, treat missing `pursuing_seconds` as `0`, and if `status === "pursuing"` and `pursuing_since` is missing, set `pursuing_since = created_at` on the next write.
 
 ---
 

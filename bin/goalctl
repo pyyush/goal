@@ -101,6 +101,23 @@ new_uuid() {
 
 read_field() { jq -r "$1 // empty" "$FILE" 2>/dev/null; }
 
+# compute_pursuit_seconds: reads pursuing_since from $FILE and prints the
+# integer seconds elapsed since that timestamp (now - pursuing_since). Prints
+# 0 if pursuing_since is missing/null/unparseable. Portable: uses python3 if
+# available, else falls back to jq's fromdateiso8601 (which works on macOS and
+# Linux without date(1) flag differences).
+compute_pursuit_seconds() {
+    local f="${1:-$FILE}"
+    [ -f "$f" ] || { printf '0'; return; }
+    jq -r '
+        (try (.pursuing_since | fromdateiso8601) catch null) as $since
+        | if $since == null then 0
+          else (now - ($since | floor)) | floor
+            | if . < 0 then 0 else . end
+          end
+    ' "$f" 2>/dev/null || printf '0'
+}
+
 # Cross-writer mutex shared with the MCP server (proper-lockfile) and hooks.
 # Discover goal-lock.sh in this order:
 #   1. $GOAL_LOCK_SH (explicit override)
@@ -192,6 +209,7 @@ create|replace)
         '{goal_id: $gid, objective: $obj, status: "pursuing",
           created_at: $ts, updated_at: $ts,
           token_budget: $budget, tokens_used: 0, tick_count: 0,
+          pursuing_seconds: 0, pursuing_since: $ts,
           history: [{ts: $ts, action: $action, note: "via goalctl"}]}' > "$FILE"
     printf 'goal %s: %s\n' "$ACTION" "$NEW_ID"
     ;;
@@ -217,7 +235,18 @@ status)
         NOW_EPOCH=$(date -u +%s)
         jq --argjson now "$NOW_EPOCH" '
             . as $g
-            | (try ($g.created_at | fromdateiso8601) catch null) as $created
+            | (try ($g.pursuing_since | fromdateiso8601) catch null) as $since
+            | (try ($g.created_at    | fromdateiso8601) catch null) as $created
+            # Backward-compat: legacy file with status=pursuing but no
+            # pursuing_since → approximate active time from created_at.
+            | (if $since != null then $since
+               elif $g.status == "pursuing" and $created != null then $created
+               else null end) as $start
+            | (($g.pursuing_seconds // 0) | floor) as $base
+            | (if $g.status == "pursuing" and $start != null
+                  then $base + (($now - ($start | floor)) | (if . < 0 then 0 else . end))
+                  else $base
+              end) as $elapsed
             | {
                 objective: $g.objective,
                 status: $g.status,
@@ -227,8 +256,9 @@ status)
                 tokens_used: ($g.tokens_used // 0),
                 remaining_tokens: (if $g.token_budget == null then null
                                    else ($g.token_budget - ($g.tokens_used // 0)) end),
-                elapsed_seconds: (if $created == null then null
-                                  else ($now - ($created | floor)) end),
+                elapsed_seconds: $elapsed,
+                pursuing_seconds: ($g.pursuing_seconds // 0),
+                pursuing_since: ($g.pursuing_since // null),
                 tick_count: ($g.tick_count // 0),
                 last_action: ($g.history // [] | last | .action // null),
                 last_note: ($g.history // [] | last | .note // null)
@@ -248,8 +278,13 @@ Ticks: \(.tick_count // 0)"
 pause)
     ensure_exists
     [ "$(read_field '.status')" = "pursuing" ] || die "can only pause a pursuing goal (current: $(read_field '.status'))"
+    DELTA=$(compute_pursuit_seconds "$FILE")
+    is_int_value() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+    is_int_value "$DELTA" || DELTA=0
     append_history "pause" "via goalctl"
-    write_state '.status = "paused"'
+    write_state ".status = \"paused\"
+        | .pursuing_seconds = ((.pursuing_seconds // 0) + ${DELTA})
+        | .pursuing_since = null"
     printf 'paused\n'
     ;;
 
@@ -257,7 +292,7 @@ resume)
     ensure_exists
     [ "$(read_field '.status')" = "paused" ] || die "can only resume a paused goal (current: $(read_field '.status'))"
     append_history "resume" "via goalctl"
-    write_state '.status = "pursuing"'
+    write_state '.status = "pursuing" | .pursuing_since = $ts'
     printf 'resumed\n'
     ;;
 
@@ -286,8 +321,18 @@ set-budget)
 
 mark-achieved)
     ensure_exists
-    append_history "mark-achieved" "via goalctl"
-    write_state '.status = "achieved"'
+    CUR_STATUS=$(read_field '.status')
+    if [ "$CUR_STATUS" = "pursuing" ]; then
+        DELTA=$(compute_pursuit_seconds "$FILE")
+        case "$DELTA" in ''|*[!0-9]*) DELTA=0 ;; esac
+        append_history "mark-achieved" "via goalctl"
+        write_state ".status = \"achieved\"
+            | .pursuing_seconds = ((.pursuing_seconds // 0) + ${DELTA})
+            | .pursuing_since = null"
+    else
+        append_history "mark-achieved" "via goalctl"
+        write_state '.status = "achieved" | .pursuing_since = null'
+    fi
     printf 'marked achieved\n'
     ;;
 
@@ -295,8 +340,18 @@ mark-unmet)
     ensure_exists
     NOTE="${ARGS[*]:-via goalctl}"
     NOTE_ESC=$(printf '%s' "$NOTE" | jq -Rs .)
-    append_history "mark-unmet" "$(printf '%s' "$NOTE" | sed 's/"/\\"/g')"
-    write_state '.status = "unmet"'
+    CUR_STATUS=$(read_field '.status')
+    if [ "$CUR_STATUS" = "pursuing" ]; then
+        DELTA=$(compute_pursuit_seconds "$FILE")
+        case "$DELTA" in ''|*[!0-9]*) DELTA=0 ;; esac
+        append_history "mark-unmet" "$(printf '%s' "$NOTE" | sed 's/"/\\"/g')"
+        write_state ".status = \"unmet\"
+            | .pursuing_seconds = ((.pursuing_seconds // 0) + ${DELTA})
+            | .pursuing_since = null"
+    else
+        append_history "mark-unmet" "$(printf '%s' "$NOTE" | sed 's/"/\\"/g')"
+        write_state '.status = "unmet" | .pursuing_since = null'
+    fi
     printf 'marked unmet\n'
     ;;
 

@@ -51,6 +51,8 @@ interface Goal {
     token_budget: number | null;
     tokens_used: number;
     tick_count: number;
+    pursuing_seconds: number;
+    pursuing_since: string | null;
     history: HistoryEntry[];
     [k: string]: unknown;
 }
@@ -222,6 +224,45 @@ function pushHistory(goal: Goal, action: string, note: string, ts: string): Goal
     return { ...goal, history, updated_at: ts };
 }
 
+/**
+ * Read goal as-is from disk but apply the same backward-compat seeding the
+ * MCP server does: missing pursuing_seconds → 0, and on a pursuing legacy
+ * file missing pursuing_since → seed from created_at. This keeps the
+ * delta-accumulation in pause/mark-unmet correct even on a file that was
+ * created by an old version.
+ */
+function normalizePursuitFields(g: Goal): Goal {
+    const seconds = typeof g.pursuing_seconds === "number" && Number.isFinite(g.pursuing_seconds)
+        ? Math.max(0, Math.floor(g.pursuing_seconds))
+        : 0;
+    let since: string | null;
+    if (typeof g.pursuing_since === "string" && g.pursuing_since.length > 0) {
+        since = g.pursuing_since;
+    } else if (g.status === "pursuing" && typeof g.created_at === "string") {
+        since = g.created_at;
+    } else {
+        since = null;
+    }
+    return { ...g, pursuing_seconds: seconds, pursuing_since: since };
+}
+
+/**
+ * If `goal.status === "pursuing"` and pursuing_since is set, accumulate the
+ * delta into pursuing_seconds and return {seconds, since:null}. Otherwise
+ * return the existing values unchanged.
+ */
+function accumulateOnExit(goal: Goal): { pursuing_seconds: number; pursuing_since: string | null } {
+    if (goal.status !== "pursuing" || goal.pursuing_since == null) {
+        return { pursuing_seconds: goal.pursuing_seconds, pursuing_since: null };
+    }
+    const sinceMs = Date.parse(goal.pursuing_since);
+    if (!Number.isFinite(sinceMs)) {
+        return { pursuing_seconds: goal.pursuing_seconds, pursuing_since: null };
+    }
+    const delta = Math.max(0, Math.floor((Date.now() - sinceMs) / 1000));
+    return { pursuing_seconds: goal.pursuing_seconds + delta, pursuing_since: null };
+}
+
 // ---- request helpers ------------------------------------------------------
 
 const MAX_BODY = 256 * 1024; // 256 KiB is plenty for a goal record
@@ -360,6 +401,8 @@ async function handlePostGoal(
             token_budget: budget,
             tokens_used: 0,
             tick_count: 0,
+            pursuing_seconds: 0,
+            pursuing_since: ts,
             history: [{ ts, action: existing ? "replace" : "create", note: "via http" }],
         };
         await store.clearBaselines();
@@ -399,11 +442,14 @@ async function handlePatchGoal(
     }
 
     await store.withLock(async () => {
-    const cur = await store.read();
-    if (!cur) {
+    const rawCur = await store.read();
+    if (!rawCur) {
         sendJson(res, 404, { error: "no_active_goal" });
         return;
     }
+    // Apply backward-compat seeding so transitions accumulate correctly even
+    // on legacy files. Any writes use the normalized record as a base.
+    const cur = normalizePursuitFields(rawCur);
 
     const ts = nowIso();
 
@@ -425,9 +471,12 @@ async function handlePatchGoal(
                 });
                 return;
             }
+            const acc = accumulateOnExit(cur);
             const next: Goal = {
                 ...pushHistory(cur, "pause", "via http", ts),
                 status: "paused",
+                pursuing_seconds: acc.pursuing_seconds,
+                pursuing_since: acc.pursuing_since,
             };
             await store.write(next, cur.goal_id);
             await store
@@ -447,6 +496,7 @@ async function handlePatchGoal(
             const next: Goal = {
                 ...pushHistory(cur, "resume", "via http", ts),
                 status: "pursuing",
+                pursuing_since: ts,
             };
             await store.write(next, cur.goal_id);
             await store
@@ -470,6 +520,8 @@ async function handlePatchGoal(
                 return;
             }
             const note = newBudget === null ? "cleared" : String(newBudget);
+            // set-budget does NOT change status, so pursuit fields are unchanged
+            // except that they may have been backfilled by normalizePursuitFields.
             const next: Goal = {
                 ...pushHistory(cur, "set-budget", note, ts),
                 token_budget: newBudget,
@@ -492,9 +544,12 @@ async function handlePatchGoal(
                 typeof body.value === "string" && body.value.length > 0
                     ? body.value
                     : "via http";
+            const acc = accumulateOnExit(cur);
             const next: Goal = {
                 ...pushHistory(cur, "mark-unmet", note, ts),
                 status: "unmet",
+                pursuing_seconds: acc.pursuing_seconds,
+                pursuing_since: acc.pursuing_since,
             };
             await store.write(next, cur.goal_id);
             await store
