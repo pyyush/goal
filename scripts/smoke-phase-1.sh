@@ -112,7 +112,7 @@ PORT=17474
 "$GOALCTL" --root "$TMP" serve-http --port $PORT &
 HTTP_PID=$!
 sleep 1
-trap 'kill $HTTP_PID 2>/dev/null; rm -rf "$TMP"' EXIT
+trap 'kill $HTTP_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
 # GET existing
 CODE=$(curl -s -o /tmp/goal-smoke-resp -w '%{http_code}' "http://127.0.0.1:$PORT/goal")

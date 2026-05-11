@@ -1,0 +1,395 @@
+#!/usr/bin/env node
+// bin/goal-bridge — generic watch-state-run-a-runner daemon for /goal cowork.
+//
+// FORBIDDEN IMPORTS IN THIS FILE: net, http, https, dgram, tls, ws.
+// This daemon is process-local + filesystem-only (spec §3 N5 + §13 + §7 B6).
+// All coordination happens via atomic file writes under the .goal/ directory.
+//
+// Usage:
+//   goal-bridge <runner> [--root <dir>]
+//
+// <runner>  Key into cowork/bridge/patterns.json (e.g. "codex", "claude-code").
+// --root    Project root (directory containing .goal/). Defaults to $PWD.
+//
+// Responsibilities (spec §7):
+//   B1. Watch .goal/state.json mtime via fs.watch, debounce 500ms.
+//   B2. When status=pursuing AND current.agent === this bridge's agent_id,
+//       write a continuation prompt line to .goal/agents/<agent_id>.continue.
+//       TODO(P3): Replace file-append with real injection (stdin pipe or MCP
+//       push) once spec §18 Q1/Q2 are answered. See spec §7 B2 + §18.
+//   B3. Write heartbeat to .goal/agents/<agent_id>.json every 5s.
+//   B4. Spawn the runner as a child process; tail its stderr for rate-limit /
+//       server-error patterns; on match write .goal/agents/<agent_id>.fault.
+//       TODO(P3): Write handoff envelope + transition to "relaying" here once
+//       relay protocol lands. See spec §7 B4 + §8.
+//   B5. Honor .goal/pause kill switch — exit cleanly within one tick.
+//   B6. No sockets bound. Ever. (enforced by forbidden imports list above)
+//
+// Agent ID format: <runner>-<hostname>-<pid> (spec §5.7)
+// Logs to .claude/goal-hook.log with hook:"bridge" (merges with hook output).
+
+import {
+  readFileSync,
+  writeFileSync,
+  appendFileSync,
+  mkdirSync,
+  existsSync,
+  watch,
+  renameSync,
+} from 'fs';
+import { hostname } from 'os';
+import { join, dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
+
+// ---- argument parsing -------------------------------------------------------
+
+const args = process.argv.slice(2);
+if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
+  process.stderr.write('usage: goal-bridge <runner> [--root <dir>]\n');
+  process.exit(1);
+}
+
+const RUNNER = args[0];
+let ROOT = process.cwd();
+
+for (let i = 1; i < args.length; i++) {
+  if (args[i] === '--root' && args[i + 1]) {
+    ROOT = resolve(args[i + 1]);
+    i++;
+  }
+}
+
+// ---- resolve patterns config ------------------------------------------------
+
+// Allow GOAL_BRIDGE_PATTERNS env override for testing.
+const __dirname_bridge = dirname(fileURLToPath(import.meta.url));
+const PATTERNS_PATH = process.env.GOAL_BRIDGE_PATTERNS
+  || join(__dirname_bridge, '..', 'cowork', 'bridge', 'patterns.json');
+
+let patternsDoc;
+try {
+  patternsDoc = JSON.parse(readFileSync(PATTERNS_PATH, 'utf8'));
+} catch (e) {
+  process.stderr.write(`goal-bridge: cannot read patterns config at ${PATTERNS_PATH}: ${e.message}\n`);
+  process.exit(1);
+}
+
+const runnerConfig = patternsDoc.runners?.[RUNNER];
+if (!runnerConfig) {
+  const known = Object.keys(patternsDoc.runners || {}).join(', ');
+  process.stderr.write(`goal-bridge: unknown runner "${RUNNER}". Known runners: ${known}\n`);
+  process.exit(1);
+}
+
+// ---- paths ------------------------------------------------------------------
+
+const GOAL_DIR      = join(ROOT, '.goal');
+const STATE_FILE    = join(GOAL_DIR, 'state.json');
+const AGENTS_DIR    = join(GOAL_DIR, 'agents');
+const PAUSE_FILE    = join(GOAL_DIR, 'pause');
+const LOG_FILE      = join(ROOT, '.claude', 'goal-hook.log');
+
+// Agent ID: <runner>-<host>-<pid> per spec §5.7
+const AGENT_ID      = `${RUNNER}-${hostname().replace(/[^a-zA-Z0-9-]/g, '-')}-${process.pid}`;
+const HB_FILE       = join(AGENTS_DIR, `${AGENT_ID}.json`);
+const CONTINUE_FILE = join(AGENTS_DIR, `${AGENT_ID}.continue`);
+const FAULT_FILE    = join(AGENTS_DIR, `${AGENT_ID}.fault`);
+
+// ---- allow env override for spawn command -----------------------------------
+// GOAL_BRIDGE_SPAWN_<RUNNER_UPPER>=<space-separated cmd>
+// e.g. GOAL_BRIDGE_SPAWN_CODEX='codex --api-key sk-...'
+
+const spawnEnvKey = `GOAL_BRIDGE_SPAWN_${RUNNER.toUpperCase().replace(/-/g, '_')}`;
+let spawnCmd = runnerConfig.spawn;
+if (process.env[spawnEnvKey]) {
+  spawnCmd = process.env[spawnEnvKey].split(' ');
+}
+
+// ---- compile failure patterns -----------------------------------------------
+
+const rateLimitPatterns   = (runnerConfig.rate_limit   || []).map(p => new RegExp(p, 'i'));
+const serverErrorPatterns = (runnerConfig.server_error || []).map(p => new RegExp(p, 'i'));
+
+// ---- helpers ----------------------------------------------------------------
+
+const now = () => new Date().toISOString();
+
+function bridgeLog(event, note = '') {
+  const line = JSON.stringify({
+    ts: now(), pid: process.pid, hook: 'bridge',
+    agent_id: AGENT_ID, runner: RUNNER, root: ROOT,
+    event, ...(note ? { note } : {})
+  }) + '\n';
+  try {
+    mkdirSync(join(ROOT, '.claude'), { recursive: true });
+    appendFileSync(LOG_FILE, line);
+  } catch (_) { /* log failure must never crash the bridge */ }
+  process.stderr.write(line);
+}
+
+// Atomic write: write to temp in same dir, then rename(2) for atomicity.
+function atomicWrite(filePath, content) {
+  const dir = dirname(filePath);
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `.tmp-bridge-${process.pid}-${Date.now()}`);
+  writeFileSync(tmp, content, 'utf8');
+  renameSync(tmp, filePath);
+}
+
+function readState() {
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
+// ---- B3: heartbeat write ----------------------------------------------------
+
+const STARTED_AT = now();
+
+function writeHeartbeat(extraFields = {}) {
+  const hb = {
+    agent_id:     AGENT_ID,
+    runner:       RUNNER,
+    pid:          process.pid,
+    session:      null,
+    role:         null,
+    started_at:   STARTED_AT,
+    heartbeat_at: now(),
+    ...extraFields,
+  };
+  try {
+    atomicWrite(HB_FILE, JSON.stringify(hb, null, 2) + '\n');
+  } catch (e) {
+    bridgeLog('heartbeat-write-failed', e.message);
+  }
+}
+
+// ---- B4: fault write --------------------------------------------------------
+
+function writeFault(kind, line) {
+  const fault = { kind, at: now(), line };
+  try {
+    atomicWrite(FAULT_FILE, JSON.stringify(fault, null, 2) + '\n');
+  } catch (e) {
+    bridgeLog('fault-write-failed', e.message);
+    return;
+  }
+  bridgeLog('fault-written', `kind=${kind}`);
+  // Print loudly so users/log scrapers see it.
+  process.stderr.write(
+    `\n!!! goal-bridge FAULT kind=${kind} agent=${AGENT_ID}\n` +
+    `    line: ${line}\n` +
+    `    fault file: ${FAULT_FILE}\n` +
+    `!!!\n`
+  );
+  // TODO(P3): After writing the fault file, the relay protocol (P3) will read
+  // it, write a handoff envelope to .goal/handoff/NNNN.md, and transition
+  // state to "relaying". For P2 we only signal via the fault file — the bridge
+  // does NOT write to state.json directly. See spec §7 B4 + §8.
+}
+
+// ---- B2: continuation append ------------------------------------------------
+
+function appendContinuation(stateObj) {
+  // TODO(P3): Replace this file-append with real injection once spec §18 Q1/Q2
+  // are answered:
+  //   Q1: Does the runner expose a structured signal channel (stdin pipe, MCP
+  //       push endpoint) for continuation prompts? Affects delivery mechanism.
+  //   Q2: Is there an MCP push equivalent in the runner at runtime? Affects
+  //       latency and ordering guarantees.
+  // For P2, we write a JSONL line to .goal/agents/<agent_id>.continue
+  // (append-only) so P3 can read and relay via the appropriate delivery path.
+  // See spec §7 B2 + §18.
+  const line = JSON.stringify({
+    ts:        now(),
+    agent_id:  AGENT_ID,
+    trigger:   'state-change',
+    status:    stateObj?.status,
+    session:   stateObj?.current?.session,
+    objective: (stateObj?.objective || '').slice(0, 200),
+  }) + '\n';
+  try {
+    mkdirSync(AGENTS_DIR, { recursive: true });
+    appendFileSync(CONTINUE_FILE, line);
+    bridgeLog('continuation-appended', `status=${stateObj?.status}`);
+  } catch (e) {
+    bridgeLog('continuation-write-failed', e.message);
+  }
+}
+
+// ---- B1: watch .goal/ for state.json changes --------------------------------
+
+let debounceTimer = null;
+
+function onStateChange() {
+  if (exiting) return;
+  const state = readState();
+  if (!state) {
+    bridgeLog('state-read-failed', 'state.json missing or unparseable on change');
+    return;
+  }
+  bridgeLog('state-changed', `status=${state.status} agent=${state.current?.agent}`);
+
+  // B2: continuation only when pursuing AND current agent is this bridge.
+  if (state.status === 'pursuing' && state.current?.agent === AGENT_ID) {
+    appendContinuation(state);
+  }
+}
+
+function scheduleStateCheck() {
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    debounceTimer = null;
+    onStateChange();
+  }, 500); // 500ms debounce per spec §7 B1
+}
+
+let watcherInstance = null;
+
+function startWatcher() {
+  if (exiting) return;
+  if (!existsSync(GOAL_DIR)) {
+    bridgeLog('warn', '.goal/ dir does not exist yet; retrying in 2s');
+    setTimeout(startWatcher, 2000);
+    return;
+  }
+  try {
+    // Watch the directory rather than the file: more portable on macOS/Linux.
+    watcherInstance = watch(GOAL_DIR, { persistent: true }, (eventType, filename) => {
+      if (filename === 'state.json') {
+        scheduleStateCheck();
+      }
+    });
+    watcherInstance.on('error', (e) => {
+      bridgeLog('watcher-error', e.message);
+      try { watcherInstance.close(); } catch (_) {}
+      watcherInstance = null;
+      setTimeout(startWatcher, 1000);
+    });
+    bridgeLog('watcher-started', GOAL_DIR);
+  } catch (e) {
+    bridgeLog('watcher-start-failed', e.message);
+    setTimeout(startWatcher, 2000);
+  }
+}
+
+// ---- B4: spawn runner child -------------------------------------------------
+
+let runnerChild = null;
+
+function spawnRunner() {
+  if (exiting) return;
+  const [cmd, ...cmdArgs] = spawnCmd;
+  bridgeLog('runner-spawn', `cmd=${cmd} args=${JSON.stringify(cmdArgs)}`);
+
+  try {
+    runnerChild = spawn(cmd, cmdArgs, {
+      stdio: ['inherit', 'inherit', 'pipe'],
+      env: { ...process.env },
+    });
+  } catch (e) {
+    bridgeLog('runner-spawn-failed', e.message);
+    return;
+  }
+
+  runnerChild.stderr.on('data', (chunk) => {
+    const text = chunk.toString();
+    process.stderr.write(text); // passthrough
+
+    for (const rawLine of text.split('\n')) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      for (const pat of rateLimitPatterns) {
+        if (pat.test(line)) { writeFault('rate_limit', line); return; }
+      }
+      for (const pat of serverErrorPatterns) {
+        if (pat.test(line)) { writeFault('server_error', line); return; }
+      }
+    }
+  });
+
+  runnerChild.on('exit', (code, signal) => {
+    bridgeLog('runner-exit', `code=${code} signal=${signal}`);
+    runnerChild = null;
+  });
+
+  runnerChild.on('error', (e) => {
+    bridgeLog('runner-error', e.message);
+    runnerChild = null;
+  });
+}
+
+// ---- B5: pause kill switch polling ------------------------------------------
+
+let pauseCheckInterval = null;
+
+function checkPause() {
+  if (existsSync(PAUSE_FILE)) {
+    bridgeLog('pause-detected', '.goal/pause present — exiting cleanly');
+    exitCleanly('paused');
+  }
+}
+
+// ---- clean exit -------------------------------------------------------------
+
+let exiting = false;
+let heartbeatInterval = null;
+
+function exitCleanly(finalStatus = 'stopped') {
+  if (exiting) return;
+  exiting = true;
+
+  if (heartbeatInterval) clearInterval(heartbeatInterval);
+  if (pauseCheckInterval) clearInterval(pauseCheckInterval);
+  if (debounceTimer) clearTimeout(debounceTimer);
+  if (watcherInstance) { try { watcherInstance.close(); } catch (_) {} }
+
+  // Write final heartbeat with status.
+  writeHeartbeat({ status: finalStatus });
+  bridgeLog('exit', `finalStatus=${finalStatus}`);
+
+  if (runnerChild) {
+    try { runnerChild.kill('SIGTERM'); } catch (_) {}
+    const killTimer = setTimeout(() => {
+      if (runnerChild) {
+        try { runnerChild.kill('SIGKILL'); } catch (_) {}
+      }
+      process.exit(0);
+    }, 3000);
+    killTimer.unref();
+    runnerChild.on('exit', () => {
+      clearTimeout(killTimer);
+      process.exit(0);
+    });
+  } else {
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => { bridgeLog('signal', 'SIGTERM'); exitCleanly('stopped'); });
+process.on('SIGINT',  () => { bridgeLog('signal', 'SIGINT');  exitCleanly('stopped'); });
+
+// ---- startup sequence -------------------------------------------------------
+
+mkdirSync(AGENTS_DIR, { recursive: true });
+mkdirSync(join(ROOT, '.claude'), { recursive: true });
+
+bridgeLog('start', `runner=${RUNNER} agent_id=${AGENT_ID} spawn=${spawnCmd.join(' ')}`);
+
+// B3: initial heartbeat + interval.
+writeHeartbeat();
+heartbeatInterval = setInterval(() => { if (!exiting) writeHeartbeat(); }, 5000);
+
+// B1: start filesystem watcher.
+startWatcher();
+
+// B4: spawn runner.
+spawnRunner();
+
+// B5: check pause immediately, then poll.
+checkPause();
+pauseCheckInterval = setInterval(checkPause, 500);

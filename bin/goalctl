@@ -33,10 +33,12 @@ commands:
   mark-unmet [note]                 set status=unmet with optional note
   listen [--grep PAT] [--since ISO] tail .claude/goal-events.jsonl
   serve-http [--port N]             local HTTP shim (loopback only, default 7474)
+  bridge start <runner>             start goal-bridge for <runner> in background
+  bridge stop <runner>              stop goal-bridge for <runner>
 
 options:
   --root <dir>     use <dir>/.claude/goal.json instead of walking up
-  --json           machine-readable output (applies to: get, status)
+  --json           machine-readable output (applies to: get, status, bridge start/stop)
 EOF
 }
 
@@ -629,6 +631,134 @@ serve-http)
         die "npx not found; install Node.js (>=18) to use 'goalctl serve-http'"
     fi
     exec npx tsx "$HTTP_SCRIPT" --port "$PORT" --root "$ROOT"
+    ;;
+
+bridge)
+    # bridge start <runner> | bridge stop <runner>
+    # P2 subset of §10's full bridge CLI (the rest lands in P5).
+    #
+    # bridge start <runner>:
+    #   Spawns bin/goal-bridge <runner> --root $ROOT in background via nohup.
+    #   stdout/stderr go to .goal/agents/<runner>.log.
+    #   PID written to .goal/agents/<runner>.pid.
+    #
+    # bridge stop <runner>:
+    #   Reads .goal/agents/<runner>.pid, sends SIGTERM, waits 3s, sends SIGKILL.
+    #   Removes pid file. Idempotent if pid file missing.
+    #
+    # --json: emit structured JSON to stdout.
+
+    BRIDGE_SUBCMD="${ARGS[0]:-}"
+    BRIDGE_RUNNER="${ARGS[1]:-}"
+    [ -n "$BRIDGE_SUBCMD" ] || die "bridge: subcommand required (start|stop)"
+    [ -n "$BRIDGE_RUNNER" ] || die "bridge: runner required (e.g. codex, claude-code)"
+
+    _BRIDGE_BIN="$(cd "$(dirname "$0")" && pwd)/goal-bridge"
+    [ -f "$_BRIDGE_BIN" ] || die "bridge: goal-bridge not found at $_BRIDGE_BIN"
+
+    _AGENTS_DIR="$ROOT/.goal/agents"
+    mkdir -p "$_AGENTS_DIR" 2>/dev/null || true
+    _PID_FILE="$_AGENTS_DIR/${BRIDGE_RUNNER}.pid"
+    _LOG_FILE="$_AGENTS_DIR/${BRIDGE_RUNNER}.log"
+
+    case "$BRIDGE_SUBCMD" in
+
+    start)
+        # Fail if already running (pid file exists and process is alive).
+        if [ -f "$_PID_FILE" ]; then
+            _OLD_PID=$(cat "$_PID_FILE" 2>/dev/null || true)
+            if [ -n "$_OLD_PID" ] && kill -0 "$_OLD_PID" 2>/dev/null; then
+                if [ "$JSON_OUTPUT" -eq 1 ]; then
+                    jq -n --arg runner "$BRIDGE_RUNNER" --argjson pid "$_OLD_PID" \
+                        '{ok: false, error: "already running", runner: $runner, pid: $pid}'
+                else
+                    die "bridge: runner '$BRIDGE_RUNNER' already running (pid $_OLD_PID). Use 'bridge stop' first."
+                fi
+                exit 1
+            fi
+            rm -f "$_PID_FILE" 2>/dev/null || true
+        fi
+
+        # Spawn bridge in background.
+        nohup node "$_BRIDGE_BIN" "$BRIDGE_RUNNER" --root "$ROOT" \
+            >> "$_LOG_FILE" 2>&1 &
+        _NEW_PID=$!
+        printf '%d\n' "$_NEW_PID" > "$_PID_FILE"
+
+        if [ "$JSON_OUTPUT" -eq 1 ]; then
+            jq -n --arg runner "$BRIDGE_RUNNER" --argjson pid "$_NEW_PID" \
+                --arg log "$_LOG_FILE" --arg pid_file "$_PID_FILE" \
+                '{ok: true, runner: $runner, pid: $pid, log: $log, pid_file: $pid_file}'
+        else
+            printf 'bridge started: runner=%s pid=%d log=%s\n' \
+                "$BRIDGE_RUNNER" "$_NEW_PID" "$_LOG_FILE"
+        fi
+        ;;
+
+    stop)
+        if [ ! -f "$_PID_FILE" ]; then
+            if [ "$JSON_OUTPUT" -eq 1 ]; then
+                jq -n --arg runner "$BRIDGE_RUNNER" \
+                    '{ok: true, runner: $runner, note: "not running (no pid file)"}'
+            else
+                printf 'bridge stop: runner=%s not running (no pid file)\n' "$BRIDGE_RUNNER"
+            fi
+            exit 0
+        fi
+
+        _STOP_PID=$(cat "$_PID_FILE" 2>/dev/null || true)
+        if [ -z "$_STOP_PID" ]; then
+            rm -f "$_PID_FILE" 2>/dev/null || true
+            if [ "$JSON_OUTPUT" -eq 1 ]; then
+                jq -n --arg runner "$BRIDGE_RUNNER" \
+                    '{ok: true, runner: $runner, note: "pid file empty; removed"}'
+            else
+                printf 'bridge stop: pid file empty; removed\n'
+            fi
+            exit 0
+        fi
+
+        if ! kill -0 "$_STOP_PID" 2>/dev/null; then
+            rm -f "$_PID_FILE" 2>/dev/null || true
+            if [ "$JSON_OUTPUT" -eq 1 ]; then
+                jq -n --arg runner "$BRIDGE_RUNNER" --argjson pid "$_STOP_PID" \
+                    '{ok: true, runner: $runner, pid: $pid, note: "process not found; removed stale pid file"}'
+            else
+                printf 'bridge stop: runner=%s pid=%d not found; removed stale pid file\n' \
+                    "$BRIDGE_RUNNER" "$_STOP_PID"
+            fi
+            exit 0
+        fi
+
+        # Send SIGTERM and wait up to 3s.
+        kill -TERM "$_STOP_PID" 2>/dev/null || true
+        _WAITED=0
+        while [ "$_WAITED" -lt 30 ]; do
+            kill -0 "$_STOP_PID" 2>/dev/null || break
+            sleep 0.1
+            _WAITED=$(( _WAITED + 1 ))
+        done
+
+        # SIGKILL if still alive.
+        if kill -0 "$_STOP_PID" 2>/dev/null; then
+            kill -KILL "$_STOP_PID" 2>/dev/null || true
+            sleep 0.2
+        fi
+
+        rm -f "$_PID_FILE" 2>/dev/null || true
+
+        if [ "$JSON_OUTPUT" -eq 1 ]; then
+            jq -n --arg runner "$BRIDGE_RUNNER" --argjson pid "$_STOP_PID" \
+                '{ok: true, runner: $runner, pid: $pid, note: "stopped"}'
+        else
+            printf 'bridge stopped: runner=%s pid=%d\n' "$BRIDGE_RUNNER" "$_STOP_PID"
+        fi
+        ;;
+
+    *)
+        die "bridge: unknown subcommand '$BRIDGE_SUBCMD' (use start|stop)"
+        ;;
+    esac
     ;;
 
 *)
