@@ -13,17 +13,36 @@
 //
 // Responsibilities (spec §7):
 //   B1. Watch .goal/state.json mtime via fs.watch, debounce 500ms.
-//   B2. When status=pursuing AND current.agent === this bridge's agent_id,
-//       write a continuation prompt line to .goal/agents/<agent_id>.continue.
-//       TODO(P3): Replace file-append with real injection (stdin pipe or MCP
-//       push) once spec §18 Q1/Q2 are answered. See spec §7 B2 + §18.
+//   B2. When status=pursuing AND current.agent === this bridge's agent_id:
+//       - For ndjson runners: spawn-per-turn (spec §18 Q2 resolution — Codex
+//         is MCP-client-only, no push channel; continuation = new spawn).
+//       - For line runners (claude-code): write continuation to .continue file
+//         (CC continuation is handled by the existing Stop hook).
 //   B3. Write heartbeat to .goal/agents/<agent_id>.json every 5s.
-//   B4. Spawn the runner as a child process; tail its stderr for rate-limit /
-//       server-error patterns; on match write .goal/agents/<agent_id>.fault.
-//       TODO(P3): Write handoff envelope + transition to "relaying" here once
-//       relay protocol lands. See spec §7 B4 + §8.
+//   B4. For ndjson runners: parse NDJSON event stream; on turn.failed/error
+//       with rate-limit payload, initiate relay protocol (spec §8).
+//       For line runners: tail stderr for rate-limit / server-error patterns.
 //   B5. Honor .goal/pause kill switch — exit cleanly within one tick.
 //   B6. No sockets bound. Ever. (enforced by forbidden imports list above)
+//
+// Relay protocol (spec §8):
+//   1. Fault detected (turn.failed with 429 payload, or 3+ consecutive_429).
+//   2. Bridge acquires .goal/lock, writes handoff envelope to
+//      .goal/handoff/NNNN.md (mktemp + rename), updates state.json atomically:
+//      status=relaying, current.agent=<peer>, handoff_head=NNNN.
+//   3. Peer bridge detects state change (its B1 watcher fires), reads handoff,
+//      injects content into first post-handoff continuation prompt.
+//   4. After first turn.completed, peer sets status back to pursuing.
+//   5. If no peer with headroom: status=queued, queued_until=max(limit_reset_at).
+//
+// Relay guardrail (spec §8): >3 relays/hour → auto-pause + notification.
+//
+// Queued polling (Q4 resolution): 30s base, exponential to 5min cap,
+// restart on quota.json mtime change. Never hard-sleeps the process.
+//
+// Solo-mode invariant: no cowork.yml in P3 means no configured peers.
+// 429 in solo mode → status stays pursuing (no relay target); quota tracked.
+// T8 must pass unchanged.
 //
 // Agent ID format: <runner>-<hostname>-<pid> (spec §5.7)
 // Logs to .claude/goal-hook.log with hook:"bridge" (merges with hook output).
@@ -33,14 +52,20 @@ import {
   writeFileSync,
   appendFileSync,
   mkdirSync,
+  mkdtempSync,
   existsSync,
+  readdirSync,
+  statSync,
   watch,
   renameSync,
+  unlinkSync,
+  rmdirSync,
 } from 'fs';
 import { hostname } from 'os';
 import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
+import { createInterface } from 'readline';
 
 // ---- argument parsing -------------------------------------------------------
 
@@ -62,7 +87,6 @@ for (let i = 1; i < args.length; i++) {
 
 // ---- resolve patterns config ------------------------------------------------
 
-// Allow GOAL_BRIDGE_PATTERNS env override for testing.
 const __dirname_bridge = dirname(fileURLToPath(import.meta.url));
 const PATTERNS_PATH = process.env.GOAL_BRIDGE_PATTERNS
   || join(__dirname_bridge, '..', 'cowork', 'bridge', 'patterns.json');
@@ -82,13 +106,21 @@ if (!runnerConfig) {
   process.exit(1);
 }
 
+const RUNNER_FORMAT = runnerConfig.format || 'line';
+const RUNNER_PROVIDER = runnerConfig.provider || 'unknown';
+
 // ---- paths ------------------------------------------------------------------
 
 const GOAL_DIR      = join(ROOT, '.goal');
 const STATE_FILE    = join(GOAL_DIR, 'state.json');
 const AGENTS_DIR    = join(GOAL_DIR, 'agents');
+const HANDOFF_DIR   = join(GOAL_DIR, 'handoff');
+const QUOTA_FILE    = join(GOAL_DIR, 'quota.json');
+const RELAY_LOG     = join(GOAL_DIR, 'relay-log.jsonl');
 const PAUSE_FILE    = join(GOAL_DIR, 'pause');
+const LOCK_DIR      = GOAL_DIR;  // .goal/ is the lock target (mkdir mutex)
 const LOG_FILE      = join(ROOT, '.claude', 'goal-hook.log');
+const EVENTS_FILE   = join(ROOT, '.claude', 'goal-events.jsonl');
 
 // Agent ID: <runner>-<host>-<pid> per spec §5.7
 const AGENT_ID      = `${RUNNER}-${hostname().replace(/[^a-zA-Z0-9-]/g, '-')}-${process.pid}`;
@@ -96,24 +128,44 @@ const HB_FILE       = join(AGENTS_DIR, `${AGENT_ID}.json`);
 const CONTINUE_FILE = join(AGENTS_DIR, `${AGENT_ID}.continue`);
 const FAULT_FILE    = join(AGENTS_DIR, `${AGENT_ID}.fault`);
 
-// ---- allow env override for spawn command -----------------------------------
-// GOAL_BRIDGE_SPAWN_<RUNNER_UPPER>=<space-separated cmd>
-// e.g. GOAL_BRIDGE_SPAWN_CODEX='codex --api-key sk-...'
+// Relay guardrail: GOAL_RELAY_LIMIT_PER_HOUR (default 3).
+const RELAY_LIMIT = parseInt(process.env.GOAL_RELAY_LIMIT_PER_HOUR || '3', 10);
 
+// ---- spawn command with substitutions --------------------------------------
+// Allow GOAL_BRIDGE_SPAWN_<RUNNER_UPPER> env override.
 const spawnEnvKey = `GOAL_BRIDGE_SPAWN_${RUNNER.toUpperCase().replace(/-/g, '_')}`;
-let spawnCmd = runnerConfig.spawn;
-if (process.env[spawnEnvKey]) {
-  spawnCmd = process.env[spawnEnvKey].split(' ');
+
+function expandSpawnTokens(parts, extraTokens = {}) {
+  const tokens = { root: ROOT, ...extraTokens };
+  return parts.map(part => {
+    let p = part;
+    for (const [k, v] of Object.entries(tokens)) {
+      p = p.replace(new RegExp(`\\{${k}\\}`, 'g'), v);
+    }
+    return p;
+  });
 }
+
+let baseSpawnCmd = runnerConfig.spawn;
+if (process.env[spawnEnvKey]) {
+  baseSpawnCmd = process.env[spawnEnvKey].split(' ');
+}
+const SPAWN_CMD = expandSpawnTokens(baseSpawnCmd);
+
+let baseResumeCmd = runnerConfig.spawn_resume || runnerConfig.spawn;
 
 // ---- compile failure patterns -----------------------------------------------
 
 const rateLimitPatterns   = (runnerConfig.rate_limit   || []).map(p => new RegExp(p, 'i'));
 const serverErrorPatterns = (runnerConfig.server_error || []).map(p => new RegExp(p, 'i'));
 
+function matchesPatterns(text, patterns) {
+  return patterns.some(p => p.test(text));
+}
+
 // ---- helpers ----------------------------------------------------------------
 
-const now = () => new Date().toISOString();
+const now = () => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 
 function bridgeLog(event, note = '') {
   const line = JSON.stringify({
@@ -132,9 +184,22 @@ function bridgeLog(event, note = '') {
 function atomicWrite(filePath, content) {
   const dir = dirname(filePath);
   mkdirSync(dir, { recursive: true });
-  const tmp = join(dir, `.tmp-bridge-${process.pid}-${Date.now()}`);
-  writeFileSync(tmp, content, 'utf8');
-  renameSync(tmp, filePath);
+  const tmpDir = mkdtempSync(join(dir, '.tmp-bridge-'));
+  const tmp = join(tmpDir, 'payload');
+  try {
+    writeFileSync(tmp, content, 'utf8');
+    renameSync(tmp, filePath);
+  } finally {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch (_) {}
+    try { rmdirSync(tmpDir); } catch (_) {}
+  }
+}
+
+function appendEvent(event) {
+  try {
+    mkdirSync(join(ROOT, '.claude'), { recursive: true });
+    appendFileSync(EVENTS_FILE, JSON.stringify(event) + '\n');
+  } catch (_) {}
 }
 
 function readState() {
@@ -145,16 +210,70 @@ function readState() {
   }
 }
 
+function readQuota() {
+  try {
+    return JSON.parse(readFileSync(QUOTA_FILE, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
+// ---- mkdir-based lock (shared with hooks/goal-lock.sh + MCP server) --------
+//
+// The mutex is the directory at .goal/lock. mkdir is atomic on POSIX, so the
+// first writer to mkdir wins. proper-lockfile (used by mcp/goal-server.ts via
+// `lockfile.lock(.goal, { lockfilePath: .goal/lock })`) creates the same dir
+// internally, so the bridge's raw mkdirSync interoperates correctly. The bash
+// hooks (hooks/goal-lock.sh) also `mkdir .goal/lock` directly. All three
+// converge on the same lockdir per spec §13.
+//
+// The bridge holds this lock only for the brief handoff write + state.json
+// transition window; it never holds it across runner spawns or NDJSON reads.
+
+const BRIDGE_LOCK_DIR = join(GOAL_DIR, 'lock');
+const BRIDGE_LOCK_TIMEOUT = 5000;
+
+function acquireBridgeLock() {
+  const deadline = Date.now() + BRIDGE_LOCK_TIMEOUT;
+  let delay = 50;
+  while (Date.now() < deadline) {
+    try {
+      mkdirSync(BRIDGE_LOCK_DIR, { recursive: false });
+      return true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') return false;
+      // Check for stale lock (> 30s old).
+      try {
+        const s = statSync(BRIDGE_LOCK_DIR);
+        if (Date.now() - s.mtimeMs > 30_000) {
+          try { rmdirSync(BRIDGE_LOCK_DIR); } catch (_) {}
+        }
+      } catch (_) {}
+      // Spin with backoff up to 200ms.
+      const sleep = Math.min(delay, 200);
+      const start = Date.now();
+      while (Date.now() - start < sleep) { /* busy spin — short */ }
+      delay = Math.min(delay * 1.5, 500);
+    }
+  }
+  return false;
+}
+
+function releaseBridgeLock() {
+  try { rmdirSync(BRIDGE_LOCK_DIR); } catch (_) {}
+}
+
 // ---- B3: heartbeat write ----------------------------------------------------
 
 const STARTED_AT = now();
+let currentSession = null;
 
 function writeHeartbeat(extraFields = {}) {
   const hb = {
     agent_id:     AGENT_ID,
     runner:       RUNNER,
     pid:          process.pid,
-    session:      null,
+    session:      currentSession,
     role:         null,
     started_at:   STARTED_AT,
     heartbeat_at: now(),
@@ -167,10 +286,21 @@ function writeHeartbeat(extraFields = {}) {
   }
 }
 
+function readAgentJson() {
+  try { return JSON.parse(readFileSync(HB_FILE, 'utf8')); } catch (_) { return {}; }
+}
+
+function updateAgentSession(sessionId) {
+  currentSession = sessionId;
+  const existing = readAgentJson();
+  const updated = { ...existing, runner_session: sessionId, heartbeat_at: now() };
+  try { atomicWrite(HB_FILE, JSON.stringify(updated, null, 2) + '\n'); } catch (_) {}
+}
+
 // ---- B4: fault write --------------------------------------------------------
 
-function writeFault(kind, line) {
-  const fault = { kind, at: now(), line };
+function writeFault(kind, payload, eventType = 'stderr') {
+  const fault = { kind, at: now(), payload, event_type: eventType };
   try {
     atomicWrite(FAULT_FILE, JSON.stringify(fault, null, 2) + '\n');
   } catch (e) {
@@ -178,31 +308,867 @@ function writeFault(kind, line) {
     return;
   }
   bridgeLog('fault-written', `kind=${kind}`);
-  // Print loudly so users/log scrapers see it.
   process.stderr.write(
     `\n!!! goal-bridge FAULT kind=${kind} agent=${AGENT_ID}\n` +
-    `    line: ${line}\n` +
+    `    payload: ${JSON.stringify(payload)}\n` +
     `    fault file: ${FAULT_FILE}\n` +
     `!!!\n`
   );
-  // TODO(P3): After writing the fault file, the relay protocol (P3) will read
-  // it, write a handoff envelope to .goal/handoff/NNNN.md, and transition
-  // state to "relaying". For P2 we only signal via the fault file — the bridge
-  // does NOT write to state.json directly. See spec §7 B4 + §8.
 }
 
-// ---- B2: continuation append ------------------------------------------------
+// ---- quota.json management --------------------------------------------------
+
+function readOrInitQuota() {
+  const existing = readQuota();
+  if (existing) return existing;
+  return {
+    providers: {
+      anthropic: { limit_reset_at: null, last_429_at: null, consecutive_429: 0, estimated_headroom: 'high' },
+      openai:    { limit_reset_at: null, last_429_at: null, consecutive_429: 0, estimated_headroom: 'high' },
+    },
+    updated_at: now(),
+  };
+}
+
+function saveQuota(quota) {
+  quota.updated_at = now();
+  try {
+    mkdirSync(GOAL_DIR, { recursive: true });
+    atomicWrite(QUOTA_FILE, JSON.stringify(quota, null, 2) + '\n');
+  } catch (e) {
+    bridgeLog('quota-write-failed', e.message);
+  }
+}
+
+function onTurnCompleted(provider) {
+  const quota = readOrInitQuota();
+  const p = quota.providers[provider] || { limit_reset_at: null, last_429_at: null, consecutive_429: 0, estimated_headroom: 'high' };
+  // Recovery: after a successful turn, improve headroom estimate.
+  const now429Age = p.last_429_at ? Date.now() - Date.parse(p.last_429_at) : Infinity;
+  p.consecutive_429 = 0;
+  if (now429Age > 3600_000) {
+    p.estimated_headroom = 'high';
+  } else {
+    p.estimated_headroom = 'medium';
+  }
+  quota.providers[provider] = p;
+  saveQuota(quota);
+}
+
+function onRateLimit(provider, eventPayload) {
+  const quota = readOrInitQuota();
+  const p = quota.providers[provider] || { limit_reset_at: null, last_429_at: null, consecutive_429: 0, estimated_headroom: 'high' };
+  p.last_429_at = now();
+  p.consecutive_429 = (p.consecutive_429 || 0) + 1;
+
+  // Try to extract Retry-After hint from payload.
+  const retryAfterMatch = String(eventPayload).match(/retry.?after[=:\s]+(\d+)/i);
+  if (retryAfterMatch) {
+    const secs = parseInt(retryAfterMatch[1], 10);
+    p.limit_reset_at = new Date(Date.now() + secs * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  } else {
+    // Heuristic: 1 hour from now.
+    p.limit_reset_at = new Date(Date.now() + 3600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  }
+
+  // Downgrade headroom.
+  const fiveMinAgo = Date.now() - 5 * 60_000;
+  const recent429s = p.consecutive_429;
+  if (recent429s >= 3) {
+    p.estimated_headroom = 'exhausted';
+  } else {
+    p.estimated_headroom = 'low';
+  }
+
+  quota.providers[provider] = p;
+  saveQuota(quota);
+  return p.limit_reset_at;
+}
+
+// ---- peer discovery (solo-mode fallback for P3) ----------------------------
+//
+// In P3, cowork.yml doesn't exist yet. Peer is: the OTHER runner in patterns.json.
+// If current runner is codex, peer is claude-code and vice versa.
+// If only one runner configured, no peer exists → stay solo.
+
+function getPeerAgent(state) {
+  // If cowork.yml had peers we'd read them here. For P3: pattern-based fallback.
+  const allRunners = Object.keys(patternsDoc.runners || {});
+  const peers = allRunners.filter(r => r !== RUNNER);
+  if (peers.length === 0) return null;
+  // Pick the first peer. In P5, this comes from cowork.yml roles.
+  const peerRunner = peers[0];
+  // Peer agent_id format: <runner>-<any-host>-<any-pid>
+  // We can't know the peer's PID. Instead, check state.roles or lineage for a
+  // known agent. If none found, return a placeholder that the peer will recognize
+  // when it starts its own bridge.
+  // For T4/T5 tests: the test sets up state.current.agent explicitly, and the
+  // peer mock bridge has a known agent_id set via MOCK_AGENT_ID env var.
+  const mockPeerAgent = process.env[`GOAL_BRIDGE_PEER_AGENT_${peerRunner.toUpperCase().replace(/-/g, '_')}`];
+  if (mockPeerAgent) return mockPeerAgent;
+  // In real cowork, you'd look at .goal/agents/ for a live heartbeat.
+  // P3 fallback: scan agents dir for a heartbeat file matching the peer runner.
+  try {
+    const agentFiles = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json') && f.startsWith(peerRunner + '-'));
+    if (agentFiles.length > 0) {
+      // Pick the most recently written one.
+      let newest = null;
+      let newestMtime = 0;
+      for (const f of agentFiles) {
+        try {
+          const s = statSync(join(AGENTS_DIR, f));
+          if (s.mtimeMs > newestMtime) { newestMtime = s.mtimeMs; newest = f; }
+        } catch (_) {}
+      }
+      if (newest) return newest.replace(/\.json$/, '');
+    }
+  } catch (_) {}
+  return null;
+}
+
+function getPeerProvider(peerAgentId) {
+  if (!peerAgentId) return null;
+  // Derive provider from runner prefix of the agent_id.
+  for (const [rname, rcfg] of Object.entries(patternsDoc.runners || {})) {
+    if (peerAgentId.startsWith(rname + '-')) return rcfg.provider || rname;
+  }
+  return null;
+}
+
+function isPeerExhausted(peerAgentId) {
+  if (!peerAgentId) return true; // no peer = exhausted (will queue)
+  const peerProvider = getPeerProvider(peerAgentId);
+  if (!peerProvider) return false;
+  const quota = readQuota();
+  if (!quota) return false;
+  const p = quota.providers[peerProvider];
+  if (!p) return false;
+  return p.estimated_headroom === 'exhausted';
+}
+
+// ---- relay log --------------------------------------------------------------
+
+function appendRelayLog(entry) {
+  try {
+    mkdirSync(GOAL_DIR, { recursive: true });
+    appendFileSync(RELAY_LOG, JSON.stringify(entry) + '\n');
+  } catch (_) {}
+}
+
+function countRecentRelays() {
+  const oneHourAgo = Date.now() - 3600_000;
+  try {
+    const lines = readFileSync(RELAY_LOG, 'utf8').split('\n').filter(Boolean);
+    return lines.filter(line => {
+      try {
+        const e = JSON.parse(line);
+        return e.ts && Date.parse(e.ts) >= oneHourAgo;
+      } catch (_) { return false; }
+    }).length;
+  } catch (_) {
+    return 0;
+  }
+}
+
+// ---- handoff envelope writer ------------------------------------------------
+//
+// Spec §5.2: seq zero-padded 4 digits, monotonic.
+// Atomic write: mktemp + rename.
+// Must be called under bridge lock.
+
+function nextHandoffSeq() {
+  mkdirSync(HANDOFF_DIR, { recursive: true });
+  let max = 0;
+  try {
+    const files = readdirSync(HANDOFF_DIR).filter(f => /^\d{4}\.md$/.test(f));
+    for (const f of files) {
+      const n = parseInt(f, 10);
+      if (n > max) max = n;
+    }
+  } catch (_) {}
+  return max + 1;
+}
+
+function formatSeq(n) {
+  return String(n).padStart(4, '0');
+}
+
+function writeHandoffEnvelope({ seq, from, to, reason, goalId, state }) {
+  const seqStr = formatSeq(seq);
+  const ts = now();
+  const handoffPath = join(HANDOFF_DIR, `${seqStr}.md`);
+
+  const objective = state?.objective || '';
+  const frontmatter = [
+    '---',
+    `seq: ${seqStr}`,
+    `from: ${from}`,
+    `to: ${to}`,
+    `at: ${ts}`,
+    `reason: ${reason}`,
+    `goal_id: ${goalId}`,
+    '---',
+  ].join('\n');
+
+  const body = [
+    '',
+    '## Did',
+    `- Agent ${from} was pursuing goal: ${objective.slice(0, 200)}`,
+    `- Stopped due to: ${reason}`,
+    '',
+    '## Did not',
+    '- (see open audit items in state.json)',
+    '',
+    '## Next',
+    `- Continue pursuing: ${objective.slice(0, 200)}`,
+    '',
+    '## Do not redo',
+    '- (check lineage in state.json for work already completed)',
+    '',
+    '## Open audit items',
+    '- See state.json .audit.checklist',
+    '',
+    '## Evidence',
+    `- Handoff triggered by: ${reason} from ${from}`,
+  ].join('\n');
+
+  const content = frontmatter + '\n' + body + '\n';
+
+  // Atomic write.
+  mkdirSync(HANDOFF_DIR, { recursive: true });
+  const tmpDir = mkdtempSync(join(HANDOFF_DIR, '.tmp-handoff-'));
+  const tmp = join(tmpDir, 'handoff.md');
+  try {
+    writeFileSync(tmp, content, 'utf8');
+    renameSync(tmp, handoffPath);
+  } catch (e) {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch (_) {}
+    try { rmdirSync(tmpDir); } catch (_) {}
+    throw e; // Abort relay — spec §13.
+  }
+  try { rmdirSync(tmpDir); } catch (_) {}
+
+  return { seq: seqStr, path: handoffPath, ts };
+}
+
+// ---- state transition helpers -----------------------------------------------
+
+function atomicUpdateState(updateFn) {
+  // Read-modify-write with CAS on goal_id.
+  const state = readState();
+  if (!state) return null;
+  const goalId = state.goal_id;
+  const updated = updateFn(state);
+  if (!updated) return null;
+  updated.updated_at = now();
+  // CAS: re-read to verify goal_id hasn't changed.
+  const fresh = readState();
+  if (!fresh || fresh.goal_id !== goalId) {
+    bridgeLog('cas-mismatch', `goal_id changed: expected ${goalId}`);
+    return null;
+  }
+  try {
+    atomicWrite(STATE_FILE, JSON.stringify(updated, null, 2) + '\n');
+    return updated;
+  } catch (e) {
+    bridgeLog('state-write-failed', e.message);
+    return null;
+  }
+}
+
+// ---- relay initiation -------------------------------------------------------
+//
+// Called when a fault is detected. Attempts to relay to peer.
+// Per spec §13: if handoff write fails, abort relay and transition to paused.
+
+function initiateRelay(reason, faultPayload) {
+  if (exiting) return;
+  bridgeLog('relay-initiating', `reason=${reason}`);
+
+  // Check relay guardrail.
+  const recentCount = countRecentRelays();
+  if (recentCount >= RELAY_LIMIT) {
+    bridgeLog('relay-guardrail-tripped', `recentCount=${recentCount} limit=${RELAY_LIMIT}`);
+    // Transition to paused.
+    if (acquireBridgeLock()) {
+      try {
+        atomicUpdateState(s => ({
+          ...s,
+          status: 'paused',
+          history: [...(s.history || []), {
+            ts: now(),
+            action: 'auto-paused',
+            note: `relay guardrail tripped (${recentCount} relays in last hour)`,
+          }],
+        }));
+      } finally {
+        releaseBridgeLock();
+      }
+    }
+    // Trigger notification sentinel.
+    triggerNotification(`Relay guardrail tripped: ${recentCount} relays in last hour. Goal auto-paused.`);
+    appendEvent({
+      ts: now(), type: 'goal.relay.guardrail_tripped',
+      goal_id: readState()?.goal_id || '',
+      agent_id: AGENT_ID, recent_count: recentCount, limit: RELAY_LIMIT,
+    });
+    return;
+  }
+
+  const state = readState();
+  if (!state) { bridgeLog('relay-no-state', ''); return; }
+
+  const peerAgent = getPeerAgent(state);
+  const peerExhausted = isPeerExhausted(peerAgent);
+
+  if (!peerAgent || peerExhausted) {
+    // Solo mode or all peers exhausted → queued.
+    bridgeLog('relay-no-peer', `peerAgent=${peerAgent} exhausted=${peerExhausted}`);
+    enterQueuedState(state);
+    return;
+  }
+
+  // Acquire lock and write handoff.
+  if (!acquireBridgeLock()) {
+    bridgeLog('relay-lock-failed', '');
+    // Per spec §13: abort relay, surface error, transition to paused.
+    transitionToPausedOnRelayFailure('lock acquisition failed');
+    return;
+  }
+
+  let handoffResult;
+  try {
+    // Compute next seq inside the lock.
+    const seq = nextHandoffSeq();
+
+    try {
+      handoffResult = writeHandoffEnvelope({
+        seq, from: AGENT_ID, to: peerAgent,
+        reason, goalId: state.goal_id, state,
+      });
+    } catch (e) {
+      bridgeLog('handoff-write-failed', e.message);
+      // Per spec §13: failed handoff = abort relay, surface error, transition to paused.
+      atomicUpdateState(s => ({
+        ...s,
+        status: 'paused',
+        history: [...(s.history || []), {
+          ts: now(),
+          action: 'relay-aborted',
+          note: `handoff write failed: ${e.message}`,
+        }],
+      }));
+      releaseBridgeLock();
+      return;
+    }
+
+    // Update state atomically: status=relaying, current.agent=peer, handoff_head=seq.
+    const updated = atomicUpdateState(s => ({
+      ...s,
+      status: 'relaying',
+      current: { agent: peerAgent, session: null, since: now() },
+      handoff_head: handoffResult.seq,
+      history: [...(s.history || []), {
+        ts: now(),
+        action: 'relay-initiated',
+        note: `${reason}: handing off to ${peerAgent} (handoff ${handoffResult.seq})`,
+      }],
+    }));
+
+    if (!updated) {
+      bridgeLog('relay-state-write-failed', '');
+      // State write failed after handoff was written. The handoff file exists
+      // but state is inconsistent. Transition to paused as best-effort recovery.
+      atomicUpdateState(s => ({
+        ...s,
+        status: 'paused',
+        history: [...(s.history || []), {
+          ts: now(), action: 'relay-aborted', note: 'state update failed after handoff write',
+        }],
+      }));
+      releaseBridgeLock();
+      return;
+    }
+  } finally {
+    releaseBridgeLock();
+  }
+
+  // Log relay event.
+  appendRelayLog({ ts: now(), from: AGENT_ID, to: peerAgent, reason, handoff_seq: handoffResult.seq });
+
+  // Emit OTEL event.
+  appendEvent({
+    ts: now(), type: 'goal.relayed',
+    goal_id: state.goal_id, reason, from: AGENT_ID, to: peerAgent,
+    handoff_seq: handoffResult.seq,
+    handoff_write_ts: handoffResult.ts,
+  });
+
+  bridgeLog('relay-done', `handoff=${handoffResult.seq} to=${peerAgent}`);
+  bridgeLog('relay-self-stop', 'stopping ndjson loop after relay');
+  ndjsonLoopActive = false;
+}
+
+function transitionToPausedOnRelayFailure(reason) {
+  if (acquireBridgeLock()) {
+    try {
+      atomicUpdateState(s => ({
+        ...s,
+        status: 'paused',
+        history: [...(s.history || []), {
+          ts: now(), action: 'relay-aborted', note: reason,
+        }],
+      }));
+    } finally {
+      releaseBridgeLock();
+    }
+  }
+}
+
+// ---- queued state -----------------------------------------------------------
+
+function enterQueuedState(state) {
+  // Compute queued_until = max limit_reset_at across all providers.
+  const quota = readOrInitQuota();
+  let maxResetAt = null;
+  for (const prov of Object.values(quota.providers)) {
+    if (prov.limit_reset_at) {
+      if (!maxResetAt || Date.parse(prov.limit_reset_at) > Date.parse(maxResetAt)) {
+        maxResetAt = prov.limit_reset_at;
+      }
+    }
+  }
+  if (!maxResetAt) {
+    // Default: 1 hour from now.
+    maxResetAt = new Date(Date.now() + 3600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  }
+
+  if (acquireBridgeLock()) {
+    try {
+      atomicUpdateState(s => ({
+        ...s,
+        status: 'queued',
+        queued_until: maxResetAt,
+        history: [...(s.history || []), {
+          ts: now(), action: 'queued', note: `no peer with headroom; retry at ${maxResetAt}`,
+        }],
+      }));
+    } finally {
+      releaseBridgeLock();
+    }
+  }
+
+  // Emit OTEL event.
+  const exhaustedProviders = Object.entries(quota.providers)
+    .filter(([, p]) => p.estimated_headroom === 'exhausted')
+    .map(([k]) => k).join(',');
+  appendEvent({
+    ts: now(), type: 'goal.queued',
+    goal_id: state.goal_id, queued_until: maxResetAt,
+    providers_throttled: exhaustedProviders,
+  });
+
+  bridgeLog('queued', `queued_until=${maxResetAt}`);
+  startQueuedPolling(maxResetAt);
+}
+
+// ---- queued polling with exponential backoff --------------------------------
+
+let queuedPollTimer = null;
+let queuedPollInterval = 30_000; // 30s base
+const QUEUED_POLL_MAX = 5 * 60_000; // 5min cap
+let lastQuotaMtime = 0;
+
+function startQueuedPolling(queuedUntil) {
+  if (queuedPollTimer) clearTimeout(queuedPollTimer);
+  scheduleQueuedPoll(queuedUntil);
+}
+
+function scheduleQueuedPoll(queuedUntil) {
+  if (exiting) return;
+  queuedPollTimer = setTimeout(() => {
+    queuedPollTimer = null;
+    checkQueuedResume(queuedUntil);
+  }, queuedPollInterval);
+  // Increase backoff up to cap.
+  queuedPollInterval = Math.min(queuedPollInterval * 1.5, QUEUED_POLL_MAX);
+}
+
+function checkQueuedResume(originalQueuedUntil) {
+  if (exiting) return;
+  const state = readState();
+  if (!state || state.status !== 'queued') {
+    bridgeLog('queued-poll-aborted', `status=${state?.status}`);
+    return;
+  }
+
+  // Check if quota.json mtime changed (peer may have recovered).
+  try {
+    const s = statSync(QUOTA_FILE);
+    if (s.mtimeMs > lastQuotaMtime) {
+      lastQuotaMtime = s.mtimeMs;
+      // Restart polling with base interval (spec Q4: restart on quota.json mtime change).
+      queuedPollInterval = 30_000;
+    }
+  } catch (_) {}
+
+  const queuedUntil = state.queued_until || originalQueuedUntil;
+  const queuedUntilMs = queuedUntil ? Date.parse(queuedUntil) : 0;
+
+  if (Date.now() < queuedUntilMs) {
+    bridgeLog('queued-poll', `not yet (${Math.round((queuedUntilMs - Date.now()) / 1000)}s remaining)`);
+    scheduleQueuedPoll(queuedUntil);
+    return;
+  }
+
+  // Check if any provider has non-exhausted headroom.
+  const quota = readQuota();
+  const anyHeadroom = quota && Object.values(quota.providers).some(p => p.estimated_headroom !== 'exhausted');
+
+  if (!anyHeadroom) {
+    bridgeLog('queued-poll', 'still no headroom; extending queue');
+    scheduleQueuedPoll(queuedUntil);
+    return;
+  }
+
+  // Resume: transition back to pursuing.
+  bridgeLog('queued-resuming', '');
+  if (acquireBridgeLock()) {
+    try {
+      const resumeTs = now();
+      atomicUpdateState(s => {
+        if (s.status !== 'queued') return null; // CAS: already changed
+        return {
+          ...s,
+          status: 'pursuing',
+          queued_until: null,
+          current: { agent: AGENT_ID, session: currentSession, since: resumeTs },
+          history: [...(s.history || []), {
+            ts: resumeTs, action: 'resumed-from-queue', note: 'headroom restored',
+          }],
+        };
+      });
+    } finally {
+      releaseBridgeLock();
+    }
+  }
+
+  // Emit recovery histogram data.
+  appendEvent({
+    ts: now(), type: 'goal.relay.resumed_from_queue',
+    goal_id: state.goal_id, agent_id: AGENT_ID,
+  });
+}
+
+// ---- notification trigger ---------------------------------------------------
+
+function triggerNotification(message) {
+  // Write a sentinel file that the Notification hook can detect.
+  // The notify hook watches .claude/ for pause events; we write a special
+  // sentinel file .claude/goal-notify-pending that hook integrations can read.
+  try {
+    const sentinelDir = join(ROOT, '.claude');
+    mkdirSync(sentinelDir, { recursive: true });
+    const sentinel = join(sentinelDir, 'goal-notify-pending');
+    const content = JSON.stringify({
+      ts: now(), agent_id: AGENT_ID, message,
+    }) + '\n';
+    atomicWrite(sentinel, content);
+    bridgeLog('notification-triggered', message.slice(0, 100));
+  } catch (e) {
+    bridgeLog('notification-trigger-failed', e.message);
+  }
+}
+
+// ---- NDJSON spawn-per-turn loop ---------------------------------------------
+//
+// For ndjson runners (Codex), the bridge is the actor that drives turns.
+// Each turn is a fresh process spawn. Session state is maintained across turns.
+
+let ndjsonLoopActive = false;
+let handoffContextForNextTurn = null; // Set when we just picked up a handoff.
+
+async function runNdjsonTurn(continuationPrompt) {
+  if (exiting || !ndjsonLoopActive) return false;
+
+  const agentData = readAgentJson();
+  const sessionId = agentData.runner_session || null;
+
+  let spawnParts;
+  if (!sessionId) {
+    // First turn: use spawn command.
+    spawnParts = expandSpawnTokens(baseSpawnCmd);
+    bridgeLog('ndjson-turn-first', `cmd=${spawnParts.join(' ')}`);
+  } else {
+    // Resume turn.
+    const envOverride = process.env[`GOAL_BRIDGE_SPAWN_RESUME_${RUNNER.toUpperCase().replace(/-/g, '_')}`];
+    const resumeParts = envOverride ? envOverride.split(' ') : baseResumeCmd;
+    spawnParts = expandSpawnTokens(resumeParts, { session_id: sessionId });
+    bridgeLog('ndjson-turn-resume', `cmd=${spawnParts.join(' ')} session=${sessionId}`);
+  }
+
+  const [cmd, ...cmdArgs] = spawnParts;
+
+  return new Promise((resolveP) => {
+    let child;
+    try {
+      child = spawn(cmd, cmdArgs, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env },
+      });
+    } catch (e) {
+      bridgeLog('ndjson-spawn-failed', e.message);
+      resolveP(false);
+      return;
+    }
+
+    // Write continuation prompt to stdin.
+    if (continuationPrompt) {
+      try {
+        child.stdin.write(continuationPrompt + '\n');
+        child.stdin.end();
+      } catch (e) {
+        bridgeLog('ndjson-stdin-write-failed', e.message);
+      }
+    } else {
+      child.stdin.end();
+    }
+
+    let lastEventWasCompleted = false;
+    let faultWritten = false;
+    let turnStartedAt = now();
+    const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
+
+    rl.on('line', (line) => {
+      if (!line.trim()) return;
+      let event;
+      try { event = JSON.parse(line); } catch (_) { return; }
+
+      const eventType = event.type || '';
+      bridgeLog('ndjson-event', eventType);
+
+      switch (eventType) {
+        case 'thread.started': {
+          const sid = event.session_id;
+          if (sid) {
+            bridgeLog('ndjson-session', `session_id=${sid}`);
+            updateAgentSession(sid);
+          }
+          break;
+        }
+
+        case 'turn.started': {
+          turnStartedAt = now();
+          lastEventWasCompleted = false;
+          break;
+        }
+
+        case 'turn.completed': {
+          lastEventWasCompleted = true;
+          const outputTokens = event.usage?.output_tokens || 0;
+          if (outputTokens > 0) {
+            // Accumulate tokens into state.json (CAS-guarded).
+            if (acquireBridgeLock()) {
+              try {
+                atomicUpdateState(s => ({
+                  ...s,
+                  tokens_used: (s.tokens_used || 0) + outputTokens,
+                }));
+              } finally {
+                releaseBridgeLock();
+              }
+            }
+          }
+          onTurnCompleted(RUNNER_PROVIDER);
+
+          // Emit handoff gap histogram if this is the first turn after a handoff.
+          const state = readState();
+          if (state?.handoff_head) {
+            appendEvent({
+              ts: now(), type: 'goal.handoff.peer_picked_up',
+              goal_id: state.goal_id, agent_id: AGENT_ID,
+              handoff_seq: state.handoff_head,
+              handoff_write_ts: turnStartedAt,
+            });
+          }
+
+          // If state is still relaying and we're the current agent, transition to pursuing.
+          if (state && state.status === 'relaying' && state.current?.agent === AGENT_ID) {
+            const relayStartTs = state.current?.since;
+            if (acquireBridgeLock()) {
+              try {
+                const resumeTs = now();
+                atomicUpdateState(s => {
+                  if (s.status !== 'relaying') return null; // already changed
+                  return {
+                    ...s,
+                    status: 'pursuing',
+                    history: [...(s.history || []), {
+                      ts: resumeTs, action: 'relay-completed',
+                      note: `peer ${AGENT_ID} resumed successfully`,
+                    }],
+                  };
+                });
+                // Emit recovery seconds histogram.
+                if (relayStartTs) {
+                  appendEvent({
+                    ts: resumeTs, type: 'goal.relay.recovery_seconds',
+                    goal_id: state.goal_id,
+                    recovery_seconds: Math.round((Date.parse(resumeTs) - Date.parse(relayStartTs)) / 1000),
+                  });
+                }
+              } finally {
+                releaseBridgeLock();
+              }
+            }
+          }
+          break;
+        }
+
+        case 'turn.failed':
+        case 'error': {
+          const payload = event.error?.message || JSON.stringify(event.error || event);
+          let faultKind = 'other';
+          if (matchesPatterns(payload, rateLimitPatterns)) {
+            faultKind = 'rate_limit';
+          } else if (matchesPatterns(payload, serverErrorPatterns)) {
+            faultKind = 'server_error';
+          }
+          writeFault(faultKind, payload, eventType);
+          faultWritten = true;
+
+          if (faultKind === 'rate_limit') {
+            onRateLimit(RUNNER_PROVIDER, payload);
+          }
+          break;
+        }
+
+        default:
+          if (eventType.startsWith('item.')) {
+            bridgeLog('ndjson-item', eventType);
+          }
+          break;
+      }
+    });
+
+    // Also pass stderr through.
+    child.stderr.on('data', (chunk) => {
+      process.stderr.write(chunk);
+    });
+
+    child.on('close', (code) => {
+      rl.close();
+      bridgeLog('ndjson-child-exit', `code=${code} lastCompleted=${lastEventWasCompleted} faultWritten=${faultWritten}`);
+
+      if (faultWritten) {
+        // Read the fault kind.
+        let faultKind = 'other';
+        try {
+          const fault = JSON.parse(readFileSync(FAULT_FILE, 'utf8'));
+          faultKind = fault.kind;
+        } catch (_) {}
+
+        if (faultKind === 'rate_limit') {
+          initiateRelay('rate_limit', 'turn.failed with rate_limit');
+        } else {
+          // server_error or other: initiate relay too (spec §8 covers 5xx).
+          initiateRelay('error', `fault kind=${faultKind}`);
+        }
+        resolveP(false); // don't schedule another turn
+        return;
+      }
+
+      if (!lastEventWasCompleted && code !== 0) {
+        // Unexpected exit without a fault file.
+        writeFault('other', `unexpected non-zero exit: code=${code}`, 'process-exit');
+        initiateRelay('error', `unexpected exit code=${code}`);
+        resolveP(false);
+        return;
+      }
+
+      resolveP(lastEventWasCompleted);
+    });
+
+    child.on('error', (e) => {
+      bridgeLog('ndjson-child-error', e.message);
+      resolveP(false);
+    });
+  });
+}
+
+async function ndjsonLoop() {
+  ndjsonLoopActive = true;
+  bridgeLog('ndjson-loop-start', `agent=${AGENT_ID}`);
+
+  while (ndjsonLoopActive && !exiting) {
+    if (existsSync(PAUSE_FILE)) {
+      bridgeLog('pause-detected-ndjson', '');
+      break;
+    }
+
+    const state = readState();
+    if (!state) { await sleep(1000); continue; }
+
+    if (state.status === 'queued') {
+      bridgeLog('ndjson-queued', 'waiting for resume');
+      await sleep(5000);
+      continue;
+    }
+
+    if (state.status !== 'pursuing' && state.status !== 'relaying') {
+      bridgeLog('ndjson-not-active', `status=${state.status}`);
+      ndjsonLoopActive = false;
+      break;
+    }
+
+    if (state.current?.agent !== AGENT_ID) {
+      // Not our turn yet — we might be the peer waiting for handoff.
+      await sleep(1000);
+      continue;
+    }
+
+    // Build continuation prompt.
+    const prompt = buildContinuationPrompt(state);
+    const success = await runNdjsonTurn(prompt);
+
+    if (!success || !ndjsonLoopActive) break;
+
+    // Pause between turns to avoid spinning.
+    await sleep(500);
+  }
+
+  bridgeLog('ndjson-loop-end', '');
+}
+
+function buildContinuationPrompt(state) {
+  let prompt = `Continue pursuing the goal: ${state.objective}\n`;
+  prompt += `Goal ID: ${state.goal_id}\n`;
+  prompt += `Status: ${state.status}\n`;
+  if (state.tokens_used) prompt += `Tokens used so far: ${state.tokens_used}\n`;
+
+  // Include handoff context if we just picked up from a relay.
+  if (handoffContextForNextTurn) {
+    prompt += `\n## Handoff context (from previous agent)\n${handoffContextForNextTurn}\n`;
+    handoffContextForNextTurn = null;
+  } else if (state.handoff_head) {
+    // Try to load the handoff envelope.
+    try {
+      const handoffPath = join(HANDOFF_DIR, `${state.handoff_head}.md`);
+      const content = readFileSync(handoffPath, 'utf8');
+      prompt += `\n## Handoff from previous agent\n${content}\n`;
+    } catch (_) {}
+  }
+
+  return prompt;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ---- B2: continuation append (line mode — claude-code) ----------------------
 
 function appendContinuation(stateObj) {
-  // TODO(P3): Replace this file-append with real injection once spec §18 Q1/Q2
-  // are answered:
-  //   Q1: Does the runner expose a structured signal channel (stdin pipe, MCP
-  //       push endpoint) for continuation prompts? Affects delivery mechanism.
-  //   Q2: Is there an MCP push equivalent in the runner at runtime? Affects
-  //       latency and ordering guarantees.
-  // For P2, we write a JSONL line to .goal/agents/<agent_id>.continue
-  // (append-only) so P3 can read and relay via the appropriate delivery path.
-  // See spec §7 B2 + §18.
   const line = JSON.stringify({
     ts:        now(),
     agent_id:  AGENT_ID,
@@ -233,9 +1199,33 @@ function onStateChange() {
   }
   bridgeLog('state-changed', `status=${state.status} agent=${state.current?.agent}`);
 
-  // B2: continuation only when pursuing AND current agent is this bridge.
-  if (state.status === 'pursuing' && state.current?.agent === AGENT_ID) {
-    appendContinuation(state);
+  if (RUNNER_FORMAT === 'ndjson') {
+    // For ndjson runners: when state switches to pursuing with us as agent,
+    // and we're not already in a loop, start the loop.
+    if (state.status === 'pursuing' && state.current?.agent === AGENT_ID) {
+      if (!ndjsonLoopActive) {
+        ndjsonLoop().catch(e => bridgeLog('ndjson-loop-error', e.message));
+      }
+    }
+    // When state switches to relaying with us as target peer (we pick up).
+    if (state.status === 'relaying' && state.current?.agent === AGENT_ID) {
+      if (!ndjsonLoopActive) {
+        bridgeLog('relay-pickup', `handoff_head=${state.handoff_head}`);
+        // Load handoff context for next turn.
+        if (state.handoff_head) {
+          try {
+            const hp = join(HANDOFF_DIR, `${state.handoff_head}.md`);
+            handoffContextForNextTurn = readFileSync(hp, 'utf8');
+          } catch (_) {}
+        }
+        ndjsonLoop().catch(e => bridgeLog('ndjson-loop-error', e.message));
+      }
+    }
+  } else {
+    // line mode: continuation only when pursuing AND current agent is this bridge.
+    if (state.status === 'pursuing' && state.current?.agent === AGENT_ID) {
+      appendContinuation(state);
+    }
   }
 }
 
@@ -244,7 +1234,7 @@ function scheduleStateCheck() {
   debounceTimer = setTimeout(() => {
     debounceTimer = null;
     onStateChange();
-  }, 500); // 500ms debounce per spec §7 B1
+  }, 500);
 }
 
 let watcherInstance = null;
@@ -257,7 +1247,6 @@ function startWatcher() {
     return;
   }
   try {
-    // Watch the directory rather than the file: more portable on macOS/Linux.
     watcherInstance = watch(GOAL_DIR, { persistent: true }, (eventType, filename) => {
       if (filename === 'state.json') {
         scheduleStateCheck();
@@ -276,13 +1265,13 @@ function startWatcher() {
   }
 }
 
-// ---- B4: spawn runner child -------------------------------------------------
+// ---- B4: spawn runner child (line mode) -------------------------------------
 
 let runnerChild = null;
 
-function spawnRunner() {
-  if (exiting) return;
-  const [cmd, ...cmdArgs] = spawnCmd;
+function spawnLineRunner() {
+  if (exiting || RUNNER_FORMAT !== 'line') return;
+  const [cmd, ...cmdArgs] = SPAWN_CMD;
   bridgeLog('runner-spawn', `cmd=${cmd} args=${JSON.stringify(cmdArgs)}`);
 
   try {
@@ -297,17 +1286,33 @@ function spawnRunner() {
 
   runnerChild.stderr.on('data', (chunk) => {
     const text = chunk.toString();
-    process.stderr.write(text); // passthrough
+    process.stderr.write(text);
 
     for (const rawLine of text.split('\n')) {
       const line = rawLine.trim();
       if (!line) continue;
 
       for (const pat of rateLimitPatterns) {
-        if (pat.test(line)) { writeFault('rate_limit', line); return; }
+        if (pat.test(line)) {
+          writeFault('rate_limit', line, 'stderr');
+          onRateLimit(RUNNER_PROVIDER, line);
+          // For line runners, relay is triggered if we're in the right state.
+          const state = readState();
+          if (state && state.status === 'pursuing' && state.current?.agent === AGENT_ID) {
+            initiateRelay('rate_limit', line);
+          }
+          return;
+        }
       }
       for (const pat of serverErrorPatterns) {
-        if (pat.test(line)) { writeFault('server_error', line); return; }
+        if (pat.test(line)) {
+          writeFault('server_error', line, 'stderr');
+          const state = readState();
+          if (state && state.status === 'pursuing' && state.current?.agent === AGENT_ID) {
+            initiateRelay('error', line);
+          }
+          return;
+        }
       }
     }
   });
@@ -342,15 +1347,17 @@ let heartbeatInterval = null;
 function exitCleanly(finalStatus = 'stopped') {
   if (exiting) return;
   exiting = true;
+  ndjsonLoopActive = false;
 
   if (heartbeatInterval) clearInterval(heartbeatInterval);
   if (pauseCheckInterval) clearInterval(pauseCheckInterval);
   if (debounceTimer) clearTimeout(debounceTimer);
+  if (queuedPollTimer) clearTimeout(queuedPollTimer);
   if (watcherInstance) { try { watcherInstance.close(); } catch (_) {} }
 
-  // Write final heartbeat with status.
   writeHeartbeat({ status: finalStatus });
   bridgeLog('exit', `finalStatus=${finalStatus}`);
+  releaseBridgeLock(); // best-effort
 
   if (runnerChild) {
     try { runnerChild.kill('SIGTERM'); } catch (_) {}
@@ -378,7 +1385,15 @@ process.on('SIGINT',  () => { bridgeLog('signal', 'SIGINT');  exitCleanly('stopp
 mkdirSync(AGENTS_DIR, { recursive: true });
 mkdirSync(join(ROOT, '.claude'), { recursive: true });
 
-bridgeLog('start', `runner=${RUNNER} agent_id=${AGENT_ID} spawn=${spawnCmd.join(' ')}`);
+bridgeLog('start', `runner=${RUNNER} format=${RUNNER_FORMAT} agent_id=${AGENT_ID}`);
+
+// Initialize quota.json if missing.
+try {
+  if (!existsSync(QUOTA_FILE)) {
+    saveQuota(readOrInitQuota());
+  }
+  lastQuotaMtime = statSync(QUOTA_FILE).mtimeMs;
+} catch (_) {}
 
 // B3: initial heartbeat + interval.
 writeHeartbeat();
@@ -387,8 +1402,24 @@ heartbeatInterval = setInterval(() => { if (!exiting) writeHeartbeat(); }, 5000)
 // B1: start filesystem watcher.
 startWatcher();
 
-// B4: spawn runner.
-spawnRunner();
+// B4: for line runners, spawn the runner child. For ndjson, the loop starts
+// when state.json shows us as current.agent.
+if (RUNNER_FORMAT === 'line') {
+  spawnLineRunner();
+} else {
+  // Check state immediately — we may already be the current agent.
+  const initState = readState();
+  if (initState && (initState.status === 'pursuing' || initState.status === 'relaying') &&
+      initState.current?.agent === AGENT_ID) {
+    if (initState.status === 'relaying' && initState.handoff_head) {
+      try {
+        const hp = join(HANDOFF_DIR, `${initState.handoff_head}.md`);
+        handoffContextForNextTurn = readFileSync(hp, 'utf8');
+      } catch (_) {}
+    }
+    ndjsonLoop().catch(e => bridgeLog('ndjson-loop-error-startup', e.message));
+  }
+}
 
 // B5: check pause immediately, then poll.
 checkPause();

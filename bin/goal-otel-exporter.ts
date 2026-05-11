@@ -170,11 +170,15 @@ interface Instruments {
     completed: import("@opentelemetry/api").Counter;
     unmet: import("@opentelemetry/api").Counter;
     budget_limited: import("@opentelemetry/api").Counter;
+    relayed: import("@opentelemetry/api").Counter;
+    queued: import("@opentelemetry/api").Counter;
   };
   histograms: {
     token_count: import("@opentelemetry/api").Histogram;
     continuation_turns: import("@opentelemetry/api").Histogram;
     elapsed_seconds: import("@opentelemetry/api").Histogram;
+    handoff_gap_seconds: import("@opentelemetry/api").Histogram;
+    relay_recovery_seconds: import("@opentelemetry/api").Histogram;
   };
 }
 
@@ -196,6 +200,12 @@ function buildInstruments(): Instruments {
       budget_limited: meter.createCounter("goal.budget_limited", {
         description: "Goals that hit their token budget",
       }),
+      relayed: meter.createCounter("goal.relayed", {
+        description: "Goal relay events (agent handoffs) keyed by reason, from, to",
+      }),
+      queued: meter.createCounter("goal.queued", {
+        description: "Goal queued events (all providers throttled) keyed by providers_throttled",
+      }),
     },
     histograms: {
       token_count: meter.createHistogram("goal.token_count", {
@@ -213,6 +223,16 @@ function buildInstruments(): Instruments {
         unit: "s",
         valueType: ValueType.DOUBLE,
       }),
+      handoff_gap_seconds: meter.createHistogram("goal.handoff.gap_seconds", {
+        description: "Time from handoff envelope write to peer first turn completion",
+        unit: "s",
+        valueType: ValueType.DOUBLE,
+      }),
+      relay_recovery_seconds: meter.createHistogram("goal.relay.recovery_seconds", {
+        description: "Time from status=relaying to status=pursuing (relay round-trip)",
+        unit: "s",
+        valueType: ValueType.DOUBLE,
+      }),
     },
   };
 }
@@ -225,6 +245,12 @@ interface GoalEvent {
   tokens_used?: number;
   continuation_turns?: number;
   elapsed_seconds?: number;
+  reason?: string;
+  from?: string;
+  to?: string;
+  providers_throttled?: string;
+  handoff_write_ts?: string;
+  recovery_seconds?: number;
   [k: string]: unknown;
 }
 
@@ -259,6 +285,33 @@ function dispatch(ev: GoalEvent): void {
     case "goal.tokens_updated":
       if (typeof ev.tokens_used === "number") {
         inst.histograms.token_count.record(ev.tokens_used, attrs);
+      }
+      break;
+    case "goal.relayed":
+      inst.counters.relayed.add(1, {
+        ...attrs,
+        reason: typeof ev.reason === "string" ? ev.reason : "unknown",
+        from:   typeof ev.from   === "string" ? ev.from   : "unknown",
+        to:     typeof ev.to     === "string" ? ev.to     : "unknown",
+      });
+      break;
+    case "goal.queued":
+      inst.counters.queued.add(1, {
+        ...attrs,
+        providers_throttled: typeof ev.providers_throttled === "string" ? ev.providers_throttled : "unknown",
+      });
+      break;
+    case "goal.handoff.peer_picked_up":
+      if (typeof ev.handoff_write_ts === "string") {
+        const gapMs = Date.now() - Date.parse(ev.handoff_write_ts);
+        if (Number.isFinite(gapMs) && gapMs >= 0) {
+          inst.histograms.handoff_gap_seconds.record(gapMs / 1000, attrs);
+        }
+      }
+      break;
+    case "goal.relay.recovery_seconds":
+      if (typeof ev.recovery_seconds === "number") {
+        inst.histograms.relay_recovery_seconds.record(ev.recovery_seconds, attrs);
       }
       break;
     // Unrecognized event types are intentionally ignored.

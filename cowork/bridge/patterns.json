@@ -3,29 +3,49 @@
     "Runner registry for goal-bridge.",
     "Each key is a runner name. The bridge selects the entry matching its <runner> argument.",
     "",
-    "spawn: command + args used to start the runner as a child process.",
-    "  These are STUB commands by default. Real spawn commands must be set by the user either:",
-    "    1. Via environment override: GOAL_BRIDGE_SPAWN_<RUNNER>=<cmd> (space-separated args)",
-    "       e.g. GOAL_BRIDGE_SPAWN_CODEX='codex --api-key $OPENAI_API_KEY'",
-    "    2. By editing the spawn array in this file post-install.",
-    "  The stubs intentionally do nothing harmful — they echo a message and exit,",
-    "  so the bridge can be tested/validated without a real runner installed.",
+    "format: 'ndjson' | 'line' (default 'line')",
+    "  ndjson — runner emits NDJSON events on stdout (spec §18 Q1 answer: Codex --json mode).",
+    "           Bridge uses spawn-per-turn model; reads thread.started / turn.completed /",
+    "           turn.failed / error events. Relay logic activates on turn.failed.",
+    "  line   — legacy mode: tail runner stderr for rate_limit / server_error regex patterns.",
+    "           Claude Code stays here — CC continuation is handled by the Stop hook, not",
+    "           by the bridge's spawn loop.",
     "",
-    "rate_limit / server_error: arrays of regex patterns matched against runner stderr.",
+    "spawn: command + args used to start the runner for the FIRST turn.",
+    "  Substitution tokens expanded at spawn time: {root}",
+    "  For ndjson runners, the objective is piped on stdin.",
+    "  For line runners, spawn starts a long-lived child process.",
+    "",
+    "spawn_resume: command + args for SUBSEQUENT turns (ndjson runners only).",
+    "  Substitution tokens: {root}, {session_id}",
+    "  The continuation prompt is piped on stdin.",
+    "",
+    "rate_limit / server_error: arrays of regex patterns.",
+    "  line mode: matched against runner stderr line-by-line.",
+    "  ndjson mode: matched against the event payload string in turn.failed / error events.",
     "  Each string is compiled as a case-insensitive JavaScript RegExp.",
-    "  On match, the bridge writes .goal/agents/<agent_id>.fault with kind=rate_limit|server_error.",
-    "  Real injection/relay waits for P3."
+    "",
+    "provider: maps the runner to a provider key in .goal/quota.json.",
+    "  claude-code → anthropic; codex → openai.",
+    "",
+    "Env override (any runner): GOAL_BRIDGE_SPAWN_<RUNNER_UPPER>=<space-separated cmd>",
+    "  e.g. GOAL_BRIDGE_SPAWN_CODEX='codex --api-key sk-...'"
   ],
   "runners": {
     "claude-code": {
+      "format": "line",
+      "provider": "anthropic",
       "spawn": ["echo", "claude-code-stub"],
       "rate_limit": ["429", "rate ?limit", "Too Many Requests"],
       "server_error": ["5\\d{2}", "internal server error", "service unavailable"]
     },
     "codex": {
-      "spawn": ["echo", "codex-stub-TODO-Q1-spec-§18"],
-      "rate_limit": ["429", "rate ?limit"],
-      "server_error": ["5\\d{2}"]
+      "format": "ndjson",
+      "provider": "openai",
+      "spawn": ["codex", "exec", "--json", "--sandbox", "workspace-write", "--cd", "{root}", "-"],
+      "spawn_resume": ["codex", "exec", "resume", "{session_id}", "--json", "--sandbox", "workspace-write", "--cd", "{root}", "-"],
+      "rate_limit": ["429", "rate ?limit", "too many requests"],
+      "server_error": ["5\\d{2}", "internal server error", "service unavailable"]
     }
   }
 }
