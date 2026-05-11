@@ -38,6 +38,12 @@ RESOLVER="$(dirname "$0")/goal-resolve.sh"
 
 resolve_goal "${2:-}" "${1:-$PWD}" || exit 0
 
+# In v2, GOAL_FILE may point at .goal/state.json. The jq filters below are
+# a strict superset so they work unchanged. The only P1 addition is handling
+# the two new statuses (relaying, queued) in the case statement — solo mode
+# shows nothing for those (they're runtime-only states from P3+, but we must
+# not crash if a file has them).
+
 SHAPE=$(jq -r '
     if (type == "object" and (.status | type) == "string") then
         ( (try (.pursuing_since | fromdateiso8601) catch null) ) as $since
@@ -143,6 +149,12 @@ case "$STATUS" in
         else
             label="Goal abandoned"
         fi
+        ;;
+    # v2 statuses — solo mode shows nothing for these runtime-only states
+    # (P3 will add cowork-aware rendering). We silently exit-0 per §13:
+    # "cowork and solo distinct paths".
+    relaying|queued)
+        exit 0
         ;;
     *)
         exit 0

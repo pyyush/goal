@@ -23,7 +23,18 @@ TMP=$(mktemp -d -t goal-smoke-XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/.claude"
 
-GOAL_FILE="$TMP/.claude/goal.json"
+# Resolve the active state file. After P1 migration, writers move from
+# .claude/goal.json (v1) to .goal/state.json (v2). The HTTP server in step 5
+# and MCP reads in steps 3-4 will trigger the lazy migration. Use this helper
+# everywhere the test inspects state on disk.
+current_state_file() {
+    if [ -f "$TMP/.goal/state.json" ]; then
+        printf '%s/.goal/state.json' "$TMP"
+    else
+        printf '%s/.claude/goal.json' "$TMP"
+    fi
+}
+GOAL_FILE="$TMP/.claude/goal.json"   # initial path; recomputed via current_state_file after step 4
 EVENTS_FILE="$TMP/.claude/goal-events.jsonl"
 GOALCTL="$REPO_ROOT/bin/goalctl"
 MCP_PKG="$REPO_ROOT/mcp/package.json"
@@ -129,11 +140,12 @@ say "events emitted ✓ ($(wc -l <"$EVENTS_FILE") lines)"
 # -------- 7. Concurrency: CAS rejects stale write ---------------------------
 
 step "7. CAS: stale goal_id rejected"
-# Snapshot the current goal_id
-OLD_ID=$(jq -r .goal_id "$GOAL_FILE")
+# Snapshot the current goal_id from the active state file (post-migration this
+# is .goal/state.json; pre-migration it is .claude/goal.json).
+OLD_ID=$(jq -r .goal_id "$(current_state_file)")
 # Bump goal_id via /goal replace (simulated by goalctl replace)
 "$GOALCTL" --root "$TMP" replace "second objective" >/dev/null
-NEW_ID=$(jq -r .goal_id "$GOAL_FILE")
+NEW_ID=$(jq -r .goal_id "$(current_state_file)")
 [ "$OLD_ID" != "$NEW_ID" ] || { red "FAIL: replace didn't generate new goal_id"; exit 7; }
 say "goal_id rotated $OLD_ID → $NEW_ID ✓"
 
@@ -148,20 +160,20 @@ step "8. Pursuit timer: pause+sleep+resume should NOT count paused interval"
 "$GOALCTL" --root "$TMP" create "pursuit timer test" >/dev/null
 sleep 2
 "$GOALCTL" --root "$TMP" pause >/dev/null
-AFTER_PAUSE=$(jq -r '.pursuing_seconds // 0' "$GOAL_FILE")
+AFTER_PAUSE=$(jq -r '.pursuing_seconds // 0' "$(current_state_file)")
 [ "$AFTER_PAUSE" -ge 1 ] || { red "FAIL: after pause, pursuing_seconds should be >= 1 (got $AFTER_PAUSE)"; exit 8; }
 say "after pause: pursuing_seconds=$AFTER_PAUSE ✓"
 
 sleep 3
 # pursuing_seconds must NOT have grown while paused.
-STILL_PAUSED=$(jq -r '.pursuing_seconds // 0' "$GOAL_FILE")
+STILL_PAUSED=$(jq -r '.pursuing_seconds // 0' "$(current_state_file)")
 [ "$STILL_PAUSED" -eq "$AFTER_PAUSE" ] || { red "FAIL: paused → pursuing_seconds grew from $AFTER_PAUSE to $STILL_PAUSED"; exit 8; }
 say "after 3s paused: pursuing_seconds still=$STILL_PAUSED ✓"
 
 "$GOALCTL" --root "$TMP" resume >/dev/null
 sleep 2
 "$GOALCTL" --root "$TMP" pause >/dev/null
-AFTER_RESUME_PAUSE=$(jq -r '.pursuing_seconds // 0' "$GOAL_FILE")
+AFTER_RESUME_PAUSE=$(jq -r '.pursuing_seconds // 0' "$(current_state_file)")
 # Should be AFTER_PAUSE + ~2 (the active resume interval), but NOT including
 # the 3s paused interval.
 DELTA=$((AFTER_RESUME_PAUSE - AFTER_PAUSE))

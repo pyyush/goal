@@ -5,6 +5,10 @@
 .claude/goal-baseline-*
 .claude/goal-events.jsonl
 .claude/goal-otel-cursor
+.claude/MIGRATED_TO_GOAL
+
+# v2 runtime state directory — never commit
+.goal/
 
 # Internal design docs / RFCs / plans — kept local, never committed
 proposal/
