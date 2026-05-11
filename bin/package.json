@@ -1,6 +1,6 @@
 {
   "name": "goal-bin",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Local helpers for goalctl — including the goal-http-server shim.",
