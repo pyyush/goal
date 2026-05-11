@@ -20,16 +20,27 @@
 
 ## Install
 
+Paste this to Claude Code / Cursor / any coding agent — or run it in a terminal:
+
+```bash
+git clone https://github.com/pyyush/goal ~/goal && cd ~/goal && ./bin/goal-setup --non-interactive
+```
+
+That clones the repo, installs the hooks, builds the MCP server, and patches `~/.claude.json` in one shot. Then **restart Claude Code** (CLI or quit-and-reopen Desktop) so the hooks and MCP server register.
+
+<details>
+<summary>Manual install (interactive prompts)</summary>
+
 ```bash
 git clone https://github.com/pyyush/goal
 cd goal
-./bin/goal-setup            # one-command interactive install (recommended)
-# or: ./install.sh user     # minimal: hooks only, no MCP server
+./bin/goal-setup            # interactive — prompts for scope, MCP server, statusline
+# or: ./install.sh user     # minimal: hooks only, no MCP server, no statusline
 ```
 
-`goal-setup` flags: `--dry-run`, `--non-interactive`, `--scope user|project`.
+`goal-setup` flags: `--dry-run` (preview), `--non-interactive` (accept defaults), `--scope user|project`.
 
-Restart Claude Code (CLI or quit-and-reopen Desktop) so the hooks + MCP server register.
+</details>
 
 ## Quickstart
 
