@@ -14,6 +14,11 @@ RESOLVER="$(dirname "$0")/goal-resolve.sh"
 # shellcheck disable=SC1090
 . "$RESOLVER"
 
+LOCK_SH="$(dirname "$0")/goal-lock.sh"
+[ -f "$LOCK_SH" ] || exit 0
+# shellcheck disable=SC1090
+. "$LOCK_SH"
+
 INPUT=$(cat || printf '')
 INPUT=${INPUT:-\{\}}
 
@@ -43,11 +48,27 @@ case "$MESSAGE" in
 esac
 
 NOW=$(date -u +%FT%TZ)
-TMP=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || exit 0
+if ! goal_lock_acquire "$GOAL_ROOT"; then
+    {
+        printf '{"ts":"%s","pid":%d,"hook":"notify","session":%s,"event":"lock-timeout","note":"could not acquire goal lock"}\n' \
+            "$NOW" "$$" \
+            "$(printf '%s' "$SESSION_ID" | jq -Rs . 2>/dev/null || printf '""')" \
+            >> "$LOG_FILE" 2>/dev/null || true
+    }
+    exit 0
+fi
+trap 'goal_lock_release "$GOAL_ROOT"' EXIT INT TERM
+
+STATE_DIR=$(dirname "$GOAL_FILE")
+TMP=$(mktemp "$STATE_DIR/.state.XXXXXX") || {
+    goal_lock_release "$GOAL_ROOT"
+    trap - EXIT INT TERM
+    exit 0
+}
 # Auto-pause: accumulate pursuit time from pursuing_since (with legacy
 # fallback to created_at) before clearing it.
 if jq --arg ts "$NOW" --arg r "$reason" --arg gid "$GOAL_ID" \
-     'if (.goal_id // "") == $gid then
+     'if ((.goal_id // "") == $gid and (.status // "") == "pursuing") then
           ( (try (.pursuing_since | fromdateiso8601) catch null) ) as $since
           | ( (try (.created_at | fromdateiso8601) catch null) ) as $created
           | ( $since // $created ) as $start
@@ -67,6 +88,8 @@ if jq --arg ts "$NOW" --arg r "$reason" --arg gid "$GOAL_ID" \
 else
     rm -f "$TMP"
 fi
+goal_lock_release "$GOAL_ROOT"
+trap - EXIT INT TERM
 
 {
     printf '{"ts":"%s","pid":%d,"hook":"notify","session":%s,"event":"auto-pause-error","note":%s}\n' \

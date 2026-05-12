@@ -42,7 +42,189 @@ if [ "$__GOAL_LOCK_FOUND" -eq 0 ]; then
     # concurrency).
     goal_lock_acquire() { return 0; }
     goal_lock_release() { :; }
+    goal_lock_path() { printf '%s/.claude/goal.lock' "$1"; }
 fi
+
+# ----- v2 migration ----------------------------------------------------------
+#
+# goal_migrate_if_needed <root>
+#
+# Performs a one-way atomic migration from v1 (.claude/goal.json) to v2
+# (.goal/state.json). Called early in every hook fire.
+#
+# Skipped entirely when:
+#   - GOAL_DISABLE_MIGRATION=1 is set
+#   - .goal/ already exists at root (migration already done)
+#   - .claude/goal.json does not exist at root
+#
+# On any error, logs loudly to .claude/goal-hook.log and aborts — never
+# half-migrates. Caller should re-resolve GOAL_FILE after this returns.
+
+goal_migrate_if_needed() {
+    local root="$1"
+    local v1_file="$root/.claude/goal.json"
+    local goal_dir="$root/.goal"
+    local v2_file="$goal_dir/state.json"
+    local log_file="$root/.claude/goal-hook.log"
+    local marker_file="$root/.claude/MIGRATED_TO_GOAL"
+
+    # Escape hatch.
+    if [ "${GOAL_DISABLE_MIGRATION:-0}" = "1" ]; then
+        return 0
+    fi
+
+    # Already migrated — no-op.
+    if [ -d "$goal_dir" ]; then
+        return 0
+    fi
+
+    # Nothing to migrate.
+    if [ ! -f "$v1_file" ] || [ -L "$v1_file" ]; then
+        return 0
+    fi
+
+    # Acquire lock (v1 path — .goal/ does not exist yet).
+    if ! goal_lock_acquire "$root"; then
+        {
+            printf '{"ts":"%s","pid":%d,"hook":"stop","event":"migration-lock-failed","root":"%s"}\n' \
+                "$(date -u +%FT%TZ)" "$$" "$root"
+        } >> "$log_file" 2>/dev/null || true
+        printf 'goal-stop: migration: could not acquire lock; aborting\n' >&2
+        return 1
+    fi
+    # Release lock on exit/error.
+    trap 'goal_lock_release "$root"' EXIT INT TERM
+
+    # Double-check after acquiring lock (another process may have raced).
+    if [ -d "$goal_dir" ]; then
+        goal_lock_release "$root"
+        trap - EXIT INT TERM
+        return 0
+    fi
+
+    # Validate the v1 file is parseable JSON before attempting migration.
+    if ! jq empty "$v1_file" 2>/dev/null; then
+        {
+            printf '{"ts":"%s","pid":%d,"hook":"stop","event":"migration-invalid-json","root":"%s"}\n' \
+                "$(date -u +%FT%TZ)" "$$" "$root"
+        } >> "$log_file" 2>/dev/null || true
+        printf 'goal-stop: migration: v1 file is not valid JSON; aborting\n' >&2
+        goal_lock_release "$root"
+        trap - EXIT INT TERM
+        return 1
+    fi
+
+    # Build v2 state in a temp file, then rename into place.
+    local tmp_dir
+    tmp_dir=$(mktemp -d "$root/.claude/.goal-migrate-XXXXXX") || {
+        printf 'goal-stop: migration: mktemp failed; aborting\n' >&2
+        goal_lock_release "$root"
+        trap - EXIT INT TERM
+        return 1
+    }
+    local tmp_state="$tmp_dir/state.json"
+
+    local migrate_ok=0
+    if jq '
+        # Extract v1 fields needed for lineage synthesis.
+        (.status // "pursuing") as $status
+        | (.tick_count // 0) as $ticks
+        | (.tokens_used // 0) as $tokens
+        | (.pursuing_seconds // 0) as $psecs
+        | (.created_at // (now | todateiso8601)) as $created
+        | (.updated_at // (now | todateiso8601)) as $updated
+        # ended_at: null if still active, else updated_at.
+        | (if ($status == "pursuing" or $status == "paused")
+            then null
+            else $updated
+            end) as $ended
+        # Build the v2 object as a strict superset of v1.
+        | . + {
+            schema_version: 2,
+            time_used_seconds: $psecs,
+            observed_at: $updated,
+            active_turn_started_at: (if $status == "pursuing" then (.pursuing_since // $updated) else null end),
+            tokens_used_observed_at: $updated,
+            time_used_seconds_final: (if $ended == null then null else $psecs end),
+            tokens_used_final: (if $ended == null then null else $tokens end),
+            compat: ["claude-code"],
+            roles: { lead: null, build: null, review: null },
+            current: { agent: null, session: null, since: null },
+            budget: null,
+            lineage: [
+              {
+                agent: "claude-code",
+                model: "unknown",
+                started_at: $created,
+                ended_at: $ended,
+                turns: $ticks,
+                tokens: $tokens,
+                summary: "migrated from v1"
+              }
+            ],
+            audit: null,
+            handoff_head: null,
+            queued_until: null
+          }
+    ' "$v1_file" > "$tmp_state" 2>/dev/null; then
+        migrate_ok=1
+    fi
+
+    if [ "$migrate_ok" -ne 1 ]; then
+        rm -rf "$tmp_dir" 2>/dev/null || true
+        {
+            printf '{"ts":"%s","pid":%d,"hook":"stop","event":"migration-jq-failed","root":"%s"}\n' \
+                "$(date -u +%FT%TZ)" "$$" "$root"
+        } >> "$log_file" 2>/dev/null || true
+        printf 'goal-stop: migration: jq transform failed; aborting\n' >&2
+        goal_lock_release "$root"
+        trap - EXIT INT TERM
+        return 1
+    fi
+
+    # Create .goal/ dir and move state file in atomically.
+    if ! mkdir "$goal_dir" 2>/dev/null; then
+        # Race: another process created it between our checks. Clean up and return.
+        rm -rf "$tmp_dir" 2>/dev/null || true
+        goal_lock_release "$root"
+        trap - EXIT INT TERM
+        return 0
+    fi
+
+    # Move state.json into .goal/.
+    if ! mv "$tmp_state" "$v2_file" 2>/dev/null; then
+        rm -rf "$tmp_dir" 2>/dev/null || true
+        rmdir "$goal_dir" 2>/dev/null || true
+        {
+            printf '{"ts":"%s","pid":%d,"hook":"stop","event":"migration-mv-failed","root":"%s"}\n' \
+                "$(date -u +%FT%TZ)" "$$" "$root"
+        } >> "$log_file" 2>/dev/null || true
+        printf 'goal-stop: migration: mv state.json failed; aborting\n' >&2
+        goal_lock_release "$root"
+        trap - EXIT INT TERM
+        return 1
+    fi
+    rm -rf "$tmp_dir" 2>/dev/null || true
+
+    # Release the old lock explicitly. The trap at the end will call
+    # goal_lock_release() which now uses goal_lock_path() → .goal/lock
+    # (because .goal/ exists). Remove .claude/goal.lock directly so
+    # the trap's release is a no-op (idempotent rm -rf is safe).
+    rm -rf "$root/.claude/goal.lock" 2>/dev/null || true
+
+    # Write the marker file.
+    printf '%s\n' "$(date -u +%FT%TZ)" > "$marker_file" 2>/dev/null || true
+
+    {
+        printf '{"ts":"%s","pid":%d,"hook":"stop","event":"migration-done","root":"%s","v2_file":"%s"}\n' \
+            "$(date -u +%FT%TZ)" "$$" "$root" "$v2_file"
+    } >> "$log_file" 2>/dev/null || true
+
+    # goal_lock_release will now use .goal/lock (since .goal/ exists).
+    goal_lock_release "$root"
+    trap - EXIT INT TERM
+    return 0
+}
 
 INPUT=$(cat || printf '')
 INPUT=${INPUT:-\{\}}
@@ -52,6 +234,16 @@ SESSION_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)
 TRANSCRIPT_PATH=$(printf '%s' "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
 
 resolve_goal "$SESSION_ID" "${SESSION_CWD:-$PWD}" || exit 0
+
+# ----- v2 migration trigger --------------------------------------------------
+# After resolving GOAL_ROOT, attempt migration (no-op if already done or
+# GOAL_DISABLE_MIGRATION=1). On success, re-resolve so GOAL_FILE points at
+# the v2 path if migration just completed.
+
+if goal_migrate_if_needed "$GOAL_ROOT"; then
+    # Re-resolve: GOAL_FILE may now point at .goal/state.json.
+    resolve_goal "$SESSION_ID" "${SESSION_CWD:-$PWD}" || exit 0
+fi
 
 # ----- helpers ---------------------------------------------------------------
 
@@ -86,16 +278,21 @@ goal_id_matches() {
 }
 
 write_state() {
-    local status="$1" action="$2" note="$3" now tmp
+    local status="$1" action="$2" note="$3" now tmp goal_file_dir
     if ! goal_id_matches; then
         log "stale-write-rejected" "write_state status=$status (goal_id changed)"
         return 1
     fi
     now=$(date -u +%FT%TZ)
-    tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
+    # Use the state file's own directory for the tmp file so rename(2) is
+    # atomic on the same filesystem. Works for both v1 (.claude/) and v2 (.goal/).
+    goal_file_dir=$(dirname "$GOAL_FILE")
+    tmp=$(mktemp "$goal_file_dir/.state.XXXXXX") || return 0
     # When transitioning OUT of pursuing into a terminal/paused state, accumulate
     # pursuing_seconds based on the on-disk pursuing_since. We do this inside the
     # jq filter so the read-modify-write is atomic and CAS-guarded by goal_id.
+    # v2 compat: pass-through unknown fields (schema_version, lineage, etc.) via
+    # the `. +` merge pattern — the filter only touches the fields it knows about.
     if jq --arg ts "$now" --arg s "$status" --arg a "$action" --arg n "$note" --arg gid "${GOAL_ID:-}" \
          'if (.goal_id // "") == $gid then
               ( (try (.pursuing_since | fromdateiso8601) catch null) ) as $since
@@ -122,13 +319,14 @@ write_state() {
 }
 
 increment_tick() {
-    local new_tick="$1" now tmp
+    local new_tick="$1" now tmp goal_file_dir
     if ! goal_id_matches; then
         log "stale-write-rejected" "increment_tick (goal_id changed)"
         return 1
     fi
     now=$(date -u +%FT%TZ)
-    tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
+    goal_file_dir=$(dirname "$GOAL_FILE")
+    tmp=$(mktemp "$goal_file_dir/.state.XXXXXX") || return 0
     if jq --arg ts "$now" --argjson t "$new_tick" --arg gid "${GOAL_ID:-}" \
          'if (.goal_id // "") == $gid then
               .tick_count = $t | .updated_at = $ts
@@ -141,13 +339,14 @@ increment_tick() {
 }
 
 write_tokens() {
-    local new_used="$1" now tmp
+    local new_used="$1" now tmp goal_file_dir
     if ! goal_id_matches; then
         log "stale-write-rejected" "write_tokens (goal_id changed)"
         return 1
     fi
     now=$(date -u +%FT%TZ)
-    tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
+    goal_file_dir=$(dirname "$GOAL_FILE")
+    tmp=$(mktemp "$goal_file_dir/.state.XXXXXX") || return 0
     if jq --arg ts "$now" --argjson u "$new_used" --arg gid "${GOAL_ID:-}" \
          'if (.goal_id // "") == $gid then
               .tokens_used = $u | .updated_at = $ts
@@ -227,7 +426,8 @@ fi
 # timer ticks correctly from this point forward.
 HAS_SINCE=$(jq -r '(.pursuing_since // null) != null' "$GOAL_FILE" 2>/dev/null || printf 'true')
 if [ "$HAS_SINCE" = "false" ]; then
-    tmp_migrate=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || tmp_migrate=""
+    _goal_file_dir=$(dirname "$GOAL_FILE")
+    tmp_migrate=$(mktemp "$_goal_file_dir/.state.XXXXXX") || tmp_migrate=""
     if [ -n "$tmp_migrate" ]; then
         if jq --arg gid "${GOAL_ID:-}" \
              'if (.goal_id // "") == $gid then

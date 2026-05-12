@@ -1,0 +1,103 @@
+#!/usr/bin/env node
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+
+const args = process.argv.slice(2);
+let root = process.cwd();
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "--root" && args[i + 1]) root = resolve(args[++i]);
+}
+
+const goalDir = join(root, ".goal");
+const stateFile = join(goalDir, "state.json");
+const heartbeatFile = join(goalDir, "heartbeat");
+const pidFile = join(goalDir, "ticker.pid");
+const lockDir = join(goalDir, "ticker.lock");
+const maxSeconds = Number.parseInt(process.env.GOAL_TICKER_MAX_SECONDS || "86400", 10);
+
+function nowIso() { return new Date().toISOString().replace(/\.\d{3}Z$/, "Z"); }
+function readState() {
+  try { return JSON.parse(readFileSync(stateFile, "utf8")); } catch { return null; }
+}
+function fmt(seconds) {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) {
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    return m ? `${h}h ${m}m` : `${h}h`;
+  }
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  return `${d}d ${h}h ${m}m`;
+}
+function elapsed(s) {
+  if (["achieved", "unmet", "budget-limited"].includes(s.status) && s.time_used_seconds_final != null) return s.time_used_seconds_final;
+  let base = Number(s.time_used_seconds ?? s.pursuing_seconds ?? 0);
+  if (s.status === "pursuing") {
+    const observed = Date.parse(s.observed_at || s.updated_at || s.created_at || nowIso());
+    const active = s.active_turn_started_at ? Date.parse(s.active_turn_started_at) : observed;
+    const start = Math.max(Number.isFinite(observed) ? observed : Date.now(), Number.isFinite(active) ? active : 0);
+    base += Math.max(0, Math.floor((Date.now() - start) / 1000));
+  }
+  return base;
+}
+function objective(s) {
+  return String(s.objective || "").replace(/\s+/g, " ").slice(0, 40);
+}
+function writeTitle(s) {
+  const prefix = s.status === "paused" ? `paused ${fmt(elapsed(s))}` : fmt(elapsed(s));
+  const agent = s.current?.agent || "solo";
+  process.stdout.write(`\x1b]0;[${prefix}] ${objective(s)} — ${agent}\x07`);
+}
+function atomicTouch(file) {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, nowIso() + "\n");
+  renameSync(tmp, file);
+}
+function acquireLock() {
+  mkdirSync(goalDir, { recursive: true });
+  try {
+    mkdirSync(lockDir);
+    writeFileSync(pidFile, `${process.pid}\n`);
+    return true;
+  } catch {
+    try {
+      const age = Date.now() - statSync(lockDir).mtimeMs;
+      if (age > 30_000) {
+        rmSync(lockDir, { recursive: true, force: true });
+        mkdirSync(lockDir);
+        writeFileSync(pidFile, `${process.pid}\n`);
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+}
+function cleanup() {
+  rmSync(lockDir, { recursive: true, force: true });
+  rmSync(pidFile, { force: true });
+}
+
+if (!process.stdout.isTTY && process.env.GOAL_TICKER_FORCE_TTY !== "1") process.exit(0);
+if (!acquireLock()) process.exit(0);
+process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+process.on("SIGHUP", () => { cleanup(); process.exit(0); });
+process.on("SIGINT", () => { cleanup(); process.exit(0); });
+
+const started = Date.now();
+const timer = setInterval(() => {
+  const s = readState();
+  if (!s || !["pursuing", "paused"].includes(s.status) || (Date.now() - started) / 1000 > maxSeconds) {
+    clearInterval(timer);
+    cleanup();
+    process.exit(0);
+  }
+  if (!process.stdout.isTTY && process.env.GOAL_TICKER_FORCE_TTY !== "1") {
+    clearInterval(timer);
+    cleanup();
+    process.exit(0);
+  }
+  writeTitle(s);
+  atomicTouch(heartbeatFile);
+}, 2000);

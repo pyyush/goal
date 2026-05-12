@@ -88,7 +88,10 @@ mkdir -p "$TARGET/commands" "$TARGET/hooks" "$HOME/.claude/goal-sessions"
 cp "$REPO_DIR/goal.md" "$TARGET/commands/goal.md"
 cp "$REPO_DIR/hooks/"*.sh "$TARGET/hooks/"
 chmod +x "$TARGET/hooks/"*.sh
-printf 'Installed command + 5 hook files to %s/\n' "$TARGET"
+mkdir -p "$TARGET/bin"
+cp "$REPO_DIR/bin/goal-ticker" "$TARGET/bin/goal-ticker"
+chmod +x "$TARGET/bin/goal-ticker"
+printf 'Installed command + hook files + goal-ticker to %s/\n' "$TARGET"
 
 # ---- settings.json merge ---------------------------------------------------
 
@@ -105,9 +108,17 @@ else
     TMP=$(mktemp)
     jq --arg p "$HOOK_CMD_PREFIX" '
         .hooks //= {}
+        | .hooks.SessionStart //= []
+        | .hooks.PreToolUse //= []
         | .hooks.Stop //= []
         | .hooks.Notification //= []
         | .hooks.UserPromptSubmit //= []
+        | (.hooks.SessionStart |=
+            if any(.[]?; .hooks[0].command == ($p + "goal-ticker.sh"))
+            then . else . + [{hooks: [{type: "command", command: ($p + "goal-ticker.sh")}]}] end)
+        | (.hooks.PreToolUse |=
+            if any(.[]?; (.matcher // "") == "Task" and .hooks[0].command == ($p + "goal-ticker.sh"))
+            then . else . + [{matcher: "Task", hooks: [{type: "command", command: ($p + "goal-ticker.sh")}]}] end)
         | (.hooks.Stop |=
             if any(.[]?; .hooks[0].command == ($p + "goal-stop.sh"))
             then . else . + [{hooks: [{type: "command", command: ($p + "goal-stop.sh")}]}] end)
@@ -272,7 +283,7 @@ fi
 # ---- project-scope .gitignore ----------------------------------------------
 
 if [ "$SCOPE" = project ] && [ -d .git ]; then
-    for pat in '.claude/goal.json' '.claude/goal-hook.log' '.claude/goal.pause' '.claude/goal-baseline-*'; do
+    for pat in '.goal/' '.claude/goal.json' '.claude/goal-hook.log' '.claude/goal.pause' '.claude/goal-baseline-*' '.claude/MIGRATED_TO_GOAL'; do
         if [ ! -f .gitignore ] || ! grep -qxF "$pat" .gitignore 2>/dev/null; then
             printf '%s\n' "$pat" >> .gitignore
             printf 'Added %s to .gitignore\n' "$pat"

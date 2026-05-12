@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Runner registry for goal-bridge.",
+    "Each key is a runner name. The bridge selects the entry matching its <runner> argument.",
+    "",
+    "format: 'ndjson' | 'line' (default 'line')",
+    "  ndjson — runner emits NDJSON events on stdout (spec §18 Q1 answer: Codex --json mode).",
+    "           Bridge uses spawn-per-turn model; reads thread.started / turn.completed /",
+    "           turn.failed / error events. Relay logic activates on turn.failed.",
+    "  line   — legacy mode: tail runner stderr for rate_limit / server_error regex patterns.",
+    "           Claude Code stays here — CC continuation is handled by the Stop hook, not",
+    "           by the bridge's spawn loop.",
+    "",
+    "spawn: command + args used to start the runner for the FIRST turn.",
+    "  Substitution tokens expanded at spawn time: {root}",
+    "  For ndjson runners, the objective is piped on stdin.",
+    "  For line runners, spawn starts a long-lived child process.",
+    "",
+    "spawn_resume: command + args for SUBSEQUENT turns (ndjson runners only).",
+    "  Substitution tokens: {root}, {session_id}",
+    "  The continuation prompt is piped on stdin.",
+    "",
+    "rate_limit / server_error: arrays of regex patterns.",
+    "  line mode: matched against runner stderr line-by-line.",
+    "  ndjson mode: matched against the event payload string in turn.failed / error events.",
+    "  Each string is compiled as a case-insensitive JavaScript RegExp.",
+    "",
+    "provider: maps the runner to a provider key in .goal/quota.json.",
+    "  claude-code → anthropic; codex → openai.",
+    "",
+    "Env override (any runner): GOAL_BRIDGE_SPAWN_<RUNNER_UPPER>=<space-separated cmd>",
+    "  e.g. GOAL_BRIDGE_SPAWN_CODEX='codex --api-key sk-...'"
+  ],
+  "runners": {
+    "claude-code": {
+      "format": "line",
+      "provider": "anthropic",
+      "spawn": ["echo", "claude-code-stub"],
+      "rate_limit": ["429", "rate ?limit", "Too Many Requests"],
+      "server_error": ["5\\d{2}", "internal server error", "service unavailable"]
+    },
+    "codex": {
+      "format": "ndjson",
+      "provider": "openai",
+      "spawn": ["codex", "exec", "--json", "--sandbox", "workspace-write", "-C", "{root}", "-"],
+      "spawn_resume": ["codex", "exec", "--json", "--sandbox", "workspace-write", "-C", "{root}", "resume", "{session_id}", "-"],
+      "rate_limit": ["429", "rate ?limit", "too many requests"],
+      "server_error": ["5\\d{2}", "internal server error", "service unavailable"]
+    }
+  }
+}

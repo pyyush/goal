@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * goal-otel-exporter — tail .claude/goal-events.jsonl and export as OTel metrics.
+ * goal-otel-exporter — tail .goal/events.jsonl and export as OTel metrics.
  *
  * Endpoint discovery:
  *   - GOAL_OTEL_ENDPOINT=https://collector.example/v1/metrics → OTLP/HTTP exporter
@@ -16,6 +16,11 @@
  *   goal.unmet             → counter goal.unmet
  *   goal.budget_limited    → counter goal.budget_limited
  *   goal.tokens_updated    → histogram goal.token_count (tokens_used, attr goal_id)
+ *   goal.relayed           → counter goal.relayed (attrs: reason, from, to)
+ *   goal.queued            → counter goal.queued (attr: providers_throttled)
+ *   goal.handoff.peer_picked_up → histogram goal.handoff.gap_seconds
+ *   goal.relay.recovery_seconds → histogram goal.relay.recovery_seconds
+ *   goal.lane.conflict     → counter goal.lane.conflict
  *
  * Lifecycle: SIGINT / SIGTERM → flush and exit 0.
  *
@@ -23,7 +28,7 @@
  *   bin/goal-otel-exporter [--events <path>] [--interval-ms <N>]
  *
  * Defaults:
- *   --events       <repo-root>/.claude/goal-events.jsonl
+ *   --events       <repo-root>/.goal/events.jsonl
  *                  (or $GOAL_EVENTS_FILE if set)
  *   --interval-ms  10000 (metrics export interval; ignored for stdout)
  */
@@ -49,7 +54,7 @@ function parseArgs(argv: readonly string[]): Args {
   let events =
     process.env.GOAL_EVENTS_FILE ??
     findEventsFile(process.cwd()) ??
-    path.join(process.cwd(), ".claude", "goal-events.jsonl");
+    path.join(process.cwd(), ".goal", "events.jsonl");
   let intervalMs = 10_000;
 
   for (let i = 0; i < argv.length; i++) {
@@ -74,10 +79,10 @@ function parseArgs(argv: readonly string[]): Args {
 }
 
 function findEventsFile(startDir: string): string | undefined {
-  // Walk up to find a `.claude/goal-events.jsonl` near a project root.
+  // Walk up to find a `.goal/events.jsonl` near a project root.
   let dir = startDir;
   for (let i = 0; i < 8; i++) {
-    const candidate = path.join(dir, ".claude", "goal-events.jsonl");
+    const candidate = path.join(dir, ".goal", "events.jsonl");
     if (fs.existsSync(candidate)) return candidate;
     const parent = path.dirname(dir);
     if (parent === dir) break;
@@ -90,7 +95,7 @@ function printHelp(): void {
   process.stdout.write(
     "Usage: goal-otel-exporter [--events <path>] [--interval-ms <N>]\n" +
       "\n" +
-      "Tails goal-events.jsonl and emits OTel metrics.\n" +
+      "Tails .goal/events.jsonl and emits OTel metrics.\n" +
       "Set GOAL_OTEL_ENDPOINT to a collector URL to push via OTLP/HTTP;\n" +
       "otherwise metrics are printed to stdout in OTLP/JSON form.\n"
   );
@@ -170,11 +175,15 @@ interface Instruments {
     completed: import("@opentelemetry/api").Counter;
     unmet: import("@opentelemetry/api").Counter;
     budget_limited: import("@opentelemetry/api").Counter;
+    relayed: import("@opentelemetry/api").Counter;
+    queued: import("@opentelemetry/api").Counter;
   };
   histograms: {
     token_count: import("@opentelemetry/api").Histogram;
     continuation_turns: import("@opentelemetry/api").Histogram;
     elapsed_seconds: import("@opentelemetry/api").Histogram;
+    handoff_gap_seconds: import("@opentelemetry/api").Histogram;
+    relay_recovery_seconds: import("@opentelemetry/api").Histogram;
   };
 }
 
@@ -196,6 +205,15 @@ function buildInstruments(): Instruments {
       budget_limited: meter.createCounter("goal.budget_limited", {
         description: "Goals that hit their token budget",
       }),
+      relayed: meter.createCounter("goal.relayed", {
+        description: "Goal relay events (agent handoffs) keyed by reason, from, to",
+      }),
+      queued: meter.createCounter("goal.queued", {
+        description: "Goal queued events (all providers throttled) keyed by providers_throttled",
+      }),
+      lane_conflict: meter.createCounter("goal.lane.conflict", {
+        description: "Lane-lease claim attempts denied due to glob conflict with an existing lease",
+      }),
     },
     histograms: {
       token_count: meter.createHistogram("goal.token_count", {
@@ -213,6 +231,16 @@ function buildInstruments(): Instruments {
         unit: "s",
         valueType: ValueType.DOUBLE,
       }),
+      handoff_gap_seconds: meter.createHistogram("goal.handoff.gap_seconds", {
+        description: "Time from handoff envelope write to peer first turn completion",
+        unit: "s",
+        valueType: ValueType.DOUBLE,
+      }),
+      relay_recovery_seconds: meter.createHistogram("goal.relay.recovery_seconds", {
+        description: "Time from status=relaying to status=pursuing (relay round-trip)",
+        unit: "s",
+        valueType: ValueType.DOUBLE,
+      }),
     },
   };
 }
@@ -225,6 +253,12 @@ interface GoalEvent {
   tokens_used?: number;
   continuation_turns?: number;
   elapsed_seconds?: number;
+  reason?: string;
+  from?: string;
+  to?: string;
+  providers_throttled?: string;
+  handoff_write_ts?: string;
+  recovery_seconds?: number;
   [k: string]: unknown;
 }
 
@@ -260,6 +294,36 @@ function dispatch(ev: GoalEvent): void {
       if (typeof ev.tokens_used === "number") {
         inst.histograms.token_count.record(ev.tokens_used, attrs);
       }
+      break;
+    case "goal.relayed":
+      inst.counters.relayed.add(1, {
+        ...attrs,
+        reason: typeof ev.reason === "string" ? ev.reason : "unknown",
+        from:   typeof ev.from   === "string" ? ev.from   : "unknown",
+        to:     typeof ev.to     === "string" ? ev.to     : "unknown",
+      });
+      break;
+    case "goal.queued":
+      inst.counters.queued.add(1, {
+        ...attrs,
+        providers_throttled: typeof ev.providers_throttled === "string" ? ev.providers_throttled : "unknown",
+      });
+      break;
+    case "goal.handoff.peer_picked_up":
+      if (typeof ev.handoff_write_ts === "string") {
+        const gapMs = Date.now() - Date.parse(ev.handoff_write_ts);
+        if (Number.isFinite(gapMs) && gapMs >= 0) {
+          inst.histograms.handoff_gap_seconds.record(gapMs / 1000, attrs);
+        }
+      }
+      break;
+    case "goal.relay.recovery_seconds":
+      if (typeof ev.recovery_seconds === "number") {
+        inst.histograms.relay_recovery_seconds.record(ev.recovery_seconds, attrs);
+      }
+      break;
+    case "goal.lane.conflict":
+      inst.counters.lane_conflict.add(1, attrs);
       break;
     // Unrecognized event types are intentionally ignored.
   }

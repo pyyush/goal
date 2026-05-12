@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * goal-http-server — local HTTP shim over .claude/goal.json
+ * goal-http-server — local HTTP shim over .goal/state.json
  *
  * Loopback-only (127.0.0.1). Invoked by `goalctl serve-http`.
  *
@@ -12,12 +12,12 @@
  *                                  Body: {action: "pause"|"resume"|"clear"|"set-budget"|"mark-unmet", value?: any}
  *                                  For "clear": returns 204 No Content.
  *   GET   /events?since=<iso>    → application/x-ndjson stream of events from
- *                                  .claude/goal-events.jsonl. Stays open and
+ *                                  .goal/events.jsonl. Stays open and
  *                                  streams new lines.
  *
  * Storage layout (single source of truth — must stay in sync with bin/goalctl):
- *   <root>/.claude/goal.json
- *   <root>/.claude/goal-events.jsonl
+ *   <root>/.goal/state.json
+ *   <root>/.goal/events.jsonl
  *   <root>/.claude/goal-baseline-<goal_id>   (cleared on create/replace/clear)
  *
  * Atomic writes via mktemp-in-same-dir + rename. CAS via goal_id check
@@ -34,7 +34,8 @@ import lockfile from "proper-lockfile";
 
 // ---- types ----------------------------------------------------------------
 
-type GoalStatus = "pursuing" | "paused" | "achieved" | "unmet" | "budget-limited";
+// v2 adds relaying and queued; readers must tolerate them.
+type GoalStatus = "pursuing" | "paused" | "achieved" | "unmet" | "budget-limited" | "relaying" | "queued";
 
 interface HistoryEntry {
     ts: string;
@@ -43,6 +44,8 @@ interface HistoryEntry {
 }
 
 interface Goal {
+    // v2 fields (additive; optional for v1 compat reads)
+    schema_version?: number;
     goal_id: string;
     objective: string;
     status: GoalStatus;
@@ -54,6 +57,15 @@ interface Goal {
     pursuing_seconds: number;
     pursuing_since: string | null;
     history: HistoryEntry[];
+    // v2 additive fields
+    compat?: string[];
+    roles?: { lead: string | null; build: string | null; review: string | null } | null;
+    current?: { agent: string | null; session: string | null; since: string | null } | null;
+    budget?: { kind: string; limit: number; used: number } | null;
+    lineage?: Array<{ agent: string; model: string; started_at: string; ended_at: string | null; turns: number; tokens: number; summary: string }>;
+    audit?: { checklist: Array<{ id: string; predicate: string; status: string; evidence: string | null }> } | null;
+    handoff_head?: string | null;
+    queued_until?: string | null;
     [k: string]: unknown;
 }
 
@@ -102,32 +114,138 @@ function die(msg: string): never {
 
 // ---- storage helpers ------------------------------------------------------
 
+/**
+ * Migrate v1 (.claude/goal.json) to v2 (.goal/state.json) if needed.
+ * Returns the canonical state file path after migration.
+ * Respects GOAL_DISABLE_MIGRATION=1.
+ */
+async function migrateIfNeeded(root: string): Promise<string> {
+    const claudeDir = path.join(root, ".claude");
+    const goalDir = path.join(root, ".goal");
+    const v1File = path.join(claudeDir, "goal.json");
+    const v2File = path.join(goalDir, "state.json");
+    const markerFile = path.join(claudeDir, "MIGRATED_TO_GOAL");
+
+    if (process.env.GOAL_DISABLE_MIGRATION === "1") return v1File;
+
+    // Already migrated.
+    try {
+        const st = await fsp.stat(goalDir);
+        if (st.isDirectory()) return v2File;
+    } catch { /* .goal/ not present */ }
+
+    // Nothing to migrate.
+    try {
+        await fsp.access(v1File);
+    } catch {
+        return v2File; // fresh start: v2/v3 state lives in .goal/
+    }
+
+    // Parse v1.
+    let v1Raw: Record<string, unknown>;
+    try {
+        const raw = await fsp.readFile(v1File, "utf8");
+        v1Raw = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+        // Can't parse — leave v1 in place.
+        return v1File;
+    }
+
+    const v1Status = typeof v1Raw.status === "string" ? v1Raw.status : "pursuing";
+    const v1Ticks = typeof v1Raw.tick_count === "number" ? v1Raw.tick_count : 0;
+    const v1Tokens = typeof v1Raw.tokens_used === "number" ? v1Raw.tokens_used : 0;
+    const nowTs = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+    const v1Created = typeof v1Raw.created_at === "string" ? v1Raw.created_at : nowTs;
+    const v1Updated = typeof v1Raw.updated_at === "string" ? v1Raw.updated_at : nowTs;
+    const isActive = v1Status === "pursuing" || v1Status === "paused";
+
+    const v2State = {
+        ...v1Raw,
+        schema_version: 2,
+        compat: ["claude-code"],
+        roles: { lead: null, build: null, review: null },
+        current: { agent: null, session: null, since: null },
+        budget: null,
+        lineage: [{
+            agent: "claude-code", model: "unknown",
+            started_at: v1Created, ended_at: isActive ? null : v1Updated,
+            turns: v1Ticks, tokens: v1Tokens, summary: "migrated from v1",
+        }],
+        audit: null, handoff_head: null, queued_until: null,
+    };
+
+    try {
+        await fsp.mkdir(goalDir, { recursive: false });
+    } catch {
+        // Race: dir already created. Re-check.
+        try {
+            const st = await fsp.stat(goalDir);
+            if (st.isDirectory()) return v2File;
+        } catch { /* ignore */ }
+        return v1File;
+    }
+
+    const tmpFile = path.join(goalDir, `state.json.${process.pid}.tmp`);
+    try {
+        await fsp.writeFile(tmpFile, JSON.stringify(v2State, null, 2) + "\n", "utf8");
+        await fsp.rename(tmpFile, v2File);
+    } catch (err) {
+        try { await fsp.unlink(tmpFile); } catch { /* ignore */ }
+        try { await fsp.rmdir(goalDir); } catch { /* ignore */ }
+        process.stderr.write(`goal-http-server: migration failed: ${(err as Error)?.message}\n`);
+        return v1File;
+    }
+
+    // Remove old lock dir (we're not inside a lock here so just clean up).
+    const oldLock = path.join(claudeDir, "goal.lock");
+    try {
+        await fsp.rm(oldLock, { recursive: true, force: true });
+    } catch { /* non-fatal */ }
+
+    try {
+        await fsp.writeFile(markerFile, nowTs + "\n", "utf8");
+    } catch { /* best-effort */ }
+
+    return v2File;
+}
+
 class Store {
     readonly file: string;
     readonly eventsFile: string;
-    readonly dir: string;
+    readonly dir: string;       // state file's parent directory
+    readonly claudeDir: string; // always .claude/ for legacy baselines/marker
     readonly root: string;
 
-    constructor(root: string) {
+    constructor(root: string, stateFile: string) {
         this.root = root;
-        this.dir = path.join(root, ".claude");
-        this.file = path.join(this.dir, "goal.json");
-        this.eventsFile = path.join(this.dir, "goal-events.jsonl");
+        this.claudeDir = path.join(root, ".claude");
+        this.file = stateFile;
+        this.dir = path.dirname(stateFile);
+        this.eventsFile = path.join(path.dirname(stateFile), "events.jsonl");
+    }
+
+    static async create(root: string): Promise<Store> {
+        const stateFile = await migrateIfNeeded(root);
+        return new Store(root, stateFile);
     }
 
     async ensureDir(): Promise<void> {
+        await fsp.mkdir(this.claudeDir, { recursive: true });
         await fsp.mkdir(this.dir, { recursive: true });
     }
 
     /**
-     * Acquire the cross-writer lock at `.claude/goal.lock`, run `fn`, release.
+     * Acquire the cross-writer lock. Post-migration: .goal/lock; pre: .claude/goal.lock.
      * Coordinates with the MCP server (proper-lockfile on the same lockfilePath)
      * and with the bash hooks / goalctl (mkdir-based mutex on the same dir).
      */
     async withLock<T>(fn: () => Promise<T>): Promise<T> {
         await this.ensureDir();
-        const release = await lockfile.lock(this.dir, {
-            lockfilePath: path.join(this.dir, "goal.lock"),
+        // Post-migration: lock lives in .goal/; pre-migration: .claude/goal.lock
+        const lockDir = this.dir;
+        const lockfilePath = path.join(lockDir, this.dir.endsWith(".goal") ? "lock" : "goal.lock");
+        const release = await lockfile.lock(lockDir, {
+            lockfilePath,
             retries: { retries: 50, minTimeout: 50, maxTimeout: 250, factor: 1.5 },
             stale: 30_000,
         });
@@ -167,7 +285,7 @@ class Store {
         await this.ensureDir();
         const tmp = path.join(
             this.dir,
-            `goal.json.${process.pid}.${crypto.randomBytes(6).toString("hex")}`,
+            `.state.${process.pid}.${crypto.randomBytes(6).toString("hex")}`,
         );
         await fsp.writeFile(tmp, JSON.stringify(goal, null, 2) + "\n", "utf8");
         await fsp.rename(tmp, this.file);
@@ -182,9 +300,10 @@ class Store {
     }
 
     async clearBaselines(): Promise<void> {
+        // Baselines always live in .claude/ regardless of v1/v2.
         let entries: string[] = [];
         try {
-            entries = await fsp.readdir(this.dir);
+            entries = await fsp.readdir(this.claudeDir);
         } catch (err: unknown) {
             if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
             throw err;
@@ -193,7 +312,7 @@ class Store {
             entries
                 .filter((n) => n.startsWith("goal-baseline-"))
                 .map((n) =>
-                    fsp.unlink(path.join(this.dir, n)).catch(() => undefined),
+                    fsp.unlink(path.join(this.claudeDir, n)).catch(() => undefined),
                 ),
         );
     }
@@ -392,18 +511,39 @@ async function handlePostGoal(
             return { code: 409, body: { error: "goal_exists_and_active" } };
         }
         const ts = nowIso();
+        // Detect v2 file (store.file is .goal/state.json).
+        const isV2 = store.file.endsWith("state.json");
         const goal: Goal = {
+            ...(isV2 ? { schema_version: 2 } : {}),
             goal_id: newGoalId(),
             objective: body.objective as string,
             status: "pursuing",
             created_at: ts,
             updated_at: ts,
+            ...(isV2 ? {
+                time_used_seconds: 0,
+                observed_at: ts,
+                active_turn_started_at: ts,
+                tokens_used_observed_at: ts,
+                time_used_seconds_final: null,
+                tokens_used_final: null,
+            } : {}),
             token_budget: budget,
             tokens_used: 0,
             tick_count: 0,
             pursuing_seconds: 0,
             pursuing_since: ts,
             history: [{ ts, action: existing ? "replace" : "create", note: "via http" }],
+            ...(isV2 ? {
+                compat: ["claude-code"],
+                roles: { lead: null, build: null, review: null },
+                current: { agent: null, session: null, since: null },
+                budget: null,
+                lineage: [],
+                audit: null,
+                handoff_head: null,
+                queued_until: null,
+            } : {}),
         };
         await store.clearBaselines();
         await store.write(goal);
@@ -722,8 +862,17 @@ function logAccess(
 
 function main(): void {
     const args = parseArgs(process.argv.slice(2));
-    const store = new Store(args.root);
     const shutdown: ShutdownState = { shuttingDown: false, events: new Set() };
+
+    // Bootstrap: create the store (runs migration async, then starts server).
+    Store.create(args.root).then((store) => {
+        startServer(args, store, shutdown);
+    }).catch((err: unknown) => {
+        die(`failed to initialize store: ${(err as Error)?.message}`);
+    });
+}
+
+function startServer(args: CliArgs, store: Store, shutdown: ShutdownState): void {
 
     const server = http.createServer((req, res) => {
         const startNs = process.hrtime.bigint();

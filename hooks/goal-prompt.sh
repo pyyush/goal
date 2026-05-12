@@ -18,6 +18,11 @@ RESOLVER="$(dirname "$0")/goal-resolve.sh"
 # shellcheck disable=SC1090
 . "$RESOLVER"
 
+LOCK_SH="$(dirname "$0")/goal-lock.sh"
+[ -f "$LOCK_SH" ] || exit 0
+# shellcheck disable=SC1090
+. "$LOCK_SH"
+
 INPUT=$(cat || printf '')
 INPUT=${INPUT:-\{\}}
 
@@ -37,14 +42,35 @@ log() {
 }
 
 write_pause() {
-    local now tmp gid
+    local now tmp gid state_dir
     now=$(date -u +%FT%TZ)
     gid=$(jq -r '.goal_id // ""' "$GOAL_FILE" 2>/dev/null) || gid=""
-    tmp=$(mktemp "$GOAL_ROOT/.claude/goal.json.XXXXXX") || return 0
+    if ! goal_lock_acquire "$GOAL_ROOT"; then
+        log "lock-timeout" "could not acquire goal lock"
+        return 1
+    fi
+    trap 'goal_lock_release "$GOAL_ROOT"' EXIT INT TERM
+    state_dir=$(dirname "$GOAL_FILE")
+    tmp=$(mktemp "$state_dir/.state.XXXXXX") || {
+        goal_lock_release "$GOAL_ROOT"
+        trap - EXIT INT TERM
+        return 1
+    }
     if jq --arg ts "$now" --arg gid "$gid" \
-         'if (.goal_id // "") == $gid then
+         'if ((.goal_id // "") == $gid and (.status // "") == "pursuing") then
+              ( (try (.pursuing_since | fromdateiso8601) catch null) ) as $since
+              | ( (try (.created_at | fromdateiso8601) catch null) ) as $created
+              | ( $since // $created ) as $start
+              | ( .pursuing_seconds // 0 ) as $base
+              | ( if $start != null
+                    then $base + ((now - ($start | floor)) | floor | (if . < 0 then 0 else . end))
+                    else $base
+                  end ) as $new_seconds
+              |
               .status = "paused"
               | .updated_at = $ts
+              | .pursuing_seconds = $new_seconds
+              | .pursuing_since = null
               | .history = ((.history // []) + [{ts: $ts, action: "auto-pause", note: "user submitted new prompt"}])
           else . end' \
          "$GOAL_FILE" > "$tmp" 2>/dev/null; then
@@ -52,6 +78,8 @@ write_pause() {
     else
         rm -f "$tmp"
     fi
+    goal_lock_release "$GOAL_ROOT"
+    trap - EXIT INT TERM
 }
 
 STATUS=$(jq -r '.status // ""' "$GOAL_FILE" 2>/dev/null) || STATUS=""

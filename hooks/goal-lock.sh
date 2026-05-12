@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 # goal-lock.sh — sourced helper. Portable directory-based mutex around
-# .claude/goal.json, coordinating with the Node side's `proper-lockfile`.
+# goal state, coordinating with the Node side's `proper-lockfile`.
 #
-# Both sides treat `<root>/.claude/goal.lock/` as the lock: `mkdir` is atomic
-# on POSIX, so the first writer to mkdir wins. The pid file inside the lockdir
+# Both sides treat the lock directory as the mutex: `mkdir` is atomic on
+# POSIX, so the first writer to mkdir wins. The pid file inside the lockdir
 # is informational (used for stale-lock detection only).
+#
+# Lock path selection (v2-aware):
+#   - After migration:  $GOAL_ROOT/.goal/lock
+#   - Before migration: $GOAL_ROOT/.claude/goal.lock
+#   Use goal_lock_path "$GOAL_ROOT" to get the canonical path for the root.
 #
 # Usage from a bash script:
 #   . "$(dirname "$0")/goal-lock.sh"       # adjust path as needed
 #   goal_lock_acquire "$GOAL_ROOT" || exit 1
 #   trap 'goal_lock_release "$GOAL_ROOT"' EXIT INT TERM
-#   ... do RMW on goal.json ...
+#   ... do RMW on goal state ...
 #   goal_lock_release "$GOAL_ROOT"
 #   trap - EXIT INT TERM
 #
@@ -22,14 +27,30 @@
 # lockfilePath: '.claude/goal.lock' })` because both implementations use the
 # directory's existence as the lock signal.
 
+# goal_lock_path: returns the canonical lockdir path for a given root.
+# After migration (.goal/ exists), the lock lives at .goal/lock.
+# Before migration, it lives at .claude/goal.lock (legacy path).
+goal_lock_path() {
+    local root="$1"
+    if [ -d "$root/.goal" ]; then
+        printf '%s/.goal/lock' "$root"
+    else
+        printf '%s/.claude/goal.lock' "$root"
+    fi
+}
+
 goal_lock_acquire() {
     local root="$1"
     local timeout_ms="${GOAL_LOCK_TIMEOUT_MS:-5000}"
     local stale_ms="${GOAL_LOCK_STALE_MS:-30000}"
-    local lockdir="$root/.claude/goal.lock"
+    local lockdir
+    lockdir=$(goal_lock_path "$root")
     local pidfile="$lockdir/pid"
 
-    [ -d "$root/.claude" ] || mkdir -p "$root/.claude" 2>/dev/null || return 1
+    # Ensure the parent of the lockdir exists.
+    local lockparent
+    lockparent=$(dirname "$lockdir")
+    [ -d "$lockparent" ] || mkdir -p "$lockparent" 2>/dev/null || return 1
 
     local started_ms
     started_ms=$(goal_lock_now_ms)
@@ -82,7 +103,9 @@ goal_lock_acquire() {
 
 goal_lock_release() {
     local root="$1"
-    rm -rf "$root/.claude/goal.lock" 2>/dev/null
+    local lockdir
+    lockdir=$(goal_lock_path "$root")
+    rm -rf "$lockdir" 2>/dev/null
 }
 
 # ---- internals -------------------------------------------------------------

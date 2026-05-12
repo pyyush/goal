@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pyyush/goal/docs/schema/state.v2.json",
+  "title": "goal state.json v2",
+  "description": "Schema for .goal/state.json — the single source of truth for an active /goal session. Validated on every write in the MCP server (hand-rolled; this file is documentation + future tooling reference).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "goal_id",
+    "objective",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 2,
+      "description": "Always 2 for v2 state files. Readers must reject files with other values."
+    },
+    "goal_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "RFC 4122 UUID v4 (lowercase). Rotated on create/replace. CAS guard key."
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000,
+      "description": "User-provided objective text. Treat as untrusted data in prompts."
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "pursuing",
+        "paused",
+        "achieved",
+        "unmet",
+        "budget-limited",
+        "relaying",
+        "queued"
+      ],
+      "description": "Lifecycle state. 'relaying' and 'queued' are runtime-driven and auto-resume. 'paused', 'unmet', 'budget-limited' never auto-resume. Model can only set 'achieved' via update_goal."
+    },
+    "created_at": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp when the goal was created. Format: 2006-01-02T15:04:05Z"
+    },
+    "updated_at": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp of the most recent write. Updated on every state change."
+    },
+    "token_budget": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "Optional positive token budget. null = unlimited. When tokens_used >= token_budget, status transitions to budget-limited."
+    },
+    "tokens_used": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Cumulative output tokens consumed by this goal across all agents."
+    },
+    "time_used_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "v3 baseline elapsed seconds. Consumers add live delta from observed_at/active_turn_started_at while pursuing."
+    },
+    "observed_at": {
+      "type": "string",
+      "description": "v3 timestamp for the time_used_seconds snapshot."
+    },
+    "active_turn_started_at": {
+      "type": ["string", "null"],
+      "description": "v3 timestamp for the current active turn; null outside active pursuit."
+    },
+    "tokens_used_observed_at": {
+      "type": "string",
+      "description": "v3 timestamp for the last trustworthy token observation."
+    },
+    "time_used_seconds_final": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "default": null,
+      "description": "v3 terminal elapsed-time snapshot. Renderers never recompute live time after this is set."
+    },
+    "tokens_used_final": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "default": null,
+      "description": "v3 terminal token snapshot."
+    },
+    "tick_count": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Number of Stop-hook continuation ticks fired for this goal."
+    },
+    "pursuing_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Cumulative active pursuit seconds, excluding paused intervals."
+    },
+    "pursuing_since": {
+      "type": ["string", "null"],
+      "description": "ISO-8601 timestamp of the start of the current pursuing session. Non-null only when status === 'pursuing'."
+    },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ts", "action", "note"],
+        "properties": {
+          "ts": { "type": "string" },
+          "action": { "type": "string" },
+          "note": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "default": [],
+      "description": "Append-only log of state transitions and notable events."
+    },
+    "compat": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": ["claude-code"],
+      "description": "Agent runner IDs that can participate in this goal. Used by cowork subsystem (P5+). Solo goals have ['claude-code'] only."
+    },
+    "roles": {
+      "type": ["object", "null"],
+      "description": "Role assignments for cowork mode (P5+). null or all-null values = solo mode.",
+      "properties": {
+        "lead":   { "type": ["string", "null"] },
+        "build":  { "type": ["string", "null"] },
+        "review": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "current": {
+      "type": ["object", "null"],
+      "description": "Which agent is currently active. null = solo or no active agent.",
+      "properties": {
+        "agent":   { "type": ["string", "null"] },
+        "session": { "type": ["string", "null"] },
+        "since":   { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "budget": {
+      "type": ["object", "null"],
+      "description": "Structured budget configuration (v2 extension of token_budget). null = use legacy token_budget field.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["tokens", "turns", "audit_items", "wallclock"]
+        },
+        "limit": { "type": "number", "minimum": 0 },
+        "used":  { "type": "number", "minimum": 0 }
+      },
+      "required": ["kind", "limit", "used"],
+      "additionalProperties": false
+    },
+    "lineage": {
+      "type": "array",
+      "description": "Per-agent session records. lineage[0] is synthesized at migration time. New entries are appended when a new agent picks up the goal.",
+      "items": {
+        "type": "object",
+        "required": ["agent", "model", "started_at", "turns", "tokens", "summary"],
+        "properties": {
+          "agent": {
+            "type": "string",
+            "description": "Agent runner ID, e.g. 'claude-code' or 'codex'."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model identifier at time of session. 'unknown' when not available at migration time."
+          },
+          "started_at": {
+            "type": "string",
+            "description": "ISO-8601 timestamp when this agent's session began."
+          },
+          "ended_at": {
+            "type": ["string", "null"],
+            "description": "ISO-8601 timestamp when this agent's session ended. null if still active."
+          },
+          "turns": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of continuation turns for this agent session."
+          },
+          "tokens": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Tokens consumed by this agent session."
+          },
+          "summary": {
+            "type": "string",
+            "description": "Human-readable note about what this agent session did. 'migrated from v1' for the synthetic lineage[0]."
+          }
+        },
+        "additionalProperties": false
+      },
+      "default": []
+    },
+    "audit": {
+      "type": ["object", "null"],
+      "description": "Audit checklist for tracking deliverables (optional).",
+      "properties": {
+        "checklist": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "predicate", "status"],
+            "properties": {
+              "id":        { "type": "string" },
+              "predicate": { "type": "string" },
+              "status":    { "type": "string", "enum": ["open", "passed", "failed"] },
+              "evidence":  { "type": ["string", "null"] }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "handoff_head": {
+      "type": ["string", "null"],
+      "description": "Sequence number of the most recent handoff envelope (P4+). null until first handoff."
+    },
+    "queued_until": {
+      "type": ["string", "null"],
+      "description": "ISO-8601 timestamp until which the goal is queued (P3+). null unless status === 'queued'."
+    }
+  }
+}

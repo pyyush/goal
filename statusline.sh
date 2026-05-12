@@ -117,9 +117,16 @@ if [ -n "$rl5" ] || [ -n "$rl7" ]; then
 fi
 
 # Goal (only emits when an active goal exists) --------------------------------
-if [ -x "$HOME/.claude/hooks/goal-statusline.sh" ]; then
+goal_helper=""
+for candidate in "$cwd/.claude/hooks/goal-statusline.sh" "$HOME/.claude/hooks/goal-statusline.sh"; do
+    if [ -x "$candidate" ]; then
+        goal_helper="$candidate"
+        break
+    fi
+done
+if [ -n "$goal_helper" ]; then
     sid=$(j '.session_id')
-    goal_seg=$(printf '%s' "$input" | bash "$HOME/.claude/hooks/goal-statusline.sh" "$cwd" "$sid" 2>/dev/null || true)
+    goal_seg=$(printf '%s' "$input" | bash "$goal_helper" "$cwd" "$sid" 2>/dev/null || true)
     [ -n "$goal_seg" ] && segments+=("$goal_seg")
 fi
 
