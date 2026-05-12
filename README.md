@@ -100,6 +100,12 @@ Subcommands are case-insensitive on the first token. Anything else is treated as
 
 `.goal/state.json` is the single source of truth. All four writers — the slash command, the hooks, the MCP server, and the headless `goalctl` / HTTP shim — coordinate through a `proper-lockfile`-compatible mkdir mutex at `.goal/lock`. Each write is atomic (`mktemp` + `rename(2)`) and CAS-guarded by `goal_id`, so a write from a stale view is rejected even if the lock somehow leaks.
 
+### v3 system map
+
+<p align="center">
+  <img src="docs/v3-system.png" alt="goal v3 system map — durable project state, Claude Code hooks, MCP tools, Codex bridge relay, headless control surfaces, observability, and release gates" width="100%">
+</p>
+
 ## Lifecycle
 
 <p align="center">
