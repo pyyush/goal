@@ -1,8 +1,8 @@
-# /goal cowork — reference
+# Cowork and rate-limit relay
 
 > The goal is the unit of work; agents are interchangeable runners against a shared protocol.
 
-`/goal` cowork lets two agents — Claude Code and Codex — pursue the same goal sequentially, handing off state through a shared directory. Neither agent is hardcoded as primary. The goal persists across handoffs, rate-limit events, and session restarts. Solo users who never create `cowork.yml` see no behavior change.
+Cowork lets Claude Code and Codex pursue the same goal sequentially, handing off state through a shared directory. Neither agent is hardcoded as primary. The goal persists across handoffs, rate-limit events, and session restarts. Users who never create `cowork.yml` stay in normal single-agent mode.
 
 ---
 
@@ -20,15 +20,15 @@ All cowork state lives under `.goal/` in your project root.
 
 ```
 .goal/
-  state.json          single source of truth (schema v2)
+  state.json          single source of truth
   handoff/
     0001.md           handoff envelopes, monotonic seq
     0002.md
   agents/
     <agent_id>.json   per-agent heartbeat (updated every 5s)
   quota.json          per-provider rate-limit headroom
-  cowork.yml          role contract (opt-in, P5)
-  lanes.json          path-glob leases (P5)
+  cowork.yml          opt-in role contract
+  lanes.json          path-glob leases
   pause               touch to halt all agents immediately
 ```
 
@@ -76,9 +76,9 @@ The bridge binds no sockets. All coordination is file-based.
 
 ---
 
-## Lifecycle — new states
+## Lifecycle states
 
-Solo mode uses five states: `pursuing`, `paused`, `achieved`, `unmet`, `budget-limited`. Cowork adds two runtime states:
+Single-agent mode uses five states: `pursuing`, `paused`, `achieved`, `unmet`, `budget-limited`. Cowork adds two runtime states:
 
 | State | Meaning | How you get here | How you leave |
 |---|---|---|---|
@@ -246,25 +246,25 @@ That test intentionally calls both Claude Code and Codex, so it is opt-in and sh
 
 ---
 
-## Profile cards
+## Agent profile cards
 
 Each agent has a capability card under `cowork/profile/`. These document the interface each agent exposes — useful when writing continuation prompts or debugging handoff gaps.
 
 - [`cowork/profile/claude-code.md`](../cowork/profile/claude-code.md) — Claude Code: surface (CLI + Desktop), session model, edit semantics, tool inventory, failure signals, continuation mechanism.
 - [`cowork/profile/codex.md`](../cowork/profile/codex.md) — Codex: surface (CLI), ndjson event stream, session IDs, failure signals, continuation via bridge stdin injection.
 
-Users may add profiles for additional agents. The directory is not enumerated by any tooling in P4.
+Users may add profiles for additional agents. The bridge is configured through `cowork/bridge/patterns.json`; profile cards are documentation for humans and prompt authors.
 
 ---
 
-## What stays the same for solo users
+## Single-agent behavior
 
 - The `/goal` slash command is unchanged.
 - State still lives at `.goal/state.json` (migrated from `.claude/goal.json` on first run — see migration path in `CHANGELOG.md`).
-- All five v1 lifecycle states work identically.
-- The statusline shows the same labels as v1 when `current.agent` is null and `cowork.yml` is absent.
+- The same five lifecycle states work without `cowork.yml`.
+- The statusline shows the normal single-agent labels when `current.agent` is null and `cowork.yml` is absent.
 - No new dependencies are required for solo use.
-- T8 (the v1 solo regression suite) must pass with no `cowork.yml` present.
+- Cowork relay is opt-in; no bridge runs unless you start one.
 
 ---
 

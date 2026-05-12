@@ -66,31 +66,31 @@
       "type": "integer",
       "minimum": 0,
       "default": 0,
-      "description": "v3 baseline elapsed seconds. Consumers add live delta from observed_at/active_turn_started_at while pursuing."
+      "description": "Baseline elapsed seconds. Consumers add live delta from observed_at/active_turn_started_at while pursuing."
     },
     "observed_at": {
       "type": "string",
-      "description": "v3 timestamp for the time_used_seconds snapshot."
+      "description": "Timestamp for the time_used_seconds snapshot."
     },
     "active_turn_started_at": {
       "type": ["string", "null"],
-      "description": "v3 timestamp for the current active turn; null outside active pursuit."
+      "description": "Timestamp for the current active turn; null outside active pursuit."
     },
     "tokens_used_observed_at": {
       "type": "string",
-      "description": "v3 timestamp for the last trustworthy token observation."
+      "description": "Timestamp for the last trustworthy token observation."
     },
     "time_used_seconds_final": {
       "type": ["integer", "null"],
       "minimum": 0,
       "default": null,
-      "description": "v3 terminal elapsed-time snapshot. Renderers never recompute live time after this is set."
+      "description": "Terminal elapsed-time snapshot. Renderers never recompute live time after this is set."
     },
     "tokens_used_final": {
       "type": ["integer", "null"],
       "minimum": 0,
       "default": null,
-      "description": "v3 terminal token snapshot."
+      "description": "Terminal token snapshot."
     },
     "tick_count": {
       "type": "integer",
@@ -127,11 +127,11 @@
       "type": "array",
       "items": { "type": "string" },
       "default": ["claude-code"],
-      "description": "Agent runner IDs that can participate in this goal. Used by cowork subsystem (P5+). Solo goals have ['claude-code'] only."
+      "description": "Agent runner IDs that can participate in this goal. Single-agent goals have ['claude-code'] only."
     },
     "roles": {
       "type": ["object", "null"],
-      "description": "Role assignments for cowork mode (P5+). null or all-null values = solo mode.",
+      "description": "Role assignments for cowork mode. null or all-null values = single-agent mode.",
       "properties": {
         "lead":   { "type": ["string", "null"] },
         "build":  { "type": ["string", "null"] },
@@ -151,7 +151,7 @@
     },
     "budget": {
       "type": ["object", "null"],
-      "description": "Structured budget configuration (v2 extension of token_budget). null = use legacy token_budget field.",
+      "description": "Structured budget configuration. null = use token_budget field.",
       "properties": {
         "kind": {
           "type": "string",
@@ -228,11 +228,11 @@
     },
     "handoff_head": {
       "type": ["string", "null"],
-      "description": "Sequence number of the most recent handoff envelope (P4+). null until first handoff."
+      "description": "Sequence number of the most recent handoff envelope. null until first handoff."
     },
     "queued_until": {
       "type": ["string", "null"],
-      "description": "ISO-8601 timestamp until which the goal is queued (P3+). null unless status === 'queued'."
+      "description": "ISO-8601 timestamp until which the goal is queued. null unless status === 'queued'."
     }
   }
 }

@@ -11,7 +11,7 @@ Tools exposed (namespace as seen by the model: `mcp__goal__*`):
 | `get_goal`    | Return the current goal state plus computed `remaining_tokens` and `elapsed_seconds`.                    |
 | `claim_lane` / `release_lane` | Manage cowork lane leases under `.goal/lanes.json`. |
 | `write_handoff` / `relay_now` / `peer_status` | Coordinate handoff and relay state between runners. |
-| `report_progress` / `report_stuck` / `record_breadcrumb` | v3 audit progress, stuck escalation, and breadcrumb memory. |
+| `report_progress` / `report_stuck` / `record_breadcrumb` | Audit progress, stuck escalation, and breadcrumb memory. |
 | `queue_message` / `steer_message` | Route queued and mid-turn messages to `.goal/queue`, `.goal/steers`, and `.goal/rejected_steers`. |
 
 The server reads and writes `.goal/state.json` at the **goal root** with the same on-disk schema as `bin/goalctl`. Hooks, `goalctl`, and this MCP server share one source of truth.
