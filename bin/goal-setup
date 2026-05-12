@@ -245,6 +245,10 @@ else
     chmod +x "$HOOKS_DST_DIR/"*.sh
     ok "wrote $HOOKS_DST_DIR/*.sh"
 fi
+mkdir -p "$TARGET/bin"
+cp "$REPO_DIR/bin/goal-ticker" "$TARGET/bin/goal-ticker"
+chmod +x "$TARGET/bin/goal-ticker"
+ok "wrote $TARGET/bin/goal-ticker"
 
 # ---- 2. settings.json merge (hook registrations) ---------------------------
 
@@ -263,9 +267,17 @@ else
     TMP=$(mktemp)
     jq --arg p "$HOOK_CMD_PREFIX" '
         .hooks //= {}
+        | .hooks.SessionStart //= []
+        | .hooks.PreToolUse //= []
         | .hooks.Stop //= []
         | .hooks.Notification //= []
         | .hooks.UserPromptSubmit //= []
+        | (.hooks.SessionStart |=
+            if any(.[]?; .hooks[0].command == ($p + "goal-ticker.sh"))
+            then . else . + [{hooks: [{type: "command", command: ($p + "goal-ticker.sh")}]}] end)
+        | (.hooks.PreToolUse |=
+            if any(.[]?; (.matcher // "") == "Task" and .hooks[0].command == ($p + "goal-ticker.sh"))
+            then . else . + [{matcher: "Task", hooks: [{type: "command", command: ($p + "goal-ticker.sh")}]}] end)
         | (.hooks.Stop |=
             if any(.[]?; .hooks[0].command == ($p + "goal-stop.sh"))
             then . else . + [{hooks: [{type: "command", command: ($p + "goal-stop.sh")}]}] end)
@@ -387,7 +399,7 @@ fi
 
 if [ "$SCOPE" = project ] && [ -d .git ]; then
     head1 "Updating .gitignore (project scope)"
-    for pat in '.claude/goal.json' '.claude/goal-hook.log' '.claude/goal.pause' '.claude/goal-baseline-*' '.claude/goal-events.jsonl' '.claude/goal-otel-cursor'; do
+    for pat in '.goal/' '.claude/goal.json' '.claude/goal-hook.log' '.claude/goal.pause' '.claude/goal-baseline-*' '.claude/MIGRATED_TO_GOAL'; do
         if [ ! -f .gitignore ] || ! grep -qxF "$pat" .gitignore 2>/dev/null; then
             printf '%s\n' "$pat" >> .gitignore
             ok "added $pat to .gitignore"

@@ -92,8 +92,8 @@ echo "$RESP2" | grep -q 'conflict_with' || {
 }
 say "agent-B claim correctly denied with conflict_with ✓"
 
-step "4. Assert goal.lane.conflict event in .claude/goal-events.jsonl"
-EVENTS_FILE="$TMP/.claude/goal-events.jsonl"
+step "4. Assert goal.lane.conflict event in .goal/events.jsonl"
+EVENTS_FILE="$TMP/.goal/events.jsonl"
 [ -f "$EVENTS_FILE" ] || { red "FAIL: events file not created at $EVENTS_FILE"; exit 4; }
 if ! grep -q '"type":"goal.lane.conflict"' "$EVENTS_FILE"; then
     red "FAIL: events file missing goal.lane.conflict line"

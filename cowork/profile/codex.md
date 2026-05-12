@@ -141,7 +141,7 @@ push.
 For the first turn of a Codex-driven session:
 
 ```
-codex exec --json [-c key=value ...] [PROMPT]
+codex exec --json -C <project root> [-c key=value ...] [PROMPT]
 ```
 
 Capture the `session_id` from the first `thread.started` event and persist
@@ -151,14 +151,14 @@ it in `.goal/agents/<agent_id>.json` (extending §5.7 with a
 For each subsequent turn:
 
 ```
-echo "<continuation prompt>" | codex exec resume <session_id> --json -
+echo "<continuation prompt>" | codex exec --json -C <project root> resume <session_id> -
 ```
 
 Per-turn flags the bridge should set:
 
 - `--json` — required. The bridge consumes the NDJSON stream.
 - `--sandbox workspace-write` — explicit, don't drift to default.
-- `--cd <project root>` — set workspace root explicitly.
+- `-C <project root>` — set workspace root explicitly.
 - `--ignore-user-config` — optional but reduces variance across user
   installs. Only set if the goal uses a per-project profile.
 

@@ -99,7 +99,12 @@ async function run() {
   assert(list.result?.tools, "tools/list: no tools");
   const names = list.result.tools.map((t) => t.name).sort();
   console.error(`smoke: tools/list → ${names.join(", ")}`);
-  expect(names.join(",") === "create_goal,get_goal,update_goal", `expected three tools, got ${names.join(",")}`);
+  const requiredTools = [
+    "create_goal", "get_goal", "update_goal",
+    "claim_lane", "release_lane", "write_handoff", "peer_status", "relay_now",
+    "report_progress", "report_stuck", "record_breadcrumb", "queue_message", "steer_message",
+  ];
+  for (const tool of requiredTools) expect(names.includes(tool), `tools/list missing ${tool}; got ${names.join(",")}`);
 
   // 3) get_goal — should error with no_active_goal
   const getEmpty = await rpc("tools/call", { name: "get_goal", arguments: {} });
@@ -130,18 +135,21 @@ async function run() {
   expect(createdObj.pursuing_since === createdObj.created_at,
          `create_goal: pursuing_since should equal created_at on fresh goal (${createdObj.pursuing_since} vs ${createdObj.created_at})`);
 
-  // 5) verify goal.json was atomically written into GOAL_ROOT/.claude/
-  const goalFile = join(goalRoot, ".claude", "goal.json");
-  expect(existsSync(goalFile), `goal.json should exist at ${goalFile}`);
+  // 5) verify state.json was atomically written into GOAL_ROOT/.goal/
+  const goalFile = join(goalRoot, ".goal", "state.json");
+  expect(existsSync(goalFile), `state.json should exist at ${goalFile}`);
   const onDisk = JSON.parse(readFileSync(goalFile, "utf8"));
   expect(onDisk.goal_id === createdObj.goal_id, "on-disk goal_id mismatch");
+  expect(onDisk.schema_version === 2, "on-disk schema_version should be 2");
+  expect(typeof onDisk.time_used_seconds === "number", "on-disk v3 time_used_seconds missing");
+  expect(typeof onDisk.observed_at === "string", "on-disk v3 observed_at missing");
   // No leftover tmp files
-  const dirEntries = readdirSync(join(goalRoot, ".claude"));
+  const dirEntries = readdirSync(join(goalRoot, ".goal"));
   const stray = dirEntries.filter((n) => n.startsWith(".goal-write-") || n.endsWith(".tmp"));
-  expect(stray.length === 0, `stray tmp files in .claude/: ${stray.join(",")}`);
+  expect(stray.length === 0, `stray tmp files in .goal/: ${stray.join(",")}`);
 
-  // 6) verify goal-events.jsonl has goal.created line
-  const eventsFile = join(goalRoot, ".claude", "goal-events.jsonl");
+  // 6) verify events.jsonl has goal.created line
+  const eventsFile = join(goalRoot, ".goal", "events.jsonl");
   expect(existsSync(eventsFile), `events file should exist at ${eventsFile}`);
   const eventLines = readFileSync(eventsFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
   expect(eventLines.length >= 1, "events: expected at least one event");

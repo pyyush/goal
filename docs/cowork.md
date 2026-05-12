@@ -65,10 +65,11 @@ Stop it:
 goalctl bridge stop codex
 ```
 
-Or via `goal-setup`:
+Or install the command, hooks, and MCP server first:
 
 ```bash
-./bin/goal-setup --enable-codex
+./bin/goal-setup --non-interactive
+goalctl bridge start codex --root /path/to/project
 ```
 
 The bridge binds no sockets. All coordination is file-based.
@@ -203,7 +204,7 @@ const env = readHandoffBySeq('.goal', '7');  // pads to "0007"
 
 ---
 
-## Role contract (cowork.yml — P5, opt-in)
+## Role contract (cowork.yml, opt-in)
 
 The role contract declares which agent plays which role. It is absent by default; its absence means solo mode. A minimal example:
 
@@ -233,7 +234,15 @@ Role assignments appear in the statusline:
 cowork: codex→build | claude-code=lead idle | 8/14 audited
 ```
 
-`cowork.yml` parsing lands in P5. In P4, the statusline detects file presence to switch rendering paths; the content is not yet parsed.
+The bridge parses `cowork.yml` when selecting a peer. If the configured peer runner is not live, the relay stays queued instead of falling back to an unrelated runner. The statusline also uses the role contract so users can see which live agent is leading, building, or reviewing.
+
+For an account-backed smoke test across the installed CLIs, run:
+
+```bash
+GOAL_LIVE_E2E=1 ./cowork/bridge/test/test-live-claude-codex.sh
+```
+
+That test intentionally calls both Claude Code and Codex, so it is opt-in and should be run only when those CLIs are authenticated and quota is available.
 
 ---
 
@@ -273,7 +282,7 @@ Users may add profiles for additional agents. The directory is not enumerated by
 
 ## Observability
 
-The bridge emits NDJSON events to `.claude/goal-events.jsonl` for each relay, handoff, and queue entry:
+The bridge emits NDJSON events to `.goal/events.jsonl` for each relay, handoff, and queue entry:
 
 ```jsonl
 {"ts":"...","type":"goal.relayed","goal_id":"...","reason":"rate_limit","from":"...","to":"...","handoff_seq":"0001"}
@@ -287,11 +296,11 @@ With `GOAL_OTEL_ENDPOINT` set, `goal-otel-exporter` ships these as OpenTelemetry
 
 ## Troubleshooting
 
-**Handoff not picked up by peer.** Check `.claude/goal-hook.log` for `relay-pickup` and `ndjson-loop-start` events from the peer bridge. Verify the peer bridge is running (`goalctl bridge status codex`) and the state file shows `current.agent` equal to the peer's agent_id.
+**Handoff not picked up by peer.** Check `.claude/goal-hook.log` and `.goal/agents/<runner>.log` for `relay-pickup` and `ndjson-loop-start` events from the peer bridge. Verify the peer bridge is running by checking `.goal/agents/<runner>.pid` or restarting it with `goalctl bridge start codex`, and confirm the state file shows `current.agent` equal to the peer's agent_id.
 
 **State stuck in `relaying`.** The peer bridge is not running or crashed. Restart it: `goalctl bridge start codex`. If state is inconsistent, run `goalctl status --json` to inspect, then `/goal resume` to force back to `pursuing`.
 
-**Queued indefinitely.** Check `goalctl quota` for provider headroom. If all providers show `exhausted`, headroom is set heuristically from the last 429 `Retry-After` header. Wait for the `queued_until` timestamp or run `goalctl relay --force` to manually trigger a resume attempt.
+**Queued indefinitely.** Check `goalctl quota` for provider headroom. If all providers show `exhausted`, headroom is set heuristically from the last 429 `Retry-After` header. Wait for the `queued_until` timestamp or run `goalctl relay` to manually request a peer handoff.
 
 **Relay guardrail tripped.** More than 3 automatic relays fired in one hour. Check `.goal/relay-log.jsonl` for the relay history. Run `/goal resume` after addressing the underlying fault.
 

@@ -13,43 +13,62 @@
   "keywords": ["goal", "objective", "persistence", "agent", "autonomy", "lifecycle"],
   "commands": ["./goal.md"],
   "hooks": {
-    "hooks": {
-      "Stop": [
-        {
-          "hooks": [
-            {
-              "type": "command",
-              "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-stop.sh"
-            }
-          ]
-        }
-      ],
-      "Notification": [
-        {
-          "hooks": [
-            {
-              "type": "command",
-              "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-notify.sh"
-            }
-          ]
-        }
-      ],
-      "UserPromptSubmit": [
-        {
-          "hooks": [
-            {
-              "type": "command",
-              "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-prompt.sh"
-            }
-          ]
-        }
-      ]
-    }
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-ticker.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-ticker.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-stop.sh"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-notify.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-prompt.sh"
+          }
+        ]
+      }
+    ]
   },
   "mcpServers": {
     "goal": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/dist/goal-server.js"],
+      "command": "bash",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/run-goal-server.sh"],
       "env": {
         "GOAL_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}"
       }

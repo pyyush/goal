@@ -9,6 +9,8 @@
     "node": ">=18"
   },
   "bin": {
+    "goal-ticker": "./goal-ticker",
+    "goal-v3": "./goal-v3",
     "goal-http-server": "./goal-http-server.ts",
     "goal-otel-exporter": "./goal-otel-exporter.ts"
   },

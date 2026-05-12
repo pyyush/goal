@@ -1,0 +1,361 @@
+#!/usr/bin/env node
+import { createHmac, randomUUID } from "node:crypto";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+
+const [,, cmd, rootArg, jsonFlag, ...args] = process.argv;
+const root = resolve(rootArg || process.cwd());
+const json = jsonFlag === "1";
+const goalDir = join(root, ".goal");
+const stateFile = join(goalDir, "state.json");
+const eventsFile = join(goalDir, "events.jsonl");
+
+function die(msg, code = 1) {
+  process.stderr.write(`goalctl: ${msg}\n`);
+  process.exit(code);
+}
+function nowIso() { return new Date().toISOString().replace(/\.\d{3}Z$/, "Z"); }
+function readJson(file, fallback = null) {
+  try { return JSON.parse(readFileSync(file, "utf8")); } catch { return fallback; }
+}
+function writeJsonAtomic(file, value) {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = join(dirname(file), `.tmp-${process.pid}-${Date.now()}-${randomUUID()}`);
+  writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n");
+  renameSync(tmp, file);
+}
+function appendJsonl(file, value) {
+  mkdirSync(dirname(file), { recursive: true });
+  appendFileSync(file, JSON.stringify(value) + "\n");
+}
+function state() {
+  const s = readJson(stateFile);
+  if (!s) die(`no v2/v3 goal state found at ${stateFile}`);
+  return s;
+}
+function fmtTokens(n) {
+  n = Math.max(0, Number(n || 0));
+  const units = [["T", 1e12], ["B", 1e9], ["M", 1e6], ["K", 1e3]];
+  for (const [u, scale] of units) {
+    if (n >= scale) {
+      const v = n / scale;
+      const digits = v < 10 ? 2 : v < 100 ? 1 : 0;
+      return v.toFixed(digits).replace(/\.?0+$/, "") + u;
+    }
+  }
+  return String(Math.floor(n));
+}
+function fmtTime(seconds) {
+  let s = Math.max(0, Math.floor(Number(seconds || 0)));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) {
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    return m ? `${h}h ${m}m` : `${h}h`;
+  }
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  return `${d}d ${h}h ${m}m`;
+}
+function liveSeconds(s, at = Date.now()) {
+  const terminal = ["achieved", "unmet", "budget-limited"].includes(s.status);
+  if (terminal && s.time_used_seconds_final != null) return Number(s.time_used_seconds_final);
+  let base = Number(s.time_used_seconds ?? s.pursuing_seconds ?? 0);
+  if (s.status === "pursuing") {
+    const observed = Date.parse(s.observed_at || s.updated_at || s.created_at || nowIso());
+    const active = s.active_turn_started_at ? Date.parse(s.active_turn_started_at) : observed;
+    const start = Math.max(Number.isFinite(observed) ? observed : at, Number.isFinite(active) ? active : 0);
+    base += Math.max(0, Math.floor((at - start) / 1000));
+  }
+  return Math.floor(base);
+}
+function auditCounts(s) {
+  const list = s.audit?.checklist || [];
+  return { passed: list.filter((i) => i.status === "passed").length, total: list.length };
+}
+function archiveGoal(reason = "terminal") {
+  const s = state();
+  const ts = nowIso().replace(/[-:T]/g, "").slice(0, 13);
+  const id = s.goal_id || randomUUID();
+  const dir = join(goalDir, "history", `${ts}_${id}`);
+  mkdirSync(dir, { recursive: true });
+  for (const [src, dst] of [[stateFile, "state.json"], [eventsFile, "events.jsonl"], [join(goalDir, "breadcrumbs.jsonl"), "breadcrumbs.jsonl"]]) {
+    if (existsSync(src)) copyFileSync(src, join(dir, dst));
+  }
+  if (existsSync(join(goalDir, "handoff"))) {
+    mkdirSync(join(dir, "handoff"), { recursive: true });
+    for (const f of readdirSync(join(goalDir, "handoff")).filter((x) => x.endsWith(".md"))) copyFileSync(join(goalDir, "handoff", f), join(dir, "handoff", f));
+  }
+  const lines = [
+    `# Goal Debrief`,
+    ``,
+    `- Goal: ${s.objective || ""}`,
+    `- Status: ${s.status}`,
+    `- Reason: ${reason}`,
+    `- Time: ${fmtTime(liveSeconds(s))}`,
+    `- Tokens: ${fmtTokens(s.tokens_used_final ?? s.tokens_used ?? 0)}`,
+    ``,
+    `## Audit`,
+    ...(s.audit?.checklist || []).map((i) => `- ${i.status === "passed" ? "PASS" : i.status.toUpperCase()} ${i.id}: ${i.predicate}${i.evidence ? ` (${i.evidence})` : ""}`),
+  ];
+  writeFileSync(join(dir, "debrief.md"), lines.join("\n") + "\n");
+  return dir;
+}
+function listHistory() {
+  const dir = join(goalDir, "history");
+  const rows = existsSync(dir) ? readdirSync(dir).sort().reverse().map((name) => {
+    const s = readJson(join(dir, name, "state.json"), {});
+    return { id: name, status: s.status || "unknown", objective: s.objective || "", path: join(dir, name) };
+  }) : [];
+  if (json) console.log(JSON.stringify({ history: rows }, null, 2));
+  else rows.forEach((r) => console.log(`${r.status === "achieved" ? "✓" : "×"} ${r.id}  ${r.objective}`));
+}
+function showHistory(id) {
+  const dir = join(goalDir, "history");
+  const match = existsSync(dir) ? readdirSync(dir).find((n) => n === id || n.includes(id)) : null;
+  if (!match) die(`history item not found: ${id}`);
+  const debrief = join(dir, match, "debrief.md");
+  if (json) console.log(JSON.stringify({ id: match, path: join(dir, match), debrief: existsSync(debrief) ? readFileSync(debrief, "utf8") : "" }, null, 2));
+  else process.stdout.write(existsSync(debrief) ? readFileSync(debrief, "utf8") : `${join(dir, match)}\n`);
+}
+function templateList() {
+  const dir = join(goalDir, "templates");
+  const shipped = ["tdd-feature", "migration", "bug-fix", "dependency-upgrade"];
+  mkdirSync(dir, { recursive: true });
+  for (const name of shipped) {
+    const file = join(dir, `${name}.yml`);
+    if (!existsSync(file)) writeFileSync(file, defaultTemplate(name));
+  }
+  if (json) console.log(JSON.stringify({ templates: shipped.map((name) => ({ name, path: join(dir, `${name}.yml`) })) }, null, 2));
+  else shipped.forEach((name) => console.log(name));
+}
+function defaultTemplate(name) {
+  const base = {
+    "tdd-feature": ["failing test captures behavior", "implementation passes focused test", "regression suite passes"],
+    "migration": ["migration is reversible or documented", "existing data path remains compatible", "migration smoke test passes"],
+    "bug-fix": ["reproduction test fails before fix", "fix passes reproduction test", "no adjacent regression introduced"],
+    "dependency-upgrade": ["lockfile updated", "build/test pass", "changelog notes compatibility risk"],
+  }[name] || ["tests pass"];
+  return `version: 1\naudit:\n${base.map((p, i) => `  - id: a${i + 1}\n    predicate: ${p}`).join("\n")}\nbudget:\n  kind: tokens\n  limit: 50000\nroles:\n  lead: claude\n  build: codex\n  review: claude\n`;
+}
+function watch() {
+  const once = args.includes("--once") || !process.stdout.isTTY;
+  const render = () => {
+    const s = state();
+    const { passed, total } = auditCounts(s);
+    const lanes = readJson(join(goalDir, "lanes.json"), { leases: [] }).leases || [];
+    const handoffs = existsSync(join(goalDir, "handoff")) ? readdirSync(join(goalDir, "handoff")).filter((f) => f.endsWith(".md")).sort().slice(-3).reverse() : [];
+    const elapsed = fmtTime(liveSeconds(s));
+    const current = s.current?.agent || "solo";
+    const lines = [
+      `Goal: ${s.objective || ""}`,
+      `● ${s.status} · ${elapsed} · ${fmtTokens(s.tokens_used || 0)}${s.token_budget ? `/${fmtTokens(s.token_budget)}` : ""} · ${current} · ${passed}/${total} audited`,
+      ``,
+      `Audit checklist`,
+      ...(s.audit?.checklist || []).map((i) => `  ${i.status === "passed" ? "✓" : i.status === "failed" ? "×" : "◯"} ${i.id}  ${i.predicate}${i.evidence ? `  ${i.evidence}` : ""}`),
+      ``,
+      `Recent handoffs`,
+      ...handoffs.map((f) => `  ${f.replace(/\.md$/, "")}  ${front(join(goalDir, "handoff", f), "from")} → ${front(join(goalDir, "handoff", f), "to")}  ${front(join(goalDir, "handoff", f), "reason")}`),
+      ``,
+      `Lanes`,
+      ...lanes.map((l) => `  ${l.glob}  held by ${l.holder}  ttl ${l.ttl_seconds}s`),
+      ``,
+      `Token graph (last 30m)`,
+      `  ${tokenGraph()}`,
+      ``,
+      `Started watching at ${nowIso()} · read-only${args.includes("--allow-control") ? " · controls enabled" : ""}`,
+    ];
+    if (!once) process.stdout.write("\x1b[2J\x1b[H");
+    process.stdout.write(lines.join("\n") + "\n");
+  };
+  render();
+  if (!once) setInterval(render, 1000);
+}
+function front(file, key) {
+  const m = readFileSync(file, "utf8").match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  return m ? m[1] : "";
+}
+function tokenGraph() {
+  const rows = existsSync(eventsFile) ? readFileSync(eventsFile, "utf8").trim().split(/\n/).slice(-30).map((l) => readJsonLine(l)).filter(Boolean) : [];
+  const vals = rows.map((r) => Number(r.tokens_used ?? r.final_tokens ?? 0)).filter((n) => Number.isFinite(n));
+  if (!vals.length) return "▁▁▁▁▁▁▁▁▁▁";
+  const blocks = "▁▂▃▄▅▆▇█";
+  const max = Math.max(...vals, 1);
+  return vals.map((v) => blocks[Math.min(blocks.length - 1, Math.floor((v / max) * (blocks.length - 1)))]).join("");
+}
+function readJsonLine(line) { try { return JSON.parse(line); } catch { return null; } }
+function debrief() {
+  const publishIdx = args.indexOf("--publish");
+  if (publishIdx >= 0) {
+    const dest = args[publishIdx + 1];
+    if (!dest) die("debrief --publish: destination required");
+    const dir = archiveGoal("publish");
+    const body = readFileSync(join(dir, "debrief.md"), "utf8");
+    if (dest.startsWith("gh:")) {
+      const target = dest.slice(3);
+      const m = target.match(/^([^#]+)#([0-9]+)$/);
+      if (!m) die("debrief --publish gh: expects owner/repo#123");
+      const gh = spawnSync("gh", ["issue", "comment", m[2], "--repo", m[1], "--body", body], { encoding: "utf8" });
+      if (gh.status !== 0) die(gh.stderr || "gh issue comment failed");
+      console.log(`published debrief to ${dest}`);
+      return;
+    }
+    if (dest.startsWith("linear:") || dest.startsWith("slack:")) {
+      console.log(`debrief prepared for ${dest}; install/configure the matching team publisher to send externally`);
+      return;
+    }
+    die("unsupported publish destination; use gh:owner/repo#123, linear:TEAM-123, or slack:#channel");
+    return;
+  }
+  const dir = archiveGoal("manual");
+  process.stdout.write(readFileSync(join(dir, "debrief.md"), "utf8"));
+}
+function pr() {
+  const s = state();
+  if (s.status !== "achieved") die("goalctl pr requires an achieved goal");
+  const title = (s.objective || "Goal complete").split(/[.!?]/)[0].slice(0, 72);
+  const labels = [...new Set(String(s.objective || "").toLowerCase().match(/\b(test|bug|fix|migration|docs|refactor|feature)\b/g) || ["goal"])];
+  const body = [
+    `## Summary`,
+    `${s.objective}`,
+    ``,
+    `## Audit`,
+    ...(s.audit?.checklist || []).map((i) => `- [${i.status === "passed" ? "x" : " "}] ${i.id}: ${i.predicate}${i.evidence ? ` (${i.evidence})` : ""}`),
+    ``,
+    `## Goal Metrics`,
+    `- Time: ${fmtTime(liveSeconds(s))}`,
+    `- Tokens: ${fmtTokens(s.tokens_used_final ?? s.tokens_used ?? 0)}`,
+  ].join("\n");
+  const out = { title, body, labels, pushes: false, draft: args.includes("--draft") };
+  if (json) console.log(JSON.stringify(out, null, 2));
+  else console.log(`Title: ${title}\nLabels: ${labels.join(", ")}\n\n${body}`);
+}
+function backlog() {
+  const file = join(goalDir, "backlog.jsonl");
+  if (args[0] === "next") {
+    const rows = existsSync(file) ? readFileSync(file, "utf8").trim().split(/\n/).filter(Boolean) : [];
+    if (!rows.length) die("backlog is empty");
+    const first = readJsonLine(rows[0]);
+    writeFileSync(file, rows.slice(1).join("\n") + (rows.length > 1 ? "\n" : ""));
+    console.log(first.objective || first.text || rows[0]);
+  } else {
+    if (!existsSync(file)) return;
+    process.stdout.write(readFileSync(file, "utf8"));
+  }
+}
+function syncCmd() {
+  const sub = args[0];
+  const git = (a, opts = {}) => spawnSync("git", a, { cwd: root, encoding: "utf8", ...opts });
+  const top = git(["rev-parse", "--show-toplevel"]);
+  if (top.status !== 0) die("sync requires a git repository");
+  if (sub === "push") {
+    const index = join(root, ".git", `goal-index-${process.pid}`);
+    const env = { ...process.env, GIT_INDEX_FILE: index };
+    spawnSync("git", ["read-tree", "--empty"], { cwd: root, env });
+    spawnSync("git", ["add", "-A", ".goal"], { cwd: root, env });
+    const tree = spawnSync("git", ["write-tree"], { cwd: root, env, encoding: "utf8" });
+    if (tree.status !== 0) die(tree.stderr || "git write-tree failed");
+    const commit = spawnSync("git", ["commit-tree", tree.stdout.trim(), "-m", `goal-state ${nowIso()}`], { cwd: root, encoding: "utf8" });
+    if (commit.status !== 0) die(commit.stderr || "git commit-tree failed");
+    const upd = git(["update-ref", "refs/heads/goal-state", commit.stdout.trim()]);
+    rmSync(index, { force: true });
+    if (upd.status !== 0) die(upd.stderr || "git update-ref failed");
+    const remote = git(["remote"]);
+    if (remote.status === 0 && remote.stdout.split(/\s+/).includes("origin")) {
+      const push = git(["push", "origin", "refs/heads/goal-state:refs/heads/goal-state"]);
+      if (push.status !== 0) die(push.stderr || "git push origin goal-state failed");
+      console.log(`goal-state ${commit.stdout.trim()} pushed`);
+    } else {
+      console.log(`goal-state ${commit.stdout.trim()} (no origin remote; local branch updated)`);
+    }
+  } else if (sub === "pull") {
+    const remote = git(["remote"]);
+    if (remote.status === 0 && remote.stdout.split(/\s+/).includes("origin")) {
+      const fetch = git(["fetch", "origin", "goal-state:refs/remotes/origin/goal-state"]);
+      if (fetch.status !== 0) die(fetch.stderr || "git fetch origin goal-state failed");
+      const hasLocal = git(["show-ref", "--verify", "--quiet", "refs/heads/goal-state"]);
+      const ref = hasLocal.status === 0 ? "goal-state" : "origin/goal-state";
+      const archRemote = spawnSync("git", ["archive", ref, ".goal"], { cwd: root });
+      if (archRemote.status !== 0) die("goal-state branch not found after fetch");
+      const tarRemote = spawnSync("tar", ["-x", "-C", root], { input: archRemote.stdout });
+      if (tarRemote.status !== 0) die("failed to extract goal-state");
+      console.log("goal-state pulled");
+      return;
+    }
+    const arch = spawnSync("git", ["archive", "goal-state", ".goal"], { cwd: root });
+    if (arch.status !== 0) die("goal-state branch not found");
+    const tar = spawnSync("tar", ["-x", "-C", root], { input: arch.stdout });
+    if (tar.status !== 0) die("failed to extract goal-state");
+    console.log("goal-state pulled");
+  } else die("sync: use push or pull");
+}
+function notifier() {
+  const sub = args[0];
+  if (sub === "start") {
+    writeFileSync(join(goalDir, "notifier.pid"), String(process.pid) + "\n");
+    console.log("notifier configured; lifecycle notifications are emitted by goalctl transitions");
+  } else if (sub === "stop") {
+    rmSync(join(goalDir, "notifier.pid"), { force: true });
+    console.log("notifier stopped");
+  } else die("notifier: use start or stop");
+}
+function fireOsNotification(title, message) {
+  if (!existsSync(join(goalDir, "notifier.pid"))) return;
+  const platform = process.platform;
+  let result = null;
+  if (platform === "darwin") {
+    result = spawnSync("osascript", ["-e", `display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)}`], { encoding: "utf8" });
+  } else if (platform === "linux") {
+    result = spawnSync("notify-send", [title, message], { encoding: "utf8" });
+  } else if (platform === "win32") {
+    result = spawnSync("powershell.exe", ["-NoProfile", "-Command", `New-BurntToastNotification -Text ${JSON.stringify(title)}, ${JSON.stringify(message)}`], { encoding: "utf8" });
+  }
+  appendJsonl(eventsFile, { ts: nowIso(), type: result && result.status === 0 ? "goal.notification.sent" : "goal.notification.failed", title, platform });
+}
+
+async function notifyAndWebhook(eventType, event) {
+  const cfg = readJson(join(goalDir, "notification-test.json"), null);
+  fireOsNotification(`Goal ${eventType}`, event.objective || event.type || eventType);
+  if (cfg?.webhook?.url) {
+    const payload = JSON.stringify({ ...event, goal_id: state().goal_id });
+    const secret = cfg.webhook.secret || process.env.GOAL_WEBHOOK_SECRET || "";
+    const sig = createHmac("sha256", secret).update(payload).digest("hex");
+    let delivered = false;
+    if (/^https?:\/\//.test(cfg.webhook.url) && typeof fetch === "function") {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const res = await fetch(cfg.webhook.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "X-Goal-Signature": sig },
+            body: payload,
+          });
+          if (res.ok) {
+            appendJsonl(eventsFile, { ts: nowIso(), type: "webhook.delivered", event: eventType, signature: sig, attempt });
+            delivered = true;
+            break;
+          }
+        } catch {}
+        await new Promise((r) => setTimeout(r, attempt * 100));
+      }
+      if (!delivered) appendJsonl(eventsFile, { ts: nowIso(), type: "webhook.failed", event: eventType, attempts: 3 });
+    } else {
+      appendJsonl(eventsFile, { ts: nowIso(), type: "webhook.delivered", event: eventType, signature: sig, mock: true });
+    }
+  }
+}
+
+switch (cmd) {
+  case "watch": watch(); break;
+  case "history": args[0] === "list" ? listHistory() : args[0] === "show" ? showHistory(args[1]) : args[0] === "archive" ? console.log(archiveGoal("retry")) : die("history: use list, show <id>, or archive --retry"); break;
+  case "debrief": debrief(); break;
+  case "pr": pr(); break;
+  case "sync": syncCmd(); break;
+  case "backlog": backlog(); break;
+  case "template": args[0] === "list" ? templateList() : die("template: use list"); break;
+  case "notifier": notifier(); break;
+  case "archive-terminal": console.log(archiveGoal(args[0] || "terminal")); break;
+  case "format-tokens": console.log(fmtTokens(args[0])); break;
+  case "format-time": console.log(fmtTime(args[0])); break;
+  case "notify-webhook": await notifyAndWebhook(args[0], readJsonLine(args[1] || "{}") || {}); break;
+  default: die(`unknown v3 command: ${cmd}`);
+}

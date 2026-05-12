@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * goal-http-server — local HTTP shim over .claude/goal.json
+ * goal-http-server — local HTTP shim over .goal/state.json
  *
  * Loopback-only (127.0.0.1). Invoked by `goalctl serve-http`.
  *
@@ -12,12 +12,12 @@
  *                                  Body: {action: "pause"|"resume"|"clear"|"set-budget"|"mark-unmet", value?: any}
  *                                  For "clear": returns 204 No Content.
  *   GET   /events?since=<iso>    → application/x-ndjson stream of events from
- *                                  .claude/goal-events.jsonl. Stays open and
+ *                                  .goal/events.jsonl. Stays open and
  *                                  streams new lines.
  *
  * Storage layout (single source of truth — must stay in sync with bin/goalctl):
- *   <root>/.claude/goal.json
- *   <root>/.claude/goal-events.jsonl
+ *   <root>/.goal/state.json
+ *   <root>/.goal/events.jsonl
  *   <root>/.claude/goal-baseline-<goal_id>   (cleared on create/replace/clear)
  *
  * Atomic writes via mktemp-in-same-dir + rename. CAS via goal_id check
@@ -138,7 +138,7 @@ async function migrateIfNeeded(root: string): Promise<string> {
     try {
         await fsp.access(v1File);
     } catch {
-        return v1File; // v1 file doesn't exist either — fresh start
+        return v2File; // fresh start: v2/v3 state lives in .goal/
     }
 
     // Parse v1.
@@ -213,7 +213,7 @@ class Store {
     readonly file: string;
     readonly eventsFile: string;
     readonly dir: string;       // state file's parent directory
-    readonly claudeDir: string; // always .claude/ for logs & events
+    readonly claudeDir: string; // always .claude/ for legacy baselines/marker
     readonly root: string;
 
     constructor(root: string, stateFile: string) {
@@ -221,7 +221,7 @@ class Store {
         this.claudeDir = path.join(root, ".claude");
         this.file = stateFile;
         this.dir = path.dirname(stateFile);
-        this.eventsFile = path.join(this.claudeDir, "goal-events.jsonl");
+        this.eventsFile = path.join(path.dirname(stateFile), "events.jsonl");
     }
 
     static async create(root: string): Promise<Store> {
@@ -520,6 +520,14 @@ async function handlePostGoal(
             status: "pursuing",
             created_at: ts,
             updated_at: ts,
+            ...(isV2 ? {
+                time_used_seconds: 0,
+                observed_at: ts,
+                active_turn_started_at: ts,
+                tokens_used_observed_at: ts,
+                time_used_seconds_final: null,
+                tokens_used_final: null,
+            } : {}),
             token_budget: budget,
             tokens_used: 0,
             tick_count: 0,

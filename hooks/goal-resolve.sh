@@ -11,7 +11,7 @@
 #                Set even when falling back to v1 path, so callers can use it
 #                to decide whether migration has happened.
 #   LOG_FILE     absolute path to goal-hook.log
-#   KILL_SWITCH  absolute path to goal.pause
+#   KILL_SWITCH  absolute path to .goal/pause
 #
 # Resolution order:
 #   1) Session pointer (~/.claude/goal-sessions/<session_id>.goal). Sticky
@@ -81,12 +81,12 @@ resolve_goal() {
     GOAL_DIR="$GOAL_ROOT/.goal"
 
     LOG_FILE="$GOAL_ROOT/.claude/goal-hook.log"
-    KILL_SWITCH="$GOAL_ROOT/.claude/goal.pause"
+    KILL_SWITCH="$GOAL_ROOT/.goal/pause"
 
     # Refresh session pointer so future fires skip the walk-up.
     if [ -n "$sid" ]; then
         mkdir -p "$HOME/.claude/goal-sessions" 2>/dev/null || true
-        printf '%s\n' "$GOAL_FILE" > "$HOME/.claude/goal-sessions/${sid}.goal" 2>/dev/null || true
+        { printf '%s\n' "$GOAL_FILE" > "$HOME/.claude/goal-sessions/${sid}.goal"; } 2>/dev/null || true
     fi
     return 0
 }

@@ -322,10 +322,57 @@ assert_contains "$output" "retry at" "retry time in queued label"
 assert_contains "$output" "throttled" "throttled providers in queued label"
 
 # ============================================================================
-# TEST 5: Verify solo path is NOT triggered when cowork.yml exists
+# TEST 5: V3 cowork state still renders cowork details instead of generic v3
 # ============================================================================
 
-step "5. cowork.yml presence triggers cowork path (even with null current.agent)"
+step "5. V3 cowork-active state — current.agent plus live-time fields"
+
+cat > "$GOAL_DIR/state.json" <<STATE
+{
+  "schema_version": 2,
+  "goal_id": "$GOAL_UUID",
+  "objective": "v3 cowork statusline",
+  "status": "pursuing",
+  "created_at": "$NOW",
+  "updated_at": "$NOW",
+  "time_used_seconds": 42,
+  "observed_at": "$NOW",
+  "active_turn_started_at": null,
+  "tokens_used_observed_at": "$NOW",
+  "time_used_seconds_final": null,
+  "tokens_used_final": null,
+  "current": { "agent": "codex-host-5678", "session": null, "since": "$NOW" },
+  "roles": { "lead": "claude-code-host-1234", "build": "codex-host-5678", "review": null },
+  "compat": ["claude-code", "codex"],
+  "lineage": [],
+  "budget": null,
+  "audit": {
+    "checklist": [
+      { "id": "a1", "predicate": "tests green", "status": "passed", "evidence": "ok" }
+    ]
+  },
+  "handoff_head": null,
+  "queued_until": null,
+  "token_budget": 1000,
+  "tokens_used": 5,
+  "pursuing_seconds": 42,
+  "pursuing_since": null
+}
+STATE
+
+output=$(run_statusline_shim)
+say "v3 cowork-active output: '$output'"
+assert_contains "$output" "cowork:" "v3 cowork prefix"
+assert_contains "$output" "codex-host-5678" "v3 agent id in output"
+assert_contains "$output" "build" "v3 role in output"
+assert_contains "$output" "1/1 audited" "v3 audit count in output"
+assert_contains "$output" "5/1K" "v3 token count in output"
+
+# ============================================================================
+# TEST 6: Verify solo path is NOT triggered when cowork.yml exists
+# ============================================================================
+
+step "6. cowork.yml presence triggers cowork path (even with null current.agent)"
 
 # Reset to a solo-looking state but add cowork.yml.
 cat > "$GOAL_DIR/state.json" <<STATE
@@ -360,11 +407,11 @@ assert_contains "$output" "cowork:" "cowork.yml triggers cowork path"
 rm "$GOAL_DIR/cowork.yml"
 
 # ============================================================================
-# TEST 6: Solo mode byte-comparison — output must match what v1 produced
+# TEST 7: Solo mode byte-comparison — output must match what v1 produced
 # This uses the same state as Test 1 and verifies exact token format.
 # ============================================================================
 
-step "6. Solo byte-comparison — pursuing 300s → 'Pursuing goal (5m)'"
+step "7. Solo byte-comparison — pursuing 300s → 'Pursuing goal (5m)'"
 
 cat > "$GOAL_DIR/state.json" <<STATE
 {

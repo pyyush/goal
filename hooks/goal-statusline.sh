@@ -43,6 +43,118 @@ RESOLVER="$(dirname "$0")/goal-resolve.sh"
 
 resolve_goal "${2:-}" "${1:-$PWD}" || exit 0
 
+# v3 render path: live baseline+delta, final snapshots, heartbeat freshness,
+# compact Codex-style token/time formatting. Older v2/v1 states fall through to
+# the compatibility renderers below so existing solo/cowork fixtures remain valid.
+if jq -e 'has("time_used_seconds") or has("observed_at") or has("tokens_used_observed_at")' "$GOAL_FILE" >/dev/null 2>&1; then
+    _fmt_time() {
+        local s="$1"
+        if   [ "$s" -lt 60 ];    then printf '%ds' "$s"
+        elif [ "$s" -lt 3600 ];  then printf '%dm' $((s / 60))
+        elif [ "$s" -lt 86400 ]; then
+            if [ $(((s % 3600) / 60)) -gt 0 ]; then printf '%dh %dm' $((s / 3600)) $(((s % 3600) / 60)); else printf '%dh' $((s / 3600)); fi
+        else printf '%dd %dh %dm' $((s / 86400)) $(((s % 86400) / 3600)) $(((s % 3600) / 60))
+        fi
+    }
+    _fmt_tokens() {
+        awk -v n="$1" 'BEGIN {
+            split("T B M K", u, " "); split("1000000000000 1000000000 1000000 1000", s, " ");
+            for (i=1;i<=4;i++) if (n >= s[i]) {
+                v=n/s[i]; d=(v<10?2:(v<100?1:0)); num=sprintf("%.*f", d, v);
+                while (index(num, ".") && substr(num, length(num), 1) == "0") num=substr(num, 1, length(num)-1);
+                if (substr(num, length(num), 1) == ".") num=substr(num, 1, length(num)-1);
+                print num u[i]; exit
+            }
+            printf "%d", n
+        }'
+    }
+    _mtime_epoch() {
+        stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || printf '0'
+    }
+    SEP=$'\x1f'
+    V3=$(jq -r --arg sep "$SEP" '
+        (now | floor) as $now
+        | (.time_used_seconds // .pursuing_seconds // 0 | floor) as $base
+        | ((try (.observed_at | fromdateiso8601) catch null) // (try (.updated_at | fromdateiso8601) catch null) // $now) as $obs
+        | ((try (.active_turn_started_at | fromdateiso8601) catch null) // $obs) as $active
+        | (if (.status == "pursuing") then ($base + (($now - ([ $obs, $active ] | max)) | floor | if . < 0 then 0 else . end)) else ($base) end) as $live
+        | (if ((.status == "achieved" or .status == "unmet" or .status == "budget-limited") and (.time_used_seconds_final != null)) then (.time_used_seconds_final | floor) else $live end) as $seconds
+        | ((.audit.checklist // []) as $a | ([ $a[] | select(.status == "passed") ] | length | tostring) + "/" + ($a | length | tostring)) as $aud
+        | [ .status,
+            ($seconds | tostring),
+            ((.tokens_used_final // .tokens_used // 0) | tostring),
+            ((.token_budget // .budget.limit // 0) | tostring),
+            (.current.agent // "solo"),
+            ($aud),
+            (.queued_until // ""),
+            (.handoff_head // ""),
+            (.tokens_used_observed_at // "")
+          ] | join($sep)
+    ' "$GOAL_FILE" 2>/dev/null) || V3=""
+    if [ -n "$V3" ]; then
+        IFS=$SEP read -r V3_STATUS V3_SECONDS V3_TOKENS V3_BUDGET V3_AGENT V3_AUDIT V3_QUEUED V3_HANDOFF_HEAD V3_TOKENS_AT <<<"$V3"
+        DOT="◌"
+        if [ -f "$GOAL_DIR/heartbeat" ]; then
+            AGE=$(( $(date +%s) - $(_mtime_epoch "$GOAL_DIR/heartbeat") ))
+            if [ "$AGE" -lt 5 ]; then DOT="●"; elif [ "$AGE" -le 30 ]; then DOT="·"; fi
+        fi
+        TOK="$(_fmt_tokens "$V3_TOKENS")"
+        if [ "${V3_BUDGET:-0}" -gt 0 ] 2>/dev/null; then TOK="${TOK}/$(_fmt_tokens "$V3_BUDGET")"; fi
+        if [ -n "$V3_TOKENS_AT" ]; then
+            TOK_AGE=$(jq -n --arg t "$V3_TOKENS_AT" '((now - ($t|fromdateiso8601)) | floor)' 2>/dev/null || printf '0')
+            [ "$TOK_AGE" -gt 30 ] 2>/dev/null && TOK="${TOK}*"
+        fi
+        V3_COWORK=0
+        if [ "$V3_AGENT" != "solo" ] || [ -f "$GOAL_DIR/cowork.yml" ] || jq -e '((.roles.lead // "") != "") or ((.roles.build // "") != "") or ((.roles.review // "") != "")' "$GOAL_FILE" >/dev/null 2>&1; then
+            V3_COWORK=1
+        fi
+        V3_ROLE=""
+        if [ "$V3_AGENT" != "solo" ]; then
+            V3_ROLE=$(jq -r --arg a "$V3_AGENT" '.roles // {} | to_entries | map(select(.value == $a)) | if length > 0 then .[0].key else "" end' "$GOAL_FILE" 2>/dev/null) || V3_ROLE=""
+        fi
+        case "$V3_STATUS" in
+            pursuing)
+                if [ "$V3_COWORK" -eq 1 ]; then
+                    agent_token="$V3_AGENT"
+                    [ -n "$V3_ROLE" ] && agent_token="${agent_token}→${V3_ROLE}"
+                    label="cowork: ${agent_token} | ${V3_AUDIT} audited | $(_fmt_time "$V3_SECONDS") | ${TOK}"
+                else
+                    label="goal · $(_fmt_time "$V3_SECONDS") · ${TOK} · ${V3_AGENT} · ${V3_AUDIT}"
+                fi
+                ;;
+            paused) label="goal · paused $(_fmt_time "$V3_SECONDS")" ;;
+            achieved) label="goal · ✓ $(_fmt_time "$V3_SECONDS") · $(_fmt_tokens "$V3_TOKENS") tokens" ;;
+            unmet) label="goal · unmet" ;;
+            budget-limited) label="goal · over budget · ${TOK}" ;;
+            relaying)
+                V3_FROM=""
+                V3_TO="$V3_AGENT"
+                if [ -n "$V3_HANDOFF_HEAD" ] && [ -f "$GOAL_DIR/handoff/${V3_HANDOFF_HEAD}.md" ]; then
+                    V3_FROM=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^from:/{gsub(/^from:[[:space:]]*/,"");print;exit}' "$GOAL_DIR/handoff/${V3_HANDOFF_HEAD}.md" 2>/dev/null || printf '')
+                    V3_TO=$(awk '/^---/{if(++c==1)next;if(c==2)exit} c==1 && /^to:/{gsub(/^to:[[:space:]]*/,"");print;exit}' "$GOAL_DIR/handoff/${V3_HANDOFF_HEAD}.md" 2>/dev/null || printf "$V3_TO")
+                fi
+                if [ -n "$V3_FROM" ] && [ -n "$V3_TO" ]; then label="Relaying ${V3_FROM} → ${V3_TO}…"; else label="goal · → ${V3_AGENT}"; fi
+                ;;
+            queued)
+                THROTTLED=""
+                if [ -f "$GOAL_DIR/quota.json" ]; then
+                    THROTTLED=$(jq -r '.providers // {} | to_entries | map(select(.value.estimated_headroom == "exhausted") | .key) | join(" + ")' "$GOAL_DIR/quota.json" 2>/dev/null) || THROTTLED=""
+                fi
+                label="Queued${V3_QUEUED:+ — retry at ${V3_QUEUED}}"
+                [ -n "$THROTTLED" ] && label="${label} (${THROTTLED} throttled)"
+                ;;
+            *) exit 0 ;;
+        esac
+        case "${GOAL_STATUSLINE_STYLE:-magenta}" in
+            plain) open='' ; close='' ;;
+            dim) open=$'\033[2;35m' ; close=$'\033[0m' ;;
+            magenta|*) open=$'\033[35m' ; close=$'\033[0m' ;;
+        esac
+        printf '%s%s %s%s' "$open" "$DOT" "$label" "$close"
+        exit 0
+    fi
+fi
+
 # ============================================================================
 # COWORK MODE DETECTION (spec §11, §13)
 # Detect cowork mode BEFORE reading state for the solo render path.

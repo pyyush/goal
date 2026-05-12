@@ -62,6 +62,36 @@
       "default": 0,
       "description": "Cumulative output tokens consumed by this goal across all agents."
     },
+    "time_used_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "v3 baseline elapsed seconds. Consumers add live delta from observed_at/active_turn_started_at while pursuing."
+    },
+    "observed_at": {
+      "type": "string",
+      "description": "v3 timestamp for the time_used_seconds snapshot."
+    },
+    "active_turn_started_at": {
+      "type": ["string", "null"],
+      "description": "v3 timestamp for the current active turn; null outside active pursuit."
+    },
+    "tokens_used_observed_at": {
+      "type": "string",
+      "description": "v3 timestamp for the last trustworthy token observation."
+    },
+    "time_used_seconds_final": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "default": null,
+      "description": "v3 terminal elapsed-time snapshot. Renderers never recompute live time after this is set."
+    },
+    "tokens_used_final": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "default": null,
+      "description": "v3 terminal token snapshot."
+    },
     "tick_count": {
       "type": "integer",
       "minimum": 0,

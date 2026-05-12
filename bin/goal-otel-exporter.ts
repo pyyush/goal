@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * goal-otel-exporter — tail .claude/goal-events.jsonl and export as OTel metrics.
+ * goal-otel-exporter — tail .goal/events.jsonl and export as OTel metrics.
  *
  * Endpoint discovery:
  *   - GOAL_OTEL_ENDPOINT=https://collector.example/v1/metrics → OTLP/HTTP exporter
@@ -28,7 +28,7 @@
  *   bin/goal-otel-exporter [--events <path>] [--interval-ms <N>]
  *
  * Defaults:
- *   --events       <repo-root>/.claude/goal-events.jsonl
+ *   --events       <repo-root>/.goal/events.jsonl
  *                  (or $GOAL_EVENTS_FILE if set)
  *   --interval-ms  10000 (metrics export interval; ignored for stdout)
  */
@@ -54,7 +54,7 @@ function parseArgs(argv: readonly string[]): Args {
   let events =
     process.env.GOAL_EVENTS_FILE ??
     findEventsFile(process.cwd()) ??
-    path.join(process.cwd(), ".claude", "goal-events.jsonl");
+    path.join(process.cwd(), ".goal", "events.jsonl");
   let intervalMs = 10_000;
 
   for (let i = 0; i < argv.length; i++) {
@@ -79,10 +79,10 @@ function parseArgs(argv: readonly string[]): Args {
 }
 
 function findEventsFile(startDir: string): string | undefined {
-  // Walk up to find a `.claude/goal-events.jsonl` near a project root.
+  // Walk up to find a `.goal/events.jsonl` near a project root.
   let dir = startDir;
   for (let i = 0; i < 8; i++) {
-    const candidate = path.join(dir, ".claude", "goal-events.jsonl");
+    const candidate = path.join(dir, ".goal", "events.jsonl");
     if (fs.existsSync(candidate)) return candidate;
     const parent = path.dirname(dir);
     if (parent === dir) break;
@@ -95,7 +95,7 @@ function printHelp(): void {
   process.stdout.write(
     "Usage: goal-otel-exporter [--events <path>] [--interval-ms <N>]\n" +
       "\n" +
-      "Tails goal-events.jsonl and emits OTel metrics.\n" +
+      "Tails .goal/events.jsonl and emits OTel metrics.\n" +
       "Set GOAL_OTEL_ENDPOINT to a collector URL to push via OTLP/HTTP;\n" +
       "otherwise metrics are printed to stdout in OTLP/JSON form.\n"
   );

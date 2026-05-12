@@ -42,8 +42,8 @@
     "codex": {
       "format": "ndjson",
       "provider": "openai",
-      "spawn": ["codex", "exec", "--json", "--sandbox", "workspace-write", "--cd", "{root}", "-"],
-      "spawn_resume": ["codex", "exec", "resume", "{session_id}", "--json", "--sandbox", "workspace-write", "--cd", "{root}", "-"],
+      "spawn": ["codex", "exec", "--json", "--sandbox", "workspace-write", "-C", "{root}", "-"],
+      "spawn_resume": ["codex", "exec", "--json", "--sandbox", "workspace-write", "-C", "{root}", "resume", "{session_id}", "-"],
       "rate_limit": ["429", "rate ?limit", "too many requests"],
       "server_error": ["5\\d{2}", "internal server error", "service unavailable"]
     }

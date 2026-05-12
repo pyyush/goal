@@ -34,8 +34,8 @@ current_state_file() {
         printf '%s/.claude/goal.json' "$TMP"
     fi
 }
-GOAL_FILE="$TMP/.claude/goal.json"   # initial path; recomputed via current_state_file after step 4
-EVENTS_FILE="$TMP/.claude/goal-events.jsonl"
+GOAL_FILE="$TMP/.goal/state.json"   # canonical v2/v3 path
+EVENTS_FILE="$TMP/.goal/events.jsonl"
 GOALCTL="$REPO_ROOT/bin/goalctl"
 MCP_PKG="$REPO_ROOT/mcp/package.json"
 
@@ -94,7 +94,7 @@ say "tools advertised: create_goal, update_goal, get_goal ✓"
 
 # -------- 4. MCP get_goal sees the goal that goalctl created ----------------
 
-step "4. MCP get_goal reads the same .claude/goal.json that goalctl wrote"
+step "4. MCP get_goal reads the same .goal/state.json that goalctl wrote"
 # GOAL_ROOT exported above is inherited by the node child here.
 GET_OUT=$(printf '%s\n%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
@@ -132,7 +132,7 @@ say "HTTP CRUD round-trip ✓"
 
 # -------- 6. Events: at least one event line per lifecycle transition -------
 
-step "6. goal-events.jsonl: HTTP pause emits goal.paused"
+step "6. events.jsonl: HTTP pause emits goal.paused"
 [ -f "$EVENTS_FILE" ] || { red "FAIL: no events file at $EVENTS_FILE"; exit 6; }
 grep -q 'goal.paused' "$EVENTS_FILE" || { red "FAIL: no goal.paused event"; cat "$EVENTS_FILE"; exit 6; }
 say "events emitted ✓ ($(wc -l <"$EVENTS_FILE") lines)"

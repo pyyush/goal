@@ -5,8 +5,8 @@
 //      its initialize response.
 //   2. After create_goal, the server pushes a boot continuation event and
 //      writes a `goal.continuation_pushed` line with outcome:"sent" to
-//      goal-events.jsonl.
-//   3. While `.claude/goal.pause` exists, a file-watch trigger produces
+//      .goal/events.jsonl.
+//   3. While `.goal/pause` exists, a file-watch trigger produces
 //      outcome:"skipped_paused".
 //   4. After removing the pause file, pushes resume.
 //
@@ -103,7 +103,7 @@ function expect(cond, msg) {
 }
 
 function readEvents() {
-  const file = join(goalRoot, ".claude", "goal-events.jsonl");
+  const file = join(goalRoot, ".goal", "events.jsonl");
   if (!existsSync(file)) return [];
   const raw = readFileSync(file, "utf8").trim();
   if (!raw) return [];
@@ -115,9 +115,9 @@ function readPushEvents() {
 }
 
 function bumpGoalMtime() {
-  // Touch goal.json's mtime so fs.watch fires without changing the content.
+  // Touch state.json's mtime so fs.watch fires without changing the content.
   // Use a future timestamp to be safe against same-second resolution.
-  const file = join(goalRoot, ".claude", "goal.json");
+  const file = join(goalRoot, ".goal", "state.json");
   const t = new Date(Date.now() + 1_000);
   utimesSync(file, t, t);
 }
@@ -144,7 +144,9 @@ async function run() {
   // ── 2) tools/list — sanity check Phase 1 tools still there ────────────
   const list = await rpc("tools/list", {});
   const names = (list.result?.tools ?? []).map((t) => t.name).sort();
-  expect(names.join(",") === "create_goal,get_goal,update_goal", `expected three tools, got ${names.join(",")}`);
+  for (const tool of ["create_goal", "get_goal", "update_goal", "report_progress", "queue_message", "steer_message"]) {
+    expect(names.includes(tool), `tools/list missing ${tool}; got ${names.join(",")}`);
+  }
 
   // ── 3) Create an active goal. ─────────────────────────────────────────
   const created = await rpc("tools/call", {
@@ -186,9 +188,9 @@ async function run() {
     expect(typeof n.params?.meta?.trigger === "string", "channel notification meta.trigger should be a string");
   }
 
-  // ── 5) Touch .claude/goal.pause; trigger a file-watch event; expect a
+  // ── 5) Touch .goal/pause; trigger a file-watch event; expect a
   //       skipped_paused outcome.
-  const pauseFile = join(goalRoot, ".claude", "goal.pause");
+  const pauseFile = join(goalRoot, ".goal", "pause");
   const beforePauseCount = readPushEvents().length;
   closeSync(openSync(pauseFile, "w")); // create empty file
   // Wait past our own push debounce (we set GOAL_CHANNEL_DEBOUNCE_MS=200).

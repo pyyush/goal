@@ -130,6 +130,7 @@ goal_migrate_if_needed() {
         (.status // "pursuing") as $status
         | (.tick_count // 0) as $ticks
         | (.tokens_used // 0) as $tokens
+        | (.pursuing_seconds // 0) as $psecs
         | (.created_at // (now | todateiso8601)) as $created
         | (.updated_at // (now | todateiso8601)) as $updated
         # ended_at: null if still active, else updated_at.
@@ -140,6 +141,12 @@ goal_migrate_if_needed() {
         # Build the v2 object as a strict superset of v1.
         | . + {
             schema_version: 2,
+            time_used_seconds: $psecs,
+            observed_at: $updated,
+            active_turn_started_at: (if $status == "pursuing" then (.pursuing_since // $updated) else null end),
+            tokens_used_observed_at: $updated,
+            time_used_seconds_final: (if $ended == null then null else $psecs end),
+            tokens_used_final: (if $ended == null then null else $tokens end),
             compat: ["claude-code"],
             roles: { lead: null, build: null, review: null },
             current: { agent: null, session: null, since: null },

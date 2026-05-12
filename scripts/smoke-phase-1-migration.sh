@@ -140,56 +140,72 @@ say "lineage[0].summary=$LINEAGE_SUMMARY ✓"
 say "lineage[0].turns=$LINEAGE_TURNS ✓"
 say "lineage[0].tokens=$LINEAGE_TOKENS ✓"
 
-# ---- 8. Assert marker file present ------------------------------------------
+# ---- 8. Assert v3 live-time fields are populated -----------------------------
 
-step "8. Assert .claude/MIGRATED_TO_GOAL marker file present"
-[ -f "$TMP/.claude/MIGRATED_TO_GOAL" ] || {
-    red "FAIL: .claude/MIGRATED_TO_GOAL marker not written"
+step "8. Assert v3 live-time fields populated"
+for field in time_used_seconds observed_at active_turn_started_at tokens_used_observed_at; do
+    VALUE=$(jq -r --arg field "$field" '.[$field] // "missing"' "$TMP/.goal/state.json")
+    [ "$VALUE" != "missing" ] || {
+        red "FAIL: migrated state missing $field"
+        exit 6
+    }
+done
+[ "$(jq -r '.time_used_seconds' "$TMP/.goal/state.json")" = "120" ] || {
+    red "FAIL: time_used_seconds should preserve pursuing_seconds=120"
     exit 6
 }
+say "v3 live-time fields present ✓"
+
+# ---- 9. Assert marker file present ------------------------------------------
+
+step "9. Assert .claude/MIGRATED_TO_GOAL marker file present"
+[ -f "$TMP/.claude/MIGRATED_TO_GOAL" ] || {
+    red "FAIL: .claude/MIGRATED_TO_GOAL marker not written"
+    exit 7
+}
 MARKER_CONTENT=$(cat "$TMP/.claude/MIGRATED_TO_GOAL")
-[ -n "$MARKER_CONTENT" ] || { red "FAIL: marker file is empty"; exit 6; }
+[ -n "$MARKER_CONTENT" ] || { red "FAIL: marker file is empty"; exit 7; }
 say "marker file: $MARKER_CONTENT ✓"
 
-# ---- 9. Assert .claude/goal.json still present (v1 compat) ------------------
+# ---- 10. Assert .claude/goal.json still present (v1 compat) -----------------
 
-step "9. Assert .claude/goal.json still in place (v1 compat)"
+step "10. Assert .claude/goal.json still in place (v1 compat)"
 [ -f "$TMP/.claude/goal.json" ] || {
     red "FAIL: .claude/goal.json was deleted after migration (must be kept per §12)"
-    exit 7
+    exit 8
 }
 say ".claude/goal.json still present ✓"
 
-# ---- 10. goalctl status reads v2 file correctly ----------------------------
+# ---- 11. goalctl status reads v2 file correctly -----------------------------
 
-step "10. goalctl status reads v2 goal correctly"
+step "11. goalctl status reads v2 goal correctly"
 STATUS_JSON=$("$GOALCTL" --root "$TMP" status --json)
 OBJ=$(printf '%s' "$STATUS_JSON" | jq -r '.objective // "missing"')
 STAT=$(printf '%s' "$STATUS_JSON" | jq -r '.status // "missing"')
 [ "$OBJ" = "migration smoke test objective" ] || {
     red "FAIL: status --json objective mismatch: '$OBJ'"
-    exit 8
+    exit 9
 }
 [ "$STAT" = "pursuing" ] || {
     red "FAIL: status --json status mismatch: '$STAT'"
-    exit 8
+    exit 9
 }
 say "status --json objective='$OBJ' ✓"
 say "status --json status='$STAT' ✓"
 
-# ---- 11. goal_id preserved across migration ---------------------------------
+# ---- 12. goal_id preserved across migration ---------------------------------
 
-step "11. Assert goal_id preserved after migration"
+step "12. Assert goal_id preserved after migration"
 MIGRATED_ID=$(jq -r '.goal_id' "$TMP/.goal/state.json")
 [ "$MIGRATED_ID" = "$V1_ID" ] || {
     red "FAIL: goal_id changed during migration (expected $V1_ID, got $MIGRATED_ID)"
-    exit 9
+    exit 10
 }
 say "goal_id=$MIGRATED_ID (preserved) ✓"
 
-# ---- 12. GOAL_DISABLE_MIGRATION=1 escape hatch ------------------------------
+# ---- 13. GOAL_DISABLE_MIGRATION=1 escape hatch ------------------------------
 
-step "12. Test GOAL_DISABLE_MIGRATION=1 escape hatch"
+step "13. Test GOAL_DISABLE_MIGRATION=1 escape hatch"
 TMP2=$(mktemp -d -t goal-migrate-smoke-disable-XXXXXX)
 trap 'rm -rf "$TMP" "$TMP2"' EXIT
 mkdir -p "$TMP2/.claude"
@@ -213,17 +229,17 @@ FIXTURE2
 
 GOAL_DISABLE_MIGRATION=1 "$GOALCTL" --root "$TMP2" status --json >/dev/null || {
     red "FAIL: goalctl status failed with GOAL_DISABLE_MIGRATION=1"
-    exit 10
+    exit 11
 }
 if [ -d "$TMP2/.goal" ]; then
     red "FAIL: GOAL_DISABLE_MIGRATION=1 should have prevented .goal/ creation"
-    exit 10
+    exit 11
 fi
 say "GOAL_DISABLE_MIGRATION=1: .goal/ not created ✓"
 
-# ---- 13. MCP server sees v2 state after migration ---------------------------
+# ---- 14. MCP server sees v2 state after migration ---------------------------
 
-step "13. MCP server reads v2 state (tools/list + get_goal)"
+step "14. MCP server reads v2 state (tools/list + get_goal)"
 export GOAL_ROOT="$TMP"
 MCP_OUT=$(
   printf '%s\n%s\n' \
@@ -235,7 +251,7 @@ MCP_OUT=$(
 printf '%s' "$MCP_OUT" | grep -q "migration smoke test objective" || {
     red "FAIL: MCP get_goal didn't return the migrated objective"
     printf '%s\n' "$MCP_OUT" | head -20
-    exit 11
+    exit 12
 }
 say "MCP get_goal reads migrated v2 state ✓"
 

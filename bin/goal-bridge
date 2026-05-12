@@ -134,9 +134,10 @@ const AGENTS_DIR    = join(GOAL_DIR, 'agents');
 const HANDOFF_DIR   = join(GOAL_DIR, 'handoff');
 const QUOTA_FILE    = join(GOAL_DIR, 'quota.json');
 const RELAY_LOG     = join(GOAL_DIR, 'relay-log.jsonl');
+const COWORK_FILE    = join(GOAL_DIR, 'cowork.yml');
 const PAUSE_FILE    = join(GOAL_DIR, 'pause');
 const LOG_FILE      = join(ROOT, '.claude', 'goal-hook.log');
-const EVENTS_FILE   = join(ROOT, '.claude', 'goal-events.jsonl');
+const EVENTS_FILE   = join(GOAL_DIR, 'events.jsonl');
 
 // Agent ID: <runner>-<host>-<pid> per spec §5.7
 const AGENT_ID      = `${RUNNER}-${hostname().replace(/[^a-zA-Z0-9-]/g, '-')}-${process.pid}`;
@@ -174,6 +175,7 @@ let baseResumeCmd = runnerConfig.spawn_resume || runnerConfig.spawn;
 
 const rateLimitPatterns   = (runnerConfig.rate_limit   || []).map(p => new RegExp(p, 'i'));
 const serverErrorPatterns = (runnerConfig.server_error || []).map(p => new RegExp(p, 'i'));
+const externalFaultEventTypes = new Set(['goalctl_relay', 'mcp_relay_now']);
 
 function matchesPatterns(text, patterns) {
   return patterns.some(p => p.test(text));
@@ -213,7 +215,7 @@ function atomicWrite(filePath, content) {
 
 function appendEvent(event) {
   try {
-    mkdirSync(join(ROOT, '.claude'), { recursive: true });
+    mkdirSync(dirname(EVENTS_FILE), { recursive: true });
     appendFileSync(EVENTS_FILE, JSON.stringify(event) + '\n');
   } catch (_) {}
 }
@@ -332,6 +334,38 @@ function writeFault(kind, payload, eventType = 'stderr') {
   );
 }
 
+function consumeExternalFaultIfPresent() {
+  if (exiting || !existsSync(FAULT_FILE)) return;
+
+  let fault;
+  try {
+    fault = JSON.parse(readFileSync(FAULT_FILE, 'utf8'));
+  } catch (e) {
+    bridgeLog('external-fault-read-failed', e.message);
+    return;
+  }
+
+  if (!externalFaultEventTypes.has(String(fault.event_type || ''))) return;
+
+  const state = readState();
+  if (!state || state.current?.agent !== AGENT_ID) return;
+  if (state.status !== 'pursuing' && state.status !== 'relaying') return;
+
+  try { unlinkSync(FAULT_FILE); } catch (_) {}
+
+  const requestedReason = typeof fault.reason === 'string' ? fault.reason : '';
+  let reason = requestedReason || 'user';
+  if (fault.kind === 'rate_limit') {
+    reason = 'rate_limit';
+    onRateLimit(RUNNER_PROVIDER, fault.payload || reason);
+  } else if (fault.kind === 'server_error') {
+    reason = 'error';
+  }
+
+  bridgeLog('external-fault-consumed', `kind=${fault.kind || 'other'} reason=${reason}`);
+  initiateRelay(reason, fault.payload || 'external relay request');
+}
+
 // ---- quota.json management --------------------------------------------------
 
 function readOrInitQuota() {
@@ -403,31 +437,49 @@ function onRateLimit(provider, eventPayload) {
 
 // ---- peer discovery (solo-mode fallback for P3) ----------------------------
 //
-// In P3, cowork.yml doesn't exist yet. Peer is: the OTHER runner in patterns.json.
-// If current runner is codex, peer is claude-code and vice versa.
-// If only one runner configured, no peer exists → stay solo.
-
-function getPeerAgent(state) {
-  // If cowork.yml had peers we'd read them here. For P3: pattern-based fallback.
-  const allRunners = Object.keys(patternsDoc.runners || {});
-  const peers = allRunners.filter(r => r !== RUNNER);
-  if (peers.length === 0) return null;
-  // Pick the first peer. In P5, this comes from cowork.yml roles.
-  const peerRunner = peers[0];
-  // Peer agent_id format: <runner>-<any-host>-<any-pid>
-  // We can't know the peer's PID. Instead, check state.roles or lineage for a
-  // known agent. If none found, return a placeholder that the peer will recognize
-  // when it starts its own bridge.
-  // For T4/T5 tests: the test sets up state.current.agent explicitly, and the
-  // peer mock bridge has a known agent_id set via MOCK_AGENT_ID env var.
-  const mockPeerAgent = process.env[`GOAL_BRIDGE_PEER_AGENT_${peerRunner.toUpperCase().replace(/-/g, '_')}`];
-  if (mockPeerAgent) return mockPeerAgent;
-  // In real cowork, you'd look at .goal/agents/ for a live heartbeat.
-  // P3 fallback: scan agents dir for a heartbeat file matching the peer runner.
+function loadCoworkConfig() {
+  if (!existsSync(COWORK_FILE)) return null;
+  const cfg = { agents: {}, roles: {} };
+  let section = null;
+  let currentAgent = null;
   try {
-    const agentFiles = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json') && f.startsWith(peerRunner + '-'));
+    const lines = readFileSync(COWORK_FILE, 'utf8').split(/\r?\n/);
+    for (const raw of lines) {
+      const line = raw.replace(/#.*/, '').replace(/[ \t]+$/, '');
+      if (!line.trim()) continue;
+      if (/^agents:\s*$/.test(line)) { section = 'agents'; currentAgent = null; continue; }
+      if (/^roles:\s*$/.test(line)) { section = 'roles'; currentAgent = null; continue; }
+      if (/^[A-Za-z0-9_-]+:\s*$/.test(line)) { section = null; currentAgent = null; continue; }
+
+      if (section === 'agents') {
+        const agentMatch = line.match(/^  ([A-Za-z0-9_-]+):\s*$/);
+        if (agentMatch) {
+          currentAgent = agentMatch[1];
+          cfg.agents[currentAgent] = cfg.agents[currentAgent] || {};
+          continue;
+        }
+        const runnerMatch = line.match(/^    runner:\s*([A-Za-z0-9_-]+)\s*$/);
+        if (runnerMatch && currentAgent) {
+          cfg.agents[currentAgent].runner = runnerMatch[1];
+        }
+      } else if (section === 'roles') {
+        const roleMatch = line.match(/^  (lead|build|review):\s*([A-Za-z0-9_-]+)\s*$/);
+        if (roleMatch) cfg.roles[roleMatch[1]] = roleMatch[2];
+      }
+    }
+  } catch (e) {
+    bridgeLog('cowork-yml-read-failed', e.message);
+    return null;
+  }
+  return cfg;
+}
+
+function findLiveAgentByRunner(runnerName) {
+  const mockPeerAgent = process.env[`GOAL_BRIDGE_PEER_AGENT_${runnerName.toUpperCase().replace(/-/g, '_')}`];
+  if (mockPeerAgent) return mockPeerAgent;
+  try {
+    const agentFiles = readdirSync(AGENTS_DIR).filter(f => f.endsWith('.json') && f.startsWith(runnerName + '-'));
     if (agentFiles.length > 0) {
-      // Pick the most recently written one.
       let newest = null;
       let newestMtime = 0;
       for (const f of agentFiles) {
@@ -440,6 +492,42 @@ function getPeerAgent(state) {
     }
   } catch (_) {}
   return null;
+}
+
+function getCoworkPeerRunner() {
+  const cfg = loadCoworkConfig();
+  if (!cfg) return null;
+
+  const roleOrder = ['lead', 'build', 'review'];
+  for (const role of roleOrder) {
+    const agentName = cfg.roles[role];
+    const runnerName = agentName ? cfg.agents[agentName]?.runner : null;
+    if (runnerName && runnerName !== RUNNER) return runnerName;
+  }
+
+  for (const agent of Object.values(cfg.agents)) {
+    if (agent.runner && agent.runner !== RUNNER) return agent.runner;
+  }
+
+  return null;
+}
+
+function getPeerAgent(state) {
+  const configuredPeerRunner = getCoworkPeerRunner();
+  if (configuredPeerRunner) {
+    const configuredPeer = findLiveAgentByRunner(configuredPeerRunner);
+    if (configuredPeer) return configuredPeer;
+    bridgeLog('peer-configured-not-live', `runner=${configuredPeerRunner}`);
+    return null;
+  }
+
+  // Solo fallback: the OTHER runner in patterns.json.
+  const allRunners = Object.keys(patternsDoc.runners || {});
+  const peers = allRunners.filter(r => r !== RUNNER);
+  if (peers.length === 0) return null;
+  // Pick the first peer only when no cowork.yml role contract exists.
+  const peerRunner = peers[0];
+  return findLiveAgentByRunner(peerRunner);
 }
 
 function getPeerProvider(peerAgentId) {
@@ -1235,6 +1323,37 @@ function appendContinuation(stateObj) {
   }
 }
 
+function completeLineRelayPickup(state) {
+  const relayStartTs = state.current?.since;
+  if (acquireBridgeLock()) {
+    try {
+      const resumeTs = now();
+      atomicUpdateState(s => {
+        if (s.status !== 'relaying' || s.current?.agent !== AGENT_ID) return null;
+        return {
+          ...s,
+          status: 'pursuing',
+          history: [...(s.history || []), {
+            ts: resumeTs,
+            action: 'relay-completed',
+            note: `line-mode peer ${AGENT_ID} accepted handoff`,
+          }],
+        };
+      });
+      if (relayStartTs) {
+        appendEvent({
+          ts: resumeTs,
+          type: 'goal.relay.recovery_seconds',
+          goal_id: state.goal_id,
+          recovery_seconds: Math.round((Date.parse(resumeTs) - Date.parse(relayStartTs)) / 1000),
+        });
+      }
+    } finally {
+      releaseBridgeLock();
+    }
+  }
+}
+
 // ---- B1: watch .goal/ for state.json changes --------------------------------
 
 let debounceTimer = null;
@@ -1271,9 +1390,13 @@ function onStateChange() {
       }
     }
   } else {
-    // line mode: continuation only when pursuing AND current agent is this bridge.
+    // line mode: continuation when pursuing, and relay pickup when relaying.
     if (state.status === 'pursuing' && state.current?.agent === AGENT_ID) {
       appendContinuation(state);
+    } else if (state.status === 'relaying' && state.current?.agent === AGENT_ID) {
+      bridgeLog('relay-pickup-line', `handoff_head=${state.handoff_head}`);
+      appendContinuation(state);
+      completeLineRelayPickup(state);
     }
   }
 }
@@ -1287,6 +1410,28 @@ function scheduleStateCheck() {
 }
 
 let watcherInstance = null;
+let pollerInstance = null;
+let lastStateMtimeMs = 0;
+
+function pollStateFile() {
+  if (exiting) return;
+  try {
+    const mtimeMs = statSync(STATE_FILE).mtimeMs;
+    if (mtimeMs !== lastStateMtimeMs) {
+      lastStateMtimeMs = mtimeMs;
+      scheduleStateCheck();
+    }
+  } catch (_) {
+    // State may not exist yet; bridge startup is allowed before goal create.
+  }
+}
+
+function startPollingFallback() {
+  if (pollerInstance) return;
+  pollStateFile();
+  pollerInstance = setInterval(pollStateFile, 500);
+  bridgeLog('watcher-polling-started', STATE_FILE);
+}
 
 function startWatcher() {
   if (exiting) return;
@@ -1305,12 +1450,13 @@ function startWatcher() {
       bridgeLog('watcher-error', e.message);
       try { watcherInstance.close(); } catch (_) {}
       watcherInstance = null;
-      setTimeout(startWatcher, 1000);
+      startPollingFallback();
     });
     bridgeLog('watcher-started', GOAL_DIR);
+    startPollingFallback();
   } catch (e) {
     bridgeLog('watcher-start-failed', e.message);
-    setTimeout(startWatcher, 2000);
+    startPollingFallback();
   }
 }
 
@@ -1380,6 +1526,7 @@ function spawnLineRunner() {
 // ---- B5: pause kill switch polling ------------------------------------------
 
 let pauseCheckInterval = null;
+let externalFaultCheckInterval = null;
 
 function checkPause() {
   if (existsSync(PAUSE_FILE)) {
@@ -1400,9 +1547,11 @@ function exitCleanly(finalStatus = 'stopped') {
 
   if (heartbeatInterval) clearInterval(heartbeatInterval);
   if (pauseCheckInterval) clearInterval(pauseCheckInterval);
+  if (externalFaultCheckInterval) clearInterval(externalFaultCheckInterval);
   if (debounceTimer) clearTimeout(debounceTimer);
   if (queuedPollTimer) clearTimeout(queuedPollTimer);
   if (watcherInstance) { try { watcherInstance.close(); } catch (_) {} }
+  if (pollerInstance) clearInterval(pollerInstance);
 
   writeHeartbeat({ status: finalStatus });
   bridgeLog('exit', `finalStatus=${finalStatus}`);
@@ -1473,3 +1622,9 @@ if (RUNNER_FORMAT === 'line') {
 // B5: check pause immediately, then poll.
 checkPause();
 pauseCheckInterval = setInterval(checkPause, 500);
+
+// External relay requests are written as .goal/agents/<agent>.fault by
+// goalctl relay and mcp__goal__relay_now. Polling keeps this filesystem-only
+// and avoids platform-specific watcher gaps on atomic rename.
+consumeExternalFaultIfPresent();
+externalFaultCheckInterval = setInterval(consumeExternalFaultIfPresent, 500);

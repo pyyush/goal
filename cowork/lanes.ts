@@ -52,7 +52,7 @@ export interface LanesFile {
   leases: LaneLease[];
 }
 
-export interface ClaimLaneResult {
+export type ClaimLaneResult = {
   ok: true;
   lease_id: string;
 } | {

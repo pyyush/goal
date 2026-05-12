@@ -7,10 +7,10 @@
  *   - update_goal(status: "complete")     // asymmetric, model can only mark done
  *   - get_goal()                          // computed remaining_tokens, elapsed_seconds
  *
- * State of record: `.claude/goal.json` at the goal root, shared with hooks &
+ * State of record: `.goal/state.json` at the goal root, shared with hooks &
  * `bin/goalctl`. Writes are atomic (tmp + rename), serialized by proper-lockfile,
  * and CAS-guarded on `goal_id`. Lifecycle transitions append a JSONL event to
- * `.claude/goal-events.jsonl`.
+ * `.goal/events.jsonl`.
  *
  * Logging policy: stdout is the MCP transport. All diagnostics MUST go to stderr.
  */
@@ -356,6 +356,12 @@ interface GoalState {
   audit?: { checklist: Array<{ id: string; predicate: string; status: string; evidence: string | null }> } | null;
   handoff_head?: string | null;
   queued_until?: string | null;
+  time_used_seconds?: number;
+  observed_at?: string;
+  active_turn_started_at?: string | null;
+  tokens_used_observed_at?: string;
+  time_used_seconds_final?: number | null;
+  tokens_used_final?: number | null;
 }
 
 interface GoalView extends GoalState {
@@ -509,7 +515,7 @@ interface GoalPaths {
   root: string;
   claudeDir: string;
   goalDir: string;           // .goal/ — v2 state directory
-  goalFile: string;          // .goal/state.json (v2) or .claude/goal.json (v1)
+  goalFile: string;          // .goal/state.json (v2) or .claude/goal.json when migration disabled
   v1GoalFile: string;        // always .claude/goal.json (migration source)
   eventsFile: string;
   baselineGlobPrefix: string;
@@ -519,24 +525,17 @@ interface GoalPaths {
 function pathsFor(root: string): GoalPaths {
   const claudeDir = join(root, ".claude");
   const goalDir = join(root, ".goal");
-  // Prefer v2 path if .goal/ exists; otherwise fall back to v1.
+  // Prefer v2 path for both fresh and migrated goals.
   // When GOAL_DISABLE_MIGRATION is set, always use v1.
   const disableMigration = process.env.GOAL_DISABLE_MIGRATION === "1";
-  let useV2 = false;
-  if (!disableMigration) {
-    try {
-      useV2 = lstatSync(goalDir).isDirectory();
-    } catch {
-      useV2 = false;
-    }
-  }
+  const useV2 = !disableMigration;
   return {
     root,
     claudeDir,
     goalDir,
     goalFile: useV2 ? join(goalDir, "state.json") : join(claudeDir, "goal.json"),
     v1GoalFile: join(claudeDir, "goal.json"),
-    eventsFile: join(claudeDir, "goal-events.jsonl"),
+    eventsFile: join(goalDir, "events.jsonl"),
     baselineGlobPrefix: "goal-baseline-",
     markerFile: join(claudeDir, "MIGRATED_TO_GOAL"),
   };
@@ -619,6 +618,12 @@ async function migrateIfNeeded(paths: GoalPaths): Promise<void> {
         status: (VALID_STATUSES.includes(v1Status as GoalStatus) ? v1Status : "pursuing") as GoalStatus,
         created_at: v1Created,
         updated_at: v1Updated,
+        time_used_seconds: typeof v1.pursuing_seconds === "number" ? v1.pursuing_seconds : 0,
+        observed_at: v1Updated,
+        active_turn_started_at: v1Status === "pursuing" ? (typeof v1.pursuing_since === "string" ? v1.pursuing_since : v1Updated) : null,
+        tokens_used_observed_at: v1Updated,
+        time_used_seconds_final: isActive ? null : (typeof v1.pursuing_seconds === "number" ? v1.pursuing_seconds : null),
+        tokens_used_final: isActive ? null : v1Tokens,
         token_budget: (typeof v1.token_budget === "number" ? v1.token_budget : null),
         tokens_used: v1Tokens,
         tick_count: v1Ticks,
@@ -875,6 +880,17 @@ function validateStateV2(obj: unknown): void {
       }
     }
   }
+
+  for (const k of ["time_used_seconds", "tokens_used", "tokens_used_final", "time_used_seconds_final"] as const) {
+    if (v[k] !== undefined && v[k] !== null && typeof v[k] !== "number") {
+      throw new ToolError("io_error", `state.json: ${k} must be number or null`);
+    }
+  }
+  for (const k of ["observed_at", "active_turn_started_at", "tokens_used_observed_at"] as const) {
+    if (v[k] !== undefined && v[k] !== null && typeof v[k] !== "string") {
+      throw new ToolError("io_error", `state.json: ${k} must be string or null`);
+    }
+  }
 }
 
 function validateGoalState(value: unknown): GoalState {
@@ -925,6 +941,12 @@ function validateGoalState(value: unknown): GoalState {
   const audit = (v.audit !== undefined) ? (v.audit as GoalState["audit"]) : undefined;
   const handoff_head = (v.handoff_head !== undefined) ? (v.handoff_head as string | null) : undefined;
   const queued_until = (v.queued_until !== undefined) ? (v.queued_until as string | null) : undefined;
+  const time_used_seconds = typeof v.time_used_seconds === "number" ? v.time_used_seconds : undefined;
+  const observed_at = typeof v.observed_at === "string" ? v.observed_at : undefined;
+  const active_turn_started_at = (v.active_turn_started_at !== undefined) ? (v.active_turn_started_at as string | null) : undefined;
+  const tokens_used_observed_at = typeof v.tokens_used_observed_at === "string" ? v.tokens_used_observed_at : undefined;
+  const time_used_seconds_final = (v.time_used_seconds_final !== undefined) ? (v.time_used_seconds_final as number | null) : undefined;
+  const tokens_used_final = (v.tokens_used_final !== undefined) ? (v.tokens_used_final as number | null) : undefined;
   return {
     ...(schema_version !== undefined ? { schema_version } : {}),
     goal_id: v.goal_id as string,
@@ -946,6 +968,12 @@ function validateGoalState(value: unknown): GoalState {
     ...(audit !== undefined ? { audit } : {}),
     ...(handoff_head !== undefined ? { handoff_head } : {}),
     ...(queued_until !== undefined ? { queued_until } : {}),
+    ...(time_used_seconds !== undefined ? { time_used_seconds } : {}),
+    ...(observed_at !== undefined ? { observed_at } : {}),
+    ...(active_turn_started_at !== undefined ? { active_turn_started_at } : {}),
+    ...(tokens_used_observed_at !== undefined ? { tokens_used_observed_at } : {}),
+    ...(time_used_seconds_final !== undefined ? { time_used_seconds_final } : {}),
+    ...(tokens_used_final !== undefined ? { tokens_used_final } : {}),
   };
 }
 
@@ -966,6 +994,21 @@ function makeView(state: GoalState): GoalView {
     }
   }
   return { ...state, remaining_tokens: remaining, elapsed_seconds: elapsed };
+}
+
+function liveGoalSeconds(state: GoalState): number {
+  if ((state.status === "achieved" || state.status === "unmet" || state.status === "budget-limited") && state.time_used_seconds_final != null) {
+    return state.time_used_seconds_final;
+  }
+  let elapsed = state.time_used_seconds ?? state.pursuing_seconds ?? 0;
+  if (state.status === "pursuing") {
+    const observedMs = Date.parse(state.observed_at ?? state.updated_at ?? state.created_at);
+    const activeMs = state.active_turn_started_at ? Date.parse(state.active_turn_started_at) : observedMs;
+    const start = Math.max(Number.isFinite(observedMs) ? observedMs : Date.now(), Number.isFinite(activeMs) ? activeMs : 0);
+    const delta = Math.floor((Date.now() - start) / 1000);
+    if (delta > 0) elapsed += delta;
+  }
+  return Math.max(0, Math.floor(elapsed));
 }
 
 interface GoalEvent {
@@ -1111,15 +1154,23 @@ async function toolCreateGoal(args: unknown): Promise<GoalView> {
     const action = existing ? "replace" : "create";
     // Determine if we're writing a v2 file.
     const isV2 = paths.goalFile.endsWith("state.json");
-    const state: GoalState = {
-      ...(isV2 ? { schema_version: 2 as const } : {}),
-      goal_id: newId,
-      objective,
-      status: "pursuing",
-      created_at: ts,
-      updated_at: ts,
-      token_budget,
-      tokens_used: 0,
+      const state: GoalState = {
+        ...(isV2 ? { schema_version: 2 as const } : {}),
+        goal_id: newId,
+        objective,
+        status: "pursuing",
+        created_at: ts,
+        updated_at: ts,
+        ...(isV2 ? {
+          time_used_seconds: 0,
+          observed_at: ts,
+          active_turn_started_at: ts,
+          tokens_used_observed_at: ts,
+          time_used_seconds_final: null,
+          tokens_used_final: null,
+        } : {}),
+        token_budget,
+        tokens_used: 0,
       tick_count: 0,
       pursuing_seconds: 0,
       pursuing_since: ts,
@@ -1203,6 +1254,11 @@ async function toolUpdateGoal(args: unknown): Promise<GoalView & { final_report:
       ...fresh,
       status: "achieved",
       updated_at: ts,
+      time_used_seconds: liveGoalSeconds(fresh),
+      observed_at: ts,
+      active_turn_started_at: null,
+      time_used_seconds_final: liveGoalSeconds(fresh),
+      tokens_used_final: fresh.tokens_used,
       pursuing_seconds: newPursuingSeconds,
       pursuing_since: null,
       history: [
@@ -1568,6 +1624,7 @@ async function toolRelayNow(args: unknown): Promise<{ ok: boolean; handoff_seq: 
   const faultFile = join(goalDir, "agents", `${currentAgent}.fault`);
   const faultData = JSON.stringify({
     kind: reason === "rate_limit" ? "rate_limit" : "other",
+    reason,
     at: nowIso(),
     payload: `relay_now: ${reason}`,
     event_type: "mcp_relay_now",
@@ -1603,6 +1660,187 @@ async function toolRelayNow(args: unknown): Promise<{ ok: boolean; handoff_seq: 
   }
 
   return { ok: true, handoff_seq: handoffSeq };
+}
+
+// ── v3 progress / breadcrumb / routing tools ────────────────────────────────
+
+function appendBreadcrumb(goalDir: string, entry: Record<string, unknown>): number {
+  const file = join(goalDir, "breadcrumbs.jsonl");
+  let seq = 1;
+  try {
+    const lines = readFileSync(file, "utf8").trim().split(/\n/).filter(Boolean);
+    const last = lines.length ? JSON.parse(lines[lines.length - 1]) : null;
+    seq = Number(last?.seq ?? 0) + 1;
+  } catch (_) { /* first breadcrumb */ }
+  appendFileSync(file, JSON.stringify({ seq, at: nowIso(), ...entry }) + "\n", "utf8");
+  return seq;
+}
+
+function jaccard(a: string, b: string): number {
+  const toks = (s: string) => new Set(s.toLowerCase().split(/[^a-z0-9_/-]+/).filter(Boolean));
+  const A = toks(a), B = toks(b);
+  const union = new Set([...A, ...B]);
+  if (union.size === 0) return 0;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  return inter / union.size;
+}
+
+function composePreamble(paths: GoalPaths, state: GoalState, antiLoopNote = ""): void {
+  const goalDir = paths.goalDir;
+  const list = state.audit?.checklist ?? [];
+  const counts = {
+    open: list.filter((i) => i.status === "open").length,
+    passed: list.filter((i) => i.status === "passed").length,
+    failed: list.filter((i) => i.status === "failed").length,
+  };
+  const handoffDir = join(goalDir, "handoff");
+  const handoffs = (() => {
+    try {
+      return readdirSync(handoffDir).filter((f) => /^\d{4}\.md$/.test(f)).sort().slice(-3).reverse()
+        .map((f) => readFileSync(join(handoffDir, f), "utf8").slice(0, 1200));
+    } catch (_) { return []; }
+  })();
+  const breadcrumbs = (() => {
+    try { return readFileSync(join(goalDir, "breadcrumbs.jsonl"), "utf8").trim().split(/\n/).filter(Boolean).slice(-8); }
+    catch (_) { return []; }
+  })();
+  const lanes = (() => {
+    try { return readFileSync(join(goalDir, "lanes.json"), "utf8").slice(0, 1500); }
+    catch (_) { return '{"leases":[]}'; }
+  })();
+  const body = [
+    "## Objective",
+    `<untrusted_objective>${state.objective}</untrusted_objective>`,
+    "",
+    "## Audit",
+    `open=${counts.open} passed=${counts.passed} failed=${counts.failed}`,
+    ...list.map((i) => `- ${i.id}: ${i.status} — ${i.predicate}${i.evidence ? ` (${i.evidence})` : ""}`),
+    "",
+    "## Recent Handoffs",
+    ...handoffs,
+    "",
+    "## Breadcrumbs",
+    ...breadcrumbs,
+    antiLoopNote ? `\n${antiLoopNote}` : "",
+    "",
+    "## Lane Leases",
+    lanes,
+    "",
+    "## Remaining Budget",
+    state.token_budget ? `${Math.max(0, state.token_budget - state.tokens_used)} tokens` : "unbounded",
+    "",
+    "## Role",
+    JSON.stringify(state.roles ?? {}),
+  ].join("\n");
+  const capped = body.split(/\s+/).slice(0, 1500).join(" ") + "\n";
+  writeFileSync(join(goalDir, "preamble.md"), capped, "utf8");
+}
+
+function validateProgressArgs(args: unknown): { audit_item_id: string; status: "passed" | "failed"; evidence_ref: string } {
+  const obj = asObject(args ?? {});
+  if (typeof obj.audit_item_id !== "string" || !obj.audit_item_id) throw new ToolError("invalid_input", "audit_item_id is required");
+  if (obj.status !== "passed" && obj.status !== "failed") throw new ToolError("invalid_input", "status must be passed or failed");
+  if (typeof obj.evidence_ref !== "string" || !obj.evidence_ref) throw new ToolError("invalid_input", "evidence_ref is required");
+  return { audit_item_id: obj.audit_item_id, status: obj.status, evidence_ref: obj.evidence_ref };
+}
+
+async function toolReportProgress(args: unknown): Promise<{ ok: true }> {
+  const p = validateProgressArgs(args);
+  const discovered = discoverExistingGoalRoot();
+  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
+  const paths = await resolvePathsWithMigration(discovered.root);
+  return await withGoalLock(paths, () => {
+    const s = readGoalState(paths);
+    if (!s) throw new ToolError("no_active_goal", "no active goal found");
+    const checklist = s.audit?.checklist ?? [];
+    const next = checklist.some((i) => i.id === p.audit_item_id)
+      ? checklist.map((i) => i.id === p.audit_item_id ? { ...i, status: p.status, evidence: p.evidence_ref } : i)
+      : [...checklist, { id: p.audit_item_id, predicate: p.evidence_ref, status: p.status, evidence: p.evidence_ref }];
+    const updated = { ...s, audit: { checklist: next }, updated_at: nowIso() };
+    atomicWriteStateV2(paths.goalFile, updated);
+    appendEvent(paths, { ts: nowIso(), type: `goal.audit.${p.status}`, goal_id: s.goal_id, audit_item_id: p.audit_item_id, evidence_ref: p.evidence_ref });
+    composePreamble(paths, updated);
+    return { ok: true };
+  });
+}
+
+async function toolRecordBreadcrumb(args: unknown): Promise<{ ok: true; seq: number }> {
+  const obj = asObject(args ?? {});
+  for (const k of ["audit_item", "approach", "outcome", "evidence_ref"] as const) {
+    if (typeof obj[k] !== "string" || !(obj[k] as string).trim()) throw new ToolError("invalid_input", `${k} is required`);
+  }
+  const discovered = discoverExistingGoalRoot();
+  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
+  const paths = await resolvePathsWithMigration(discovered.root);
+  return await withGoalLock(paths, () => {
+    const s = readGoalState(paths);
+    if (!s) throw new ToolError("no_active_goal", "no active goal found");
+    const seq = appendBreadcrumb(paths.goalDir, { agent: s.current?.agent ?? "model", audit_item: obj.audit_item, approach: obj.approach, outcome: obj.outcome, evidence_ref: obj.evidence_ref });
+    let note = "";
+    try {
+      const rows = readFileSync(join(paths.goalDir, "breadcrumbs.jsonl"), "utf8").trim().split(/\n/).filter(Boolean).map((l) => JSON.parse(l));
+      const last = rows.filter((r) => r.audit_item === obj.audit_item).slice(-3);
+      if (last.length === 3 && jaccard(String(last[0].approach), String(last[1].approach)) > 0.7 && jaccard(String(last[1].approach), String(last[2].approach)) > 0.7) {
+        note = "You've tried similar approaches 3 times. Consider a different angle, or call mcp__goal__report_stuck to surface this.";
+      }
+    } catch (_) { /* best effort */ }
+    composePreamble(paths, s, note);
+    return { ok: true, seq };
+  });
+}
+
+async function toolReportStuck(args: unknown): Promise<{ ok: true; escalation: string }> {
+  const obj = asObject(args ?? {});
+  if (typeof obj.audit_item_id !== "string" || !obj.audit_item_id) throw new ToolError("invalid_input", "audit_item_id is required");
+  if (typeof obj.reason !== "string" || !obj.reason) throw new ToolError("invalid_input", "reason is required");
+  const attempts = typeof obj.attempts === "number" ? obj.attempts : parseInt(String(obj.attempts ?? "1"), 10);
+  const discovered = discoverExistingGoalRoot();
+  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
+  const paths = await resolvePathsWithMigration(discovered.root);
+  return await withGoalLock(paths, () => {
+    const s = readGoalState(paths);
+    if (!s) throw new ToolError("no_active_goal", "no active goal found");
+    appendFileSync(join(paths.goalDir, "escalations.md"), `\n## ${nowIso()} ${obj.audit_item_id}\n${obj.reason}\nattempts=${attempts}\n`, "utf8");
+    const escalation = attempts >= 5 ? "paused" : "try_peer";
+    const updated = attempts >= 5 ? { ...s, status: "paused" as GoalStatus, updated_at: nowIso(), active_turn_started_at: null } : { ...s, updated_at: nowIso() };
+    atomicWriteStateV2(paths.goalFile, updated);
+    appendEvent(paths, { ts: nowIso(), type: "goal.audit.stuck", goal_id: s.goal_id, audit_item_id: obj.audit_item_id, attempts, escalation });
+    composePreamble(paths, updated);
+    return { ok: true, escalation };
+  });
+}
+
+function validateMessageArgs(args: unknown): { text: string; session_id: string } {
+  const obj = asObject(args ?? {});
+  if (typeof obj.text !== "string" || !obj.text.trim()) throw new ToolError("invalid_input", "text is required");
+  if (typeof obj.session_id !== "string" || !obj.session_id.trim()) throw new ToolError("invalid_input", "session_id is required");
+  return { text: obj.text, session_id: obj.session_id };
+}
+
+async function toolQueueMessage(args: unknown): Promise<{ ok: true; position: number }> {
+  const m = validateMessageArgs(args);
+  const goalDir = await resolveGoalDir();
+  const file = join(goalDir, "queue", `${m.session_id}.jsonl`);
+  mkdirSync(dirname(file), { recursive: true });
+  let position = 1;
+  try { position = readFileSync(file, "utf8").trim().split(/\n/).filter(Boolean).length + 1; } catch (_) {}
+  appendFileSync(file, JSON.stringify({ at: nowIso(), text: m.text, session_id: m.session_id }) + "\n", "utf8");
+  return { ok: true, position };
+}
+
+async function toolSteerMessage(args: unknown): Promise<{ ok: true; accepted: boolean }> {
+  const m = validateMessageArgs(args);
+  const discovered = discoverExistingGoalRoot();
+  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
+  const paths = await resolvePathsWithMigration(discovered.root);
+  const s = readGoalState(paths);
+  const accepted = s?.status === "pursuing" || s?.status === "relaying";
+  const dir = accepted ? "steers" : "rejected_steers";
+  const file = join(paths.goalDir, dir, `${m.session_id}.jsonl`);
+  mkdirSync(dirname(file), { recursive: true });
+  appendFileSync(file, JSON.stringify({ at: nowIso(), text: m.text, session_id: m.session_id }) + "\n", "utf8");
+  return { ok: true, accepted };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1748,6 +1986,69 @@ const TOOLS: Tool[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "report_progress",
+    description: "Mark one audit item passed or failed with concrete evidence. This cannot change lifecycle status or bypass the final audit gate.",
+    inputSchema: {
+      type: "object",
+      required: ["audit_item_id", "status", "evidence_ref"],
+      properties: {
+        audit_item_id: { type: "string" },
+        status: { type: "string", enum: ["passed", "failed"] },
+        evidence_ref: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "report_stuck",
+    description: "Declare that an audit item is stuck; after max attempts the goal pauses for user attention.",
+    inputSchema: {
+      type: "object",
+      required: ["audit_item_id", "reason", "attempts"],
+      properties: {
+        audit_item_id: { type: "string" },
+        reason: { type: "string" },
+        attempts: { type: "integer", minimum: 1 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "record_breadcrumb",
+    description: "Append a non-trivial approach/outcome breadcrumb and refresh the continuation preamble.",
+    inputSchema: {
+      type: "object",
+      required: ["audit_item", "approach", "outcome", "evidence_ref"],
+      properties: {
+        audit_item: { type: "string" },
+        approach: { type: "string" },
+        outcome: { type: "string" },
+        evidence_ref: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "queue_message",
+    description: "Queue a user or peer message for the next turn of a session.",
+    inputSchema: {
+      type: "object",
+      required: ["text", "session_id"],
+      properties: { text: { type: "string" }, session_id: { type: "string" } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "steer_message",
+    description: "Route a mid-turn steer to steers/<session>.jsonl, or rejected_steers when the current state cannot accept it.",
+    inputSchema: {
+      type: "object",
+      required: ["text", "session_id"],
+      properties: { text: { type: "string" }, session_id: { type: "string" } },
+      additionalProperties: false,
+    },
+  },
 ];
 
 function toolResultFromObject(value: unknown): CallToolResult {
@@ -1792,6 +2093,16 @@ async function dispatch(name: string, args: unknown): Promise<CallToolResult> {
         return toolResultFromObject(await toolPeerStatus());
       case "relay_now":
         return toolResultFromObject(await toolRelayNow(args));
+      case "report_progress":
+        return toolResultFromObject(await toolReportProgress(args));
+      case "report_stuck":
+        return toolResultFromObject(await toolReportStuck(args));
+      case "record_breadcrumb":
+        return toolResultFromObject(await toolRecordBreadcrumb(args));
+      case "queue_message":
+        return toolResultFromObject(await toolQueueMessage(args));
+      case "steer_message":
+        return toolResultFromObject(await toolSteerMessage(args));
       default:
         return errorResult(new ToolError("invalid_input", `unknown tool: ${name}`));
     }
@@ -1815,7 +2126,7 @@ async function dispatch(name: string, args: unknown): Promise<CallToolResult> {
 //
 // Kill switches (in priority order):
 //   - GOAL_CHANNEL_DISABLE=1               → never push
-//   - .claude/goal.pause exists            → never push
+//   - .goal/pause exists                   → never push
 //   - status !== "pursuing"                → never push
 //   - token_budget set AND tokens_used >=  → never push (budget exhausted)
 //
@@ -1865,10 +2176,12 @@ class ChannelPushManager {
   private readonly server: Server;
   private watcher: FSWatcher | null = null;
   private timer: NodeJS.Timeout | null = null;
+  private pollTimer: NodeJS.Timeout | null = null;
   private bootTimer: NodeJS.Timeout | null = null;
   private coalesceTimer: NodeJS.Timeout | null = null;
   private currentRoot: string | null = null;
   private lastTickCount: number | null = null;
+  private lastStateMtimeMs = 0;
   private lastPushTs = 0;
   private running = false;
   private readonly debounceMs: number;
@@ -1896,6 +2209,7 @@ class ChannelPushManager {
     logDebug("channel: starting", { root: this.currentRoot, source: resolved.source, debounceMs: this.debounceMs });
 
     this.installWatcher();
+    this.installPollingFallback();
     this.scheduleBootPush();
     this.scheduleTimer();
   }
@@ -1906,6 +2220,7 @@ class ChannelPushManager {
     this.running = false;
     if (this.bootTimer) { clearTimeout(this.bootTimer); this.bootTimer = null; }
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
     if (this.coalesceTimer) { clearTimeout(this.coalesceTimer); this.coalesceTimer = null; }
     if (this.watcher) {
       try { this.watcher.close(); } catch { /* best-effort */ }
@@ -1918,8 +2233,10 @@ class ChannelPushManager {
     if (!this.currentRoot) return;
     const paths = pathsFor(this.currentRoot);
     try {
-      // Ensure dirs exist so fs.watch doesn't ENOENT.
+      // Ensure dirs exist so fs.watch doesn't ENOENT. Fresh v2/v3 goals use
+      // .goal/state.json, so create .goal before the first goal exists.
       ensureClaudeDir(paths);
+      ensureGoalStateDir(paths);
     } catch (err) {
       logError("channel: failed to ensure .claude dir", { reason: (err as Error)?.message });
       return;
@@ -1932,16 +2249,37 @@ class ChannelPushManager {
       // own atomicWriteJson does.
       this.watcher = watch(watchDir, { persistent: false }, (_eventType, filename) => {
         // We only care about state file changes (state.json for v2, goal.json for v1).
-        if (filename && filename !== "goal.json" && filename !== "state.json" && filename !== "goal.pause") return;
+        if (filename && filename !== "goal.json" && filename !== "state.json" && filename !== "goal.pause" && filename !== "pause") return;
         this.coalesceAndEvaluate("filewatch");
       });
       this.watcher.on("error", (err: Error) => {
         logError("channel: watcher error", { reason: err.message });
+        try { this.watcher?.close(); } catch { /* best-effort */ }
+        this.watcher = null;
       });
       logDebug("channel: watcher installed", { dir: watchDir });
     } catch (err) {
       logError("channel: watch() failed; filewatch trigger disabled", { reason: (err as Error)?.message });
     }
+  }
+
+  private installPollingFallback(): void {
+    if (!this.currentRoot || this.pollTimer) return;
+    this.pollTimer = setInterval(() => {
+      if (!this.currentRoot) return;
+      const paths = pathsFor(this.currentRoot);
+      try {
+        const mtime = statSync(paths.goalFile).mtimeMs;
+        if (mtime !== this.lastStateMtimeMs) {
+          this.lastStateMtimeMs = mtime;
+          this.coalesceAndEvaluate("filewatch");
+        }
+      } catch {
+        // State file may not exist yet.
+      }
+    }, 500);
+    this.pollTimer.unref?.();
+    logDebug("channel: polling fallback installed");
   }
 
   private scheduleBootPush(): void {
@@ -2056,7 +2394,7 @@ class ChannelPushManager {
     trigger: PushTrigger,
   ): { kind: "send"; goalId: string } | { kind: "skip"; outcome: PushOutcome; goalId: string } {
     // Pause file: hardest kill switch.
-    const pauseFile = join(paths.claudeDir, "goal.pause");
+    const pauseFile = join(paths.goalDir, "pause");
     if (existsSync(pauseFile)) {
       return { kind: "skip", outcome: "skipped_paused", goalId: this.peekGoalId(paths) };
     }
@@ -2258,4 +2596,3 @@ export const __test = {
   CHANNEL_NOTIFICATION_METHOD,
   CONTINUATION_MESSAGE,
 };
-

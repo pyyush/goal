@@ -3,11 +3,11 @@
 #
 # Approximates Codex CLI's app-server thread_goal_processor (JSON-RPC):
 # create / get / status / pause / resume / clear / set-budget / mark-unmet
-# all operate on .claude/goal.json directly, so external orchestrators
+# all operate on .goal/state.json directly, so external orchestrators
 # (CI jobs, multi-agent runners, IDE integrations) can drive a goal
 # without owning a Claude Code session.
 #
-# Resolution: walks up from $PWD to find .claude/goal.json, stopping at
+# Resolution: walks up from $PWD to find .goal/state.json, stopping at
 # $HOME. Use --root <dir> to override.
 #
 # Requires: bash 3.2+, jq, uuidgen (or /proc/sys/kernel/random/uuid).
@@ -31,7 +31,7 @@ commands:
   set-budget <N>                    update token_budget (positive int or 'none')
   mark-achieved                     set status=achieved (skips audit — caller-owned)
   mark-unmet [note]                 set status=unmet with optional note
-  listen [--grep PAT] [--since ISO] tail .claude/goal-events.jsonl
+  listen [--grep PAT] [--since ISO] tail .goal/events.jsonl
   serve-http [--port N]             local HTTP shim (loopback only, default 7474)
   bridge start <runner>             start goal-bridge for <runner> in background
   bridge stop <runner>              stop goal-bridge for <runner>
@@ -42,9 +42,17 @@ commands:
   relay [--json]                    force relay to peer (writes fault signal)
   quota [--json]                    show provider headroom from .goal/quota.json
   cowork init                       write default .goal/cowork.yml
+  watch [--allow-control]           render the read-only v3 dashboard
+  history list|show <id>            list or inspect archived goals
+  debrief [--publish DEST]          generate or publish a goal debrief
+  pr [--draft]                      scaffold PR title/body/labels (no push)
+  sync push|pull                    sync .goal/ through goal-state branch
+  backlog [next]                    list or promote backlog items
+  template list                     list/materialize shipped goal templates
+  notifier start|stop               manage notification marker
 
 options:
-  --root <dir>     use <dir>/.claude/goal.json instead of walking up
+  --root <dir>     use <dir>/.goal/state.json instead of walking up
   --json           machine-readable output (applies to: get, status, bridge start/stop,
                    handoff list/show, lanes, relay, quota)
 EOF
@@ -103,6 +111,8 @@ resolve_root() {
 resolve_state_file() {
     local root="$1"
     if [ "${GOAL_DISABLE_MIGRATION:-0}" != "1" ] && [ -f "$root/.goal/state.json" ] && [ ! -L "$root/.goal/state.json" ]; then
+        printf '%s/.goal/state.json' "$root"
+    elif [ "${GOAL_DISABLE_MIGRATION:-0}" != "1" ]; then
         printf '%s/.goal/state.json' "$root"
     else
         printf '%s/.claude/goal.json' "$root"
@@ -178,11 +188,18 @@ goalctl_migrate_if_needed() {
         (.status // "pursuing") as $status
         | (.tick_count // 0) as $ticks
         | (.tokens_used // 0) as $tokens
+        | (.pursuing_seconds // 0) as $psecs
         | (.created_at // (now | todateiso8601)) as $created
         | (.updated_at // (now | todateiso8601)) as $updated
         | (if ($status == "pursuing" or $status == "paused") then null else $updated end) as $ended
         | . + {
             schema_version: 2,
+            time_used_seconds: $psecs,
+            observed_at: $updated,
+            active_turn_started_at: (if $status == "pursuing" then (.pursuing_since // $updated) else null end),
+            tokens_used_observed_at: $updated,
+            time_used_seconds_final: (if $ended == null then null else $psecs end),
+            tokens_used_final: (if $ended == null then null else $tokens end),
             compat: ["claude-code"],
             roles: { lead: null, build: null, review: null },
             current: { agent: null, session: null, since: null },
@@ -325,6 +342,30 @@ write_state() {
     trap - EXIT INT TERM
 }
 
+write_new_state() {
+    # Usage: write_new_state <command> [args...]
+    # Runs the command while holding the shared lock, captures stdout to a
+    # temp file beside the state file, then atomically renames it into place.
+    local tmp file_dir
+    if ! goal_lock_acquire "$ROOT"; then
+        die "could not acquire goal lock (held by another writer for >${GOAL_LOCK_TIMEOUT_MS:-5000}ms)"
+    fi
+    trap 'goal_lock_release "$ROOT"' EXIT INT TERM
+    file_dir=$(dirname "$FILE")
+    mkdir -p "$file_dir" 2>/dev/null || true
+    tmp=$(mktemp "$file_dir/.state.XXXXXX")
+    if "$@" > "$tmp"; then
+        mv "$tmp" "$FILE"
+    else
+        rm -f "$tmp" 2>/dev/null || true
+        goal_lock_release "$ROOT"
+        trap - EXIT INT TERM
+        die "state generation failed; goal state unchanged"
+    fi
+    goal_lock_release "$ROOT"
+    trap - EXIT INT TERM
+}
+
 ensure_exists() {
     [ -f "$FILE" ] || die "no goal at $FILE"
 }
@@ -346,14 +387,41 @@ append_history() {
 
 case "$CMD" in
 
+watch|history|debrief|pr|sync|backlog|template|notifier)
+    V3="$(cd "$(dirname "$0")" && pwd)/goal-v3"
+    [ -x "$V3" ] || die "goal-v3 helper not found at $V3"
+    exec node "$V3" "$CMD" "$ROOT" "$JSON_OUTPUT" ${ARGS[@]+"${ARGS[@]}"}
+    ;;
+
 create|replace)
-    OBJECTIVE="${ARGS[0]:-}"
-    [ -z "$OBJECTIVE" ] && die "create: objective required"
+    QUICK=0
+    TEMPLATE=""
+    DECOMPOSE=0
     BUDGET="null"
-    if [ "${ARGS[1]:-}" = "--budget" ]; then
-        BUDGET="${ARGS[2]:-}"
-        [[ "$BUDGET" =~ ^[1-9][0-9]*$ ]] || die "--budget must be a positive integer"
-    fi
+    OBJ_PARTS=()
+    i=0
+    while [ "$i" -lt "${#ARGS[@]}" ]; do
+        case "${ARGS[$i]}" in
+            --quick)
+                QUICK=1; i=$((i+1)) ;;
+            --template)
+                TEMPLATE="${ARGS[$((i+1))]:-}"
+                [ -n "$TEMPLATE" ] || die "--template requires a name"
+                i=$((i+2)) ;;
+            --decompose)
+                DECOMPOSE=1; i=$((i+1)) ;;
+            --budget)
+                BUDGET="${ARGS[$((i+1))]:-}"
+                [[ "$BUDGET" =~ ^[1-9][0-9]*$ ]] || die "--budget must be a positive integer"
+                i=$((i+2)) ;;
+            *)
+                OBJ_PARTS+=("${ARGS[$i]}"); i=$((i+1)) ;;
+        esac
+    done
+    OBJECTIVE="${OBJ_PARTS[*]:-}"
+    [ -z "$OBJECTIVE" ] && die "create: objective required"
+    OBJ_LEN=$(printf '%s' "$OBJECTIVE" | wc -m | tr -d '[:space:]')
+    [ "$OBJ_LEN" -le 4000 ] || die "objective is $OBJ_LEN characters; limit is 4000"
     if [ "$CMD" = "create" ] && [ -f "$FILE" ]; then
         STATUS=$(read_field '.status')
         case "$STATUS" in
@@ -366,6 +434,50 @@ create|replace)
     [ -f "$FILE" ] && OLD_OBJ=$(read_field '.objective')
     ACTION="create"
     [ -n "$OLD_OBJ" ] && ACTION="replace"
+    SIMILAR_NOTE=""
+    if [ -d "$ROOT/.goal/history" ]; then
+        FIRST_WORD=$(printf '%s' "$OBJECTIVE" | awk '{print tolower($1)}')
+        if [ -n "$FIRST_WORD" ]; then
+            SIMILAR_NOTE=$(find "$ROOT/.goal/history" -maxdepth 3 -name state.json 2>/dev/null | while IFS= read -r _sf; do
+                _obj=$(jq -r '.objective // ""' "$_sf" 2>/dev/null)
+                _status=$(jq -r '.status // "unknown"' "$_sf" 2>/dev/null)
+                printf '%s' "$_obj" | tr '[:upper:]' '[:lower:]' | grep -q "$FIRST_WORD" || continue
+                printf '%s: %s\n' "$_status" "$_obj"
+            done | head -3)
+            if [ -n "$SIMILAR_NOTE" ]; then
+                printf 'Similar past goals:\n%s\n' "$SIMILAR_NOTE" >&2
+            fi
+        fi
+    fi
+    AUDIT_JSON="null"
+    STRUCTURED_BUDGET="null"
+    ROLE_JSON='{ "lead": null, "build": null, "review": null }'
+    if [ "$TEMPLATE" = "tdd-feature" ] || [ "$TEMPLATE" = "migration" ] || [ "$TEMPLATE" = "bug-fix" ] || [ "$TEMPLATE" = "dependency-upgrade" ]; then
+        case "$TEMPLATE" in
+            tdd-feature) P1="failing test captures behavior"; P2="implementation passes focused test"; P3="regression suite passes" ;;
+            migration) P1="migration path is compatible"; P2="rollback or recovery path documented"; P3="migration smoke test passes" ;;
+            bug-fix) P1="reproduction test captures bug"; P2="fix passes reproduction"; P3="adjacent regression suite passes" ;;
+            dependency-upgrade) P1="lockfile updated"; P2="build and tests pass"; P3="compatibility risk documented" ;;
+        esac
+        AUDIT_JSON=$(jq -n --arg p1 "$P1" --arg p2 "$P2" --arg p3 "$P3" \
+            '{checklist:[{id:"a1",predicate:$p1,status:"open",evidence:null},{id:"a2",predicate:$p2,status:"open",evidence:null},{id:"a3",predicate:$p3,status:"open",evidence:null}]}')
+        STRUCTURED_BUDGET='{ "kind": "tokens", "limit": 50000, "used": 0 }'
+        ROLE_JSON='{ "lead": "claude", "build": "codex", "review": "claude" }'
+        [ "$BUDGET" = "null" ] && BUDGET=50000
+        printf 'instantiating template %s: 3 audit items, 50000-token budget, lead/build/review roles\n' "$TEMPLATE" >&2
+    elif [ "$QUICK" -ne 1 ]; then
+        AUDIT_JSON=$(jq -n \
+            '{checklist:[
+              {id:"a1",predicate:"implementation satisfies the objective",status:"open",evidence:null},
+              {id:"a2",predicate:"relevant tests or smoke checks pass",status:"open",evidence:null},
+              {id:"a3",predicate:"documentation or user-facing output is accurate when applicable",status:"open",evidence:null}
+            ]}')
+    fi
+    if [ "$DECOMPOSE" -eq 1 ]; then
+        mkdir -p "$ROOT/.goal" 2>/dev/null || true
+        printf '{"at":"%s","objective":"%s — part 2","status":"pending"}\n' "$NOW" "$OBJECTIVE" >> "$ROOT/.goal/backlog.jsonl"
+        printf '{"at":"%s","objective":"%s — verification","status":"pending"}\n' "$NOW" "$OBJECTIVE" >> "$ROOT/.goal/backlog.jsonl"
+    fi
     # Clear stale baseline files from previous goal_id (the Stop hook
     # writes one per goal_id; replacing leaves orphans).
     rm -f "$ROOT/.claude/goal-baseline-"* 2>/dev/null || true
@@ -374,29 +486,36 @@ create|replace)
     _file_base=$(basename "$_file_dir")
     if [ "$_file_base" = ".goal" ]; then
         # v2 schema — include all v2 fields.
-        jq -n --arg gid "$NEW_ID" --arg obj "$OBJECTIVE" --arg ts "$NOW" \
+        write_new_state jq -n --arg gid "$NEW_ID" --arg obj "$OBJECTIVE" --arg ts "$NOW" \
               --argjson budget "$BUDGET" --arg action "$ACTION" \
+              --argjson audit "$AUDIT_JSON" --argjson roles "$ROLE_JSON" --argjson sbudget "$STRUCTURED_BUDGET" \
             '{schema_version: 2,
               goal_id: $gid, objective: $obj, status: "pursuing",
               created_at: $ts, updated_at: $ts,
+              time_used_seconds: 0, observed_at: $ts, active_turn_started_at: $ts,
+              tokens_used_observed_at: $ts,
+              time_used_seconds_final: null, tokens_used_final: null,
               token_budget: $budget, tokens_used: 0, tick_count: 0,
               pursuing_seconds: 0, pursuing_since: $ts,
               compat: ["claude-code"],
-              roles: {lead: null, build: null, review: null},
+              roles: $roles,
               current: {agent: null, session: null, since: null},
-              budget: null,
+              budget: $sbudget,
               lineage: [],
-              audit: null, handoff_head: null, queued_until: null,
-              history: [{ts: $ts, action: $action, note: "via goalctl"}]}' > "$FILE"
+              audit: $audit, handoff_head: null, queued_until: null,
+              history: [{ts: $ts, action: $action, note: "via goalctl"}]}'
+        if [ -n "$SIMILAR_NOTE" ]; then
+            printf '## Similar Goals\n%s\n' "$SIMILAR_NOTE" > "$ROOT/.goal/preamble.md"
+        fi
     else
         # v1 schema — keep minimal shape for backward compat.
-        jq -n --arg gid "$NEW_ID" --arg obj "$OBJECTIVE" --arg ts "$NOW" \
+        write_new_state jq -n --arg gid "$NEW_ID" --arg obj "$OBJECTIVE" --arg ts "$NOW" \
               --argjson budget "$BUDGET" --arg action "$ACTION" \
             '{goal_id: $gid, objective: $obj, status: "pursuing",
               created_at: $ts, updated_at: $ts,
               token_budget: $budget, tokens_used: 0, tick_count: 0,
               pursuing_seconds: 0, pursuing_since: $ts,
-              history: [{ts: $ts, action: $action, note: "via goalctl"}]}' > "$FILE"
+              history: [{ts: $ts, action: $action, note: "via goalctl"}]}'
     fi
     printf 'goal %s: %s\n' "$ACTION" "$NEW_ID"
     ;;
@@ -519,6 +638,11 @@ mark-achieved)
         append_history "mark-achieved" "via goalctl"
         write_state ".status = \"achieved\"
             | .pursuing_seconds = ((.pursuing_seconds // 0) + ${DELTA})
+            | .time_used_seconds = ((.time_used_seconds // .pursuing_seconds // 0) + ${DELTA})
+            | .observed_at = \$ts
+            | .active_turn_started_at = null
+            | .time_used_seconds_final = (.time_used_seconds // ((.pursuing_seconds // 0) + ${DELTA}))
+            | .tokens_used_final = (.tokens_used // 0)
             | .pursuing_since = null"
     else
         append_history "mark-achieved" "via goalctl"
@@ -538,6 +662,11 @@ mark-unmet)
         append_history "mark-unmet" "$(printf '%s' "$NOTE" | sed 's/"/\\"/g')"
         write_state ".status = \"unmet\"
             | .pursuing_seconds = ((.pursuing_seconds // 0) + ${DELTA})
+            | .time_used_seconds = ((.time_used_seconds // .pursuing_seconds // 0) + ${DELTA})
+            | .observed_at = \$ts
+            | .active_turn_started_at = null
+            | .time_used_seconds_final = (.time_used_seconds // ((.pursuing_seconds // 0) + ${DELTA}))
+            | .tokens_used_final = (.tokens_used // 0)
             | .pursuing_since = null"
     else
         append_history "mark-unmet" "$(printf '%s' "$NOTE" | sed 's/"/\\"/g')"
@@ -547,12 +676,12 @@ mark-unmet)
     ;;
 
 listen)
-    # tail -F .claude/goal-events.jsonl with optional --grep and --since.
+    # tail -F .goal/events.jsonl with optional --grep and --since.
     # Args supported (consumed from ARGS):
     #   --grep <pattern>    grep -E filter on lines as they arrive
     #   --since <iso8601>   print existing lines whose .ts >= since, then tail
     ensure_dir
-    EVENTS_FILE="$ROOT/.claude/goal-events.jsonl"
+    EVENTS_FILE="$ROOT/.goal/events.jsonl"
     [ -f "$EVENTS_FILE" ] || : > "$EVENTS_FILE"
 
     GREP_PAT=""
@@ -635,6 +764,9 @@ serve-http)
     SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
     HTTP_SCRIPT="$SCRIPT_DIR/goal-http-server.ts"
     [ -f "$HTTP_SCRIPT" ] || die "goal-http-server.ts not found at $HTTP_SCRIPT"
+    if node --experimental-strip-types -e 'process.exit(0)' >/dev/null 2>&1; then
+        exec node --experimental-strip-types "$HTTP_SCRIPT" --port "$PORT" --root "$ROOT"
+    fi
     if ! command -v npx >/dev/null 2>&1; then
         die "npx not found; install Node.js (>=18) to use 'goalctl serve-http'"
     fi
@@ -974,7 +1106,7 @@ relay)
     mkdir -p "$(dirname "$_FAULT_FILE")" 2>/dev/null || true
 
     _FAULT_JSON=$(jq -n --arg ts "$(date -u +%FT%TZ)" --arg agent "$_STATE_AGENT" \
-        '{kind:"other",at:$ts,payload:"goalctl relay: forced relay",event_type:"goalctl_relay"}')
+        '{kind:"other",reason:"user",at:$ts,payload:"goalctl relay: forced relay",event_type:"goalctl_relay"}')
     printf '%s\n' "$_FAULT_JSON" > "$_FAULT_FILE.tmp" && \
         mv "$_FAULT_FILE.tmp" "$_FAULT_FILE" 2>/dev/null || \
         { rm -f "$_FAULT_FILE.tmp" 2>/dev/null; die "relay: could not write fault file"; }

@@ -16,7 +16,7 @@
 #   6. Assert: both bridges detect the achieved status and stop their ndjson
 #      loops within 5s (no further turn events emitted).
 #   7. Assert: lineage records both agent IDs.
-#   8. Assert: no non-loopback LISTEN sockets (a18 check).
+#   8. Assert: bridge PIDs open no LISTEN sockets (a18 check).
 #
 # "Mocked Codex" means:
 #   - The runner binary is mock-runner.sh with MOCK_FORMAT=ndjson.
@@ -358,15 +358,20 @@ else
     say "goalctl not found at $GOALCTL — skipping integration sub-check"
 fi
 
-# ---- step 8: a18 check — no non-loopback LISTEN sockets ---------------------
+# ---- step 8: a18 check — no LISTEN sockets from bridge PIDs -----------------
 
-step "8. a18 check — no non-loopback LISTEN sockets from node"
+step "8. a18 check — bridge PIDs open no LISTEN sockets"
 
-LSOF_OUT=$(lsof -i -P -n 2>/dev/null | grep -i listen | grep node || echo "(no node LISTEN sockets)")
-say "$LSOF_OUT"
-NON_LO=$(printf '%s' "$LSOF_OUT" | grep -v "127.0.0.1" | grep -v "(no node LISTEN sockets)" || true)
-[ -z "$NON_LO" ] || fail "non-loopback LISTEN socket found: $NON_LO"
-say "a18: no non-loopback LISTEN sockets ✓"
+if ! command -v lsof >/dev/null 2>&1; then
+    say "lsof unavailable; skipping socket assertion"
+else
+    LSOF_OUT=$(lsof -Pan -p "$BRIDGE_A_PID" -p "$BRIDGE_B_PID" -iTCP -sTCP:LISTEN 2>/dev/null || true)
+    [ -n "$LSOF_OUT" ] || LSOF_OUT="(no bridge LISTEN sockets)"
+    say "$LSOF_OUT"
+    LISTEN_LINES=$(printf '%s\n' "$LSOF_OUT" | awk 'NR > 1 { print }')
+    [ -z "$LISTEN_LINES" ] || fail "bridge opened LISTEN socket: $LISTEN_LINES"
+fi
+say "a18: bridge opened no LISTEN sockets ✓"
 
 # ---- done -------------------------------------------------------------------
 
@@ -378,7 +383,7 @@ say "✓ T7-4: Both agents in lineage: $AGENT_A, $AGENT_B"
 say "✓ T7-5: audit.achieved_at recorded"
 say "✓ T7-6: Bridges quiesced after achieved state (no new turn loops)"
 say "✓ T7-7: goalctl lanes --json outputs valid JSON"
-say "✓ T7-8: a18: no non-loopback LISTEN sockets"
+say "✓ T7-8: a18: bridge opened no LISTEN sockets"
 say "No real Codex invoked — all runner behavior provided by mock-runner.sh ✓"
 
 green "ALL TWO-AGENT E2E TESTS PASSED (T7 / a9)"
