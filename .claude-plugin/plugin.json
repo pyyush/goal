@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "goal",
-  "version": "0.1.1",
-  "description": "Persistent objective lifecycle for Claude Code: set a goal once, Claude pursues across turns until done.",
+  "version": "0.2.0",
+  "description": "Persistent objective lifecycle for Claude Code: set a goal once, Claude pursues it across turns until it is verifiably done.",
   "author": {
     "name": "pyyush",
     "url": "https://github.com/pyyush"
@@ -12,59 +12,6 @@
   "license": "MIT",
   "keywords": ["goal", "objective", "persistence", "agent", "autonomy", "lifecycle"],
   "commands": ["./goal.md"],
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-ticker.sh"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Task",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-ticker.sh"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-stop.sh"
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-notify.sh"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/goal-prompt.sh"
-          }
-        ]
-      }
-    ]
-  },
   "mcpServers": {
     "goal": {
       "command": "bash",
@@ -75,8 +22,6 @@
     }
   },
   "channels": [
-    {
-      "server": "goal"
-    }
+    { "server": "goal" }
   ]
 }

@@ -1,55 +1,19 @@
 {
+  "//": "Manual (non-plugin) install of goal. Installing via the plugin marketplace wires hooks automatically from hooks/hooks.json — you only need the statusLine block below.",
+  "statusLine": {
+    "type": "command",
+    "command": "bash $HOME/.claude/statusline.sh",
+    "refreshInterval": 10
+  },
   "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/goal-ticker.sh"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Task",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/goal-ticker.sh"
-          }
-        ]
-      }
-    ],
     "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/goal-stop.sh"
-          }
-        ]
-      }
+      { "hooks": [ { "type": "command", "command": "bash .claude/hooks/goal-stop.sh" } ] }
     ],
     "Notification": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/goal-notify.sh"
-          }
-        ]
-      }
+      { "hooks": [ { "type": "command", "command": "bash .claude/hooks/goal-notify.sh" } ] }
     ],
     "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/goal-prompt.sh"
-          }
-        ]
-      }
+      { "hooks": [ { "type": "command", "command": "bash .claude/hooks/goal-prompt.sh" } ] }
     ]
   }
 }

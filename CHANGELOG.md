@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.2.0 — Codex-faithful goal lifecycle
+
+A `/goal` that is stable, reliable, token-efficient, and never silently lost.
+Verified against Claude Code 2.1.143 and the open-source Codex implementation.
+
+### Architecture
+- **No LLM evaluator.** Continuation is a deterministic Stop-hook dispatcher;
+  completion is the working model auditing itself via the `overclaim` skill and
+  calling MCP `update_goal` (complete-only). Mirrors Codex `core/src/goals.rs` —
+  Claude Code's native `/goal` uses a Haiku evaluator; this does not.
+- **Session-owned goals.** Goals resolve by session ownership, read-only — fixes
+  concurrent goals clobbering each other (Bug 1) and fresh sessions inheriting a
+  stale status line (Bug 3).
+- **No model-set failure.** The model can reach `achieved` only through the
+  `overclaim` audit; a stuck goal parks to resumable `needs-input`, never
+  `unmet`. `unmet` is removed everywhere.
+
+### Reliability
+- Hardened Stop hook: `set -u` only, `exec 2>/dev/null`, per-goal locks — a
+  hook fire emits zero stderr, so the "hook error" notices are gone (Bug 4).
+- Removed the `goal-ticker` daemon: it wrote to `/dev/tty`, which Claude Code
+  hooks lost in v2.1.139. The live timer now uses `statusLine.refreshInterval`.
+- Plugin hooks moved to `hooks/hooks.json` per the current plugin spec.
+
+### Token efficiency
+- Continuation drives the loop by reference: a ~35-token prompt citing the
+  persisted spec, with a full re-paste only on context-loss signals (first
+  fire, every 25 ticks, re-orientation). v2 re-pasted the full objective every
+  turn.
+
+### UX
+- New cockpit status line: state-driven glyph + colour, evidence meter, live
+  timer. Renders only for the owning session; terminal states do not stick.
+  Interactive mockup: `docs/goal-statusline-cockpit.html`.
+
+### Added earlier in this line
+- `goalframe` skill — structures a raw objective into a verifiable spec.
+- `overclaim` skill — evidence audit; the only path to `achieved`.
+
+
 All notable changes to the `/goal` plugin are documented here.  
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
