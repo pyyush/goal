@@ -1,13 +1,29 @@
 {
   "description": "goal — persistent objective lifecycle. Drives an owned goal across turns via a deterministic Stop-hook dispatcher; no LLM evaluator.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/bin/goal-statusline-install",
+              "--ensure"
+            ]
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "bash",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/goal-stop.sh"]
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/goal-stop.sh"
+            ]
           }
         ]
       }
@@ -18,7 +34,9 @@
           {
             "type": "command",
             "command": "bash",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/goal-notify.sh"]
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/goal-notify.sh"
+            ]
           }
         ]
       }
@@ -29,7 +47,9 @@
           {
             "type": "command",
             "command": "bash",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/goal-prompt.sh"]
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/goal-prompt.sh"
+            ]
           }
         ]
       }

@@ -78,7 +78,7 @@ The bridge binds no sockets. All coordination is file-based.
 
 ## Lifecycle states
 
-Single-agent mode uses five states: `pursuing`, `paused`, `achieved`, `unmet`, `budget-limited`. Cowork adds two runtime states:
+Single-agent mode uses five states: `pursuing`, `paused`, `achieved`, `needs-input`, `budget-limited`. Cowork adds two runtime states:
 
 | State | Meaning | How you get here | How you leave |
 |---|---|---|---|

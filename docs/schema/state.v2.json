@@ -36,12 +36,12 @@
         "pursuing",
         "paused",
         "achieved",
-        "unmet",
+        "needs-input",
         "budget-limited",
         "relaying",
         "queued"
       ],
-      "description": "Lifecycle state. 'relaying' and 'queued' are runtime-driven and auto-resume. 'paused', 'unmet', 'budget-limited' never auto-resume. Model can only set 'achieved' via update_goal."
+      "description": "Lifecycle state. 'relaying' and 'queued' are runtime-driven and auto-resume. 'paused', 'needs-input', 'budget-limited' never auto-resume. Model can only set 'achieved' via update_goal."
     },
     "created_at": {
       "type": "string",

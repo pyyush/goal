@@ -89,9 +89,9 @@ cp "$REPO_DIR/goal.md" "$TARGET/commands/goal.md"
 cp "$REPO_DIR/hooks/"*.sh "$TARGET/hooks/"
 chmod +x "$TARGET/hooks/"*.sh
 mkdir -p "$TARGET/bin"
-cp "$REPO_DIR/bin/goal-ticker" "$TARGET/bin/goal-ticker"
-chmod +x "$TARGET/bin/goal-ticker"
-printf 'Installed command + hook files + goal-ticker to %s/\n' "$TARGET"
+cp "$REPO_DIR/bin/goal-statusline-install" "$TARGET/bin/goal-statusline-install"
+chmod +x "$TARGET/bin/goal-statusline-install"
+printf 'Installed command + hook files to %s/\n' "$TARGET"
 
 # ---- settings.json merge ---------------------------------------------------
 
@@ -108,17 +108,9 @@ else
     TMP=$(mktemp)
     jq --arg p "$HOOK_CMD_PREFIX" '
         .hooks //= {}
-        | .hooks.SessionStart //= []
-        | .hooks.PreToolUse //= []
         | .hooks.Stop //= []
         | .hooks.Notification //= []
         | .hooks.UserPromptSubmit //= []
-        | (.hooks.SessionStart |=
-            if any(.[]?; .hooks[0].command == ($p + "goal-ticker.sh"))
-            then . else . + [{hooks: [{type: "command", command: ($p + "goal-ticker.sh")}]}] end)
-        | (.hooks.PreToolUse |=
-            if any(.[]?; (.matcher // "") == "Task" and .hooks[0].command == ($p + "goal-ticker.sh"))
-            then . else . + [{matcher: "Task", hooks: [{type: "command", command: ($p + "goal-ticker.sh")}]}] end)
         | (.hooks.Stop |=
             if any(.[]?; .hooks[0].command == ($p + "goal-stop.sh"))
             then . else . + [{hooks: [{type: "command", command: ($p + "goal-stop.sh")}]}] end)
@@ -155,129 +147,28 @@ else
 fi
 
 # ---- statusline setup ------------------------------------------------------
-#
-# Three cases:
-#   A) No statusLine configured  → offer to install bundled statusline
-#   B) Existing script-based statusLine → keep / append goal segment / replace / diff
-#   C) Existing inline-command statusLine → keep / replace only (no script to patch)
-
-STATUSLINE_SRC="$REPO_DIR/statusline.sh"
-case "$SCOPE" in
-    user)    STATUSLINE_DST="$HOME/.claude/statusline.sh"
-             STATUSLINE_CMD='bash $HOME/.claude/statusline.sh' ;;
-    project) STATUSLINE_DST="./.claude/statusline.sh"
-             STATUSLINE_CMD='bash .claude/statusline.sh' ;;
-esac
-
-read -r -d '' GOAL_SNIPPET <<'SNIP' || true
-
-# --- goal segment (added by the goal plugin) ---
-if [ -x "$HOME/.claude/hooks/goal-statusline.sh" ]; then
-    __goal_seg=$(printf '%s' "${input:-}" | bash "$HOME/.claude/hooks/goal-statusline.sh" "${cwd:-}" "${sid:-}" 2>/dev/null || true)
-    [ -n "$__goal_seg" ] && printf ' | %s' "$__goal_seg"
-fi
-SNIP
-
-install_bundled_statusline() {
-    cp "$STATUSLINE_SRC" "$STATUSLINE_DST"
-    chmod +x "$STATUSLINE_DST"
-    local TMP
-    TMP=$(mktemp)
-    jq --arg cmd "$STATUSLINE_CMD" '.statusLine = {type: "command", command: $cmd}' "$SETTINGS" > "$TMP"
-    mv "$TMP" "$SETTINGS"
-    printf 'Installed bundled statusline at %s and wired it in settings.json.\n' "$STATUSLINE_DST"
-}
-
-EXISTING_STATUSLINE=""
-if [ -f "$SETTINGS" ]; then
-    EXISTING_STATUSLINE=$(jq -r '.statusLine.command // empty' "$SETTINGS" 2>/dev/null)
-fi
+# Additive wiring: install a wrapper that runs whatever status line you already
+# have and appends the /goal cockpit line below it. Your status line is never
+# replaced — only the statusLine.command pointer is re-pointed, and the old
+# value is preserved as the wrapper's inner command. The installer also adds a
+# SessionStart hook so the goal line survives a future /statusline.
 
 printf '\n--- Statusline setup ---\n'
-
-if [ -z "$EXISTING_STATUSLINE" ]; then
-    cat <<EOF
-No statusLine is currently configured.
-
-The bundled statusline shows:
-  model | cwd | context% | rate-limits (Pro/Max) | goal (when active)
-
-Options:
-  [Y] install the bundled statusline
-  [n] skip — don't touch statusline (goal segment won't render)
-  [l] skip for now; print the goal-segment snippet so I can add it later
-EOF
-    printf 'Choice [Y/n/l]: '
-    read -r choice || choice=""
-    case "${choice:-Y}" in
-        y|Y|yes|YES|"")  install_bundled_statusline ;;
-        l|L)             printf '\nPaste this near the end of your future statusline script:\n%s\n' "$GOAL_SNIPPET" ;;
-        *)               printf 'Skipped statusline setup.\n' ;;
+if [ -x "$TARGET/bin/goal-statusline-install" ]; then
+    SL_FLAG=--user
+    [ "$SCOPE" = project ] && SL_FLAG=--project
+    bash "$TARGET/bin/goal-statusline-install" --audit "$SL_FLAG" 2>/dev/null | sed 's/^/  /'
+    printf '\nWire the goal cockpit into your status line? It is additive — your\n'
+    printf 'existing status line is preserved (run with --audit any time). [Y/n] '
+    read -r __sl || __sl=""
+    case "${__sl:-Y}" in
+        y|Y|yes|YES|"")
+            bash "$TARGET/bin/goal-statusline-install" "$SL_FLAG" || true ;;
+        *)
+            printf 'Skipped. Run "%s/bin/goal-statusline-install" whenever you want it.\n' "$TARGET" ;;
     esac
 else
-    EXISTING_SCRIPT=""
-    candidate=$(printf '%s' "$EXISTING_STATUSLINE" | sed "s|\$HOME|$HOME|g; s|~|$HOME|g" | awk '{for (i=1;i<=NF;i++) if ($i ~ /\.sh$/) { print $i; exit }}')
-    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
-        EXISTING_SCRIPT="$candidate"
-    fi
-
-    printf 'Detected existing statusLine:\n  %s\n' "$EXISTING_STATUSLINE"
-    [ -n "$EXISTING_SCRIPT" ] && printf '  (script: %s)\n' "$EXISTING_SCRIPT"
-    printf '\nOptions:\n'
-    printf '  [k] keep yours as-is (recommended if customized)\n'
-    [ -n "$EXISTING_SCRIPT" ] && printf '  [a] append goal segment to your script (non-destructive)\n'
-    printf '  [r] replace with the bundled statusline (backs yours up)\n'
-    printf '  [s] show diff between yours and the bundled one\n'
-
-    while :; do
-        printf 'Choice [k]: '
-        read -r choice || choice=""
-        case "${choice:-k}" in
-            k|K|"")
-                printf 'Kept your statusline unchanged.\n'
-                break ;;
-            a|A)
-                if [ -z "$EXISTING_SCRIPT" ]; then
-                    printf 'No script file to patch — your statusLine uses an inline command.\nSnippet to paste manually:\n%s\n' "$GOAL_SNIPPET"
-                    break
-                fi
-                if grep -q 'goal-statusline.sh' "$EXISTING_SCRIPT" 2>/dev/null; then
-                    printf 'Goal segment already present in %s — nothing to append.\n' "$EXISTING_SCRIPT"
-                    break
-                fi
-                printf '\nWill append this to %s:\n%s\n\nProceed? [y/N]: ' "$EXISTING_SCRIPT" "$GOAL_SNIPPET"
-                read -r ok || ok=""
-                case "${ok:-N}" in
-                    y|Y|yes|YES)
-                        BACKUP="$EXISTING_SCRIPT.bak.$(date +%s)"
-                        cp "$EXISTING_SCRIPT" "$BACKUP"
-                        printf '%s\n' "$GOAL_SNIPPET" >> "$EXISTING_SCRIPT"
-                        printf 'Appended. Backup at %s\n' "$BACKUP" ;;
-                    *)  printf 'Skipped — no changes made.\n' ;;
-                esac
-                break ;;
-            r|R)
-                if [ -n "$EXISTING_SCRIPT" ]; then
-                    BACKUP="$EXISTING_SCRIPT.bak.$(date +%s)"
-                    cp "$EXISTING_SCRIPT" "$BACKUP"
-                    printf 'Backed up existing script to %s\n' "$BACKUP"
-                fi
-                install_bundled_statusline
-                break ;;
-            s|S)
-                if [ -n "$EXISTING_SCRIPT" ]; then
-                    printf '\n--- diff (yours → bundled) ---\n'
-                    { diff -u "$EXISTING_SCRIPT" "$STATUSLINE_SRC" || true; } | sed 's/^/  /'
-                else
-                    printf '\nYour statusLine is an inline command; no script to diff.\nBundled statusline preview:\n'
-                    sed 's/^/  /' "$STATUSLINE_SRC" | head -40
-                fi
-                continue ;;
-            *)
-                printf 'Invalid choice.\n'
-                continue ;;
-        esac
-    done
+    printf 'goal-statusline-install missing — skipping status line setup.\n'
 fi
 
 # ---- project-scope .gitignore ----------------------------------------------

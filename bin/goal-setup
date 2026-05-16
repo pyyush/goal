@@ -246,9 +246,9 @@ else
     ok "wrote $HOOKS_DST_DIR/*.sh"
 fi
 mkdir -p "$TARGET/bin"
-cp "$REPO_DIR/bin/goal-ticker" "$TARGET/bin/goal-ticker"
-chmod +x "$TARGET/bin/goal-ticker"
-ok "wrote $TARGET/bin/goal-ticker"
+cp "$REPO_DIR/bin/goal-statusline-install" "$TARGET/bin/goal-statusline-install"
+chmod +x "$TARGET/bin/goal-statusline-install"
+ok "wrote $TARGET/bin/goal-statusline-install"
 
 # ---- 2. settings.json merge (hook registrations) ---------------------------
 
@@ -267,17 +267,9 @@ else
     TMP=$(mktemp)
     jq --arg p "$HOOK_CMD_PREFIX" '
         .hooks //= {}
-        | .hooks.SessionStart //= []
-        | .hooks.PreToolUse //= []
         | .hooks.Stop //= []
         | .hooks.Notification //= []
         | .hooks.UserPromptSubmit //= []
-        | (.hooks.SessionStart |=
-            if any(.[]?; .hooks[0].command == ($p + "goal-ticker.sh"))
-            then . else . + [{hooks: [{type: "command", command: ($p + "goal-ticker.sh")}]}] end)
-        | (.hooks.PreToolUse |=
-            if any(.[]?; (.matcher // "") == "Task" and .hooks[0].command == ($p + "goal-ticker.sh"))
-            then . else . + [{matcher: "Task", hooks: [{type: "command", command: ($p + "goal-ticker.sh")}]}] end)
         | (.hooks.Stop |=
             if any(.[]?; .hooks[0].command == ($p + "goal-stop.sh"))
             then . else . + [{hooks: [{type: "command", command: ($p + "goal-stop.sh")}]}] end)
@@ -297,44 +289,28 @@ else
     fi
 fi
 
-# ---- 3. statusline (prompt before touching) -------------------------------
+# ---- 3. statusline (additive — never replaces an existing status line) -----
 
 head1 "Statusline integration"
 
-case "$SCOPE" in
-    user)    STATUSLINE_DST="$HOME/.claude/statusline.sh"; STATUSLINE_CMD='bash $HOOK_VAR_HOME/.claude/statusline.sh' ;;
-    project) STATUSLINE_DST="$TARGET/statusline.sh"; STATUSLINE_CMD='bash .claude/statusline.sh' ;;
-esac
-# Use literal $HOME (avoid shell expansion in the JSON value).
-STATUSLINE_CMD="${STATUSLINE_CMD/\$HOOK_VAR_HOME/\$HOME}"
-
-EXISTING_STATUSLINE=""
-if [ -f "$SETTINGS" ]; then
-    EXISTING_STATUSLINE=$(jq -r '.statusLine.command // empty' "$SETTINGS" 2>/dev/null || true)
-fi
-
-install_statusline_inline() {
-    cp "$REPO_DIR/statusline.sh" "$STATUSLINE_DST"
-    chmod +x "$STATUSLINE_DST"
-    local TMP; TMP=$(mktemp)
-    jq --arg cmd "$STATUSLINE_CMD" '.statusLine = {type: "command", command: $cmd}' "$SETTINGS" > "$TMP"
-    mv "$TMP" "$SETTINGS"
-    ok "installed bundled statusline -> $STATUSLINE_DST"
-}
-
-if [ -z "$EXISTING_STATUSLINE" ]; then
+SL_INSTALLER="$TARGET/bin/goal-statusline-install"
+if [ -x "$SL_INSTALLER" ]; then
+    SL_FLAG=--user
+    [ "$SCOPE" = project ] && SL_FLAG=--project
     if [ "$NON_INTERACTIVE" = 1 ]; then
-        install_statusline_inline
+        bash "$SL_INSTALLER" "$SL_FLAG" || true
     else
-        printf 'No statusline configured. Install bundled one? [Y/n/skip] '
+        bash "$SL_INSTALLER" --audit "$SL_FLAG" 2>/dev/null
+        printf '\nWire the goal cockpit into your status line? It is additive — any\n'
+        printf 'status line you already have is preserved, not replaced. [Y/n] '
         read -r ans || ans=""
         case "${ans:-Y}" in
-            y|Y|yes|YES|"") install_statusline_inline ;;
-            *)              note "skipped statusline" ;;
+            y|Y|yes|YES|"") bash "$SL_INSTALLER" "$SL_FLAG" || true ;;
+            *)              note "skipped statusline (run $SL_INSTALLER anytime)" ;;
         esac
     fi
 else
-    note "existing statusLine detected; not touching (re-run install.sh for the full 3-way prompt)"
+    note "goal-statusline-install missing — skipped statusline"
 fi
 
 # ---- 4. MCP server build + registration -----------------------------------

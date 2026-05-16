@@ -73,7 +73,7 @@ Useful setup flags:
 /goal Refactor the auth module to use the new session API; run tests until green
 ```
 
-Claude Code keeps working until the goal is audited as complete, declared unmet, paused, budget-limited, or cleared.
+Claude Code keeps working until the goal is audited as complete, parked for input, paused, budget-limited, or cleared. No model grades completion — the loop is a deterministic state machine and completion is Claude's own audited call.
 
 ```text
 /goal status
@@ -162,26 +162,25 @@ The server also declares a Claude `goal/continue` push channel so idle sessions 
 
 ## Statusline
 
-The statusline gives you a compact run state:
+The statusline renders the owned goal as a compact two-line cockpit — and only in the session that owns the goal, so an unrelated shell in the same directory shows nothing.
 
-| State | Example |
+| State | Shown as |
 |---|---|
-| Pursuing | `Pursuing goal (12.5K / 50K)` |
-| Paused | `Goal paused (/goal resume)` |
-| Achieved | `Goal achieved (1h 23m)` |
-| Unmet | `Goal unmet (/goal status)` |
-| Budget-limited | `Goal abandoned (50K / 50K)` |
-| Cowork active | `cowork: codex→build | claude=review idle | 8/14 audited` |
-| Relaying | `Relaying claude-code → codex…` |
-| Queued | `Queued — retry at 14:47 (anthropic + openai throttled)` |
+| Pursuing (healthy) | teal `◎ GOAL <title> · N/M checks · 12m` + the latest progress reason |
+| Pursuing (stalled) | amber `◍` — `no progress last turn — re-orienting` |
+| Needs input | orange `◌` — the specific blocker; the one state meant to catch your eye |
+| Achieved | green `✓ GOAL MET · 7/7 · 23m`, then collapses on the next turn |
+| Budget-limited | red budget gauge — `wrap up: budget reached` |
+| Relaying / Queued | cowork relay state and retry time |
+| No goal | the segment is absent |
 
-The timer tracks active pursuit time. Paused time is excluded. Final states keep their final time/token snapshots.
+The live timer uses `statusLine.refreshInterval` — no background daemon, no writes to `/dev/tty` (which hooks no longer have). The timer counts active pursuit time only; paused time is excluded. Terminal states keep their final time/token snapshots. See `docs/goal-statusline-cockpit.html` for the full interactive mockup.
 
 ## Reliability model
 
 - Objectives are wrapped as untrusted data so a goal cannot smuggle higher-priority instructions.
 - Completion is audit-gated and evidence-backed.
-- The model cannot pause, resume, clear, mark unmet, or raise its own budget through MCP.
+- The model cannot pause, resume, clear, mark a failure, or raise its own budget — `update_goal` is asymmetric and only marks complete (the same contract Codex enforces).
 - `.goal/pause` halts the loop from any terminal.
 - Notification hooks pause on API errors in solo mode.
 - Cowork mode relays or queues on rate limits.

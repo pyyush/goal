@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# bin/goal-statusline-install — wire the /goal cockpit into the status line,
+# ADDITIVELY. Never replaces the user's status line.
+#
+# It installs hooks/goal-statusline-wrap.sh as `statusLine.command` and saves
+# whatever was there before as the wrapper's "inner" command. The wrapper then
+# runs the user's status line verbatim and appends the goal line.
+#
+# Modes:
+#   (default)   install — wrap the current statusLine (idempotent)
+#   --audit     report the current wiring; make no changes
+#   --ensure    quiet re-wrap, for the SessionStart hook. Only acts if the user
+#               already opted in — this is what makes the goal line survive a
+#               later `/statusline`, which regenerates statusLine.command.
+#
+# Scope:
+#   --user      operate on ~/.claude/settings.json   (default)
+#   --project   operate on ./.claude/settings.json
+#
+# Requires bash 3.2+, jq.
+
+set -u
+
+MODE="install" SCOPE="user"
+for a in "$@"; do
+    case "$a" in
+        --audit)   MODE="audit" ;;
+        --ensure)  MODE="ensure" ;;
+        --install) MODE="install" ;;
+        --user)    SCOPE="user" ;;
+        --project) SCOPE="project" ;;
+        -h|--help) sed -n '2,18p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    esac
+done
+
+command -v jq >/dev/null 2>&1 || { echo "goal-statusline-install: jq is required" >&2; exit 1; }
+
+case "$SCOPE" in
+    user)    CLAUDE_DIR="$HOME/.claude" ;;
+    project) CLAUDE_DIR="./.claude" ;;
+esac
+SETTINGS="$CLAUDE_DIR/settings.json"
+WRAP="$CLAUDE_DIR/hooks/goal-statusline-wrap.sh"
+WRAP_CMD="bash $WRAP"
+SELF_ABS="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+STATE_DIR="$HOME/.claude/goal"
+INNER_FILE="$STATE_DIR/statusline-inner"
+MARKER="$STATE_DIR/statusline-managed"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+current_cmd() {
+    [ -f "$SETTINGS" ] || { printf ''; return; }
+    jq -r '.statusLine.command // ""' "$SETTINGS" 2>/dev/null || printf ''
+}
+is_wrapper() { case "$1" in *goal-statusline-wrap.sh*) return 0 ;; *) return 1 ;; esac; }
+
+# Repoint statusLine.command at the wrapper, preserving <prev> as the inner
+# command. Atomic; keeps any other settings keys intact; adds refreshInterval
+# so the live timer ticks while the session is idle.
+apply_wrap() {
+    local prev="$1" tmp
+    case "$prev" in *goal-statusline-wrap.sh*) prev="" ;; esac   # never wrap ourselves
+    printf '%s' "$prev" > "$INNER_FILE" 2>/dev/null || true
+    [ -f "$SETTINGS" ] || printf '{}' > "$SETTINGS"
+    tmp=$(mktemp "$CLAUDE_DIR/.sl.XXXXXX" 2>/dev/null) || tmp="$SETTINGS.tmp.$$"
+    if jq --arg c "$WRAP_CMD" '
+            .statusLine = ((.statusLine // {})
+              | .type = "command"
+              | .command = $c
+              | .refreshInterval = (.refreshInterval // 10))
+        ' "$SETTINGS" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$SETTINGS" 2>/dev/null && return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    return 1
+}
+
+CUR=$(current_cmd)
+
+# Register the SessionStart hook that re-wraps after /statusline regenerates
+# the status line. Idempotent. This is what makes the goal line durable.
+register_ensure_hook() {
+    local tmp
+    tmp=$(mktemp "$CLAUDE_DIR/.sl.XXXXXX" 2>/dev/null) || return 1
+    if jq --arg c "bash $SELF_ABS --ensure" '
+            .hooks //= {} | .hooks.SessionStart //= []
+            | .hooks.SessionStart |=
+                (if any(.[]?; ((.hooks[0].command // "") | test("goal-statusline-install")))
+                 then . else . + [{hooks: [{type: "command", command: $c}]}] end)
+        ' "$SETTINGS" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$SETTINGS" 2>/dev/null && return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    return 1
+}
+
+case "$MODE" in
+
+    audit)
+        echo "goal status-line audit  (scope: $SCOPE)"
+        echo "  settings:      $SETTINGS $( [ -f "$SETTINGS" ] && echo '(present)' || echo '(absent)')"
+        echo "  wrapper:       $WRAP $( [ -f "$WRAP" ] && echo '(present)' || echo '(MISSING)')"
+        echo "  goal segment:  $CLAUDE_DIR/hooks/goal-statusline.sh $( [ -f "$CLAUDE_DIR/hooks/goal-statusline.sh" ] && echo '(present)' || echo '(MISSING)')"
+        if [ -z "$CUR" ]; then
+            echo "  statusLine:    (none configured)"
+            echo "  -> goal line:  will NOT render. Run: goal-statusline-install"
+        elif is_wrapper "$CUR"; then
+            echo "  statusLine:    goal wrapper ACTIVE"
+            if [ -s "$INNER_FILE" ]; then
+                echo "  inner (yours): $(cat "$INNER_FILE" 2>/dev/null)"
+            else
+                echo "  inner (yours): (none — wrapper shows a minimal default line)"
+            fi
+            echo "  -> goal line:  renders for the session that owns a goal."
+        else
+            echo "  statusLine:    $CUR"
+            echo "  -> goal line:  will NOT render. Run: goal-statusline-install"
+            echo "                 (your status line above is preserved as the inner command)"
+        fi
+        [ -f "$MARKER" ] && echo "  managed:       yes — survives /statusline regeneration" \
+                          || echo "  managed:       no  — run goal-statusline-install to opt in"
+        exit 0
+        ;;
+
+    ensure)
+        # SessionStart path — safe, quiet, consent-respecting.
+        if [ -f "$MARKER" ]; then
+            # Opted in: keep the wrapper active across /statusline regenerations.
+            # A fresh /statusline becomes the new inner command; the goal line
+            # is preserved on top of it.
+            if [ -z "$CUR" ] || ! is_wrapper "$CUR"; then
+                apply_wrap "$CUR" || exit 0
+                register_ensure_hook 2>/dev/null || true
+            fi
+        elif [ -z "$CUR" ] && [ -f "$WRAP" ]; then
+            # No marker AND no status line at all: wiring one is a pure addition
+            # with nothing to clobber. Safe to do automatically so a fresh user
+            # sees the goal cockpit before ever running /statusline.
+            if apply_wrap ""; then
+                : > "$MARKER" 2>/dev/null || true
+                register_ensure_hook 2>/dev/null || true
+            fi
+        fi
+        # No marker + an existing status line: do nothing — that needs an
+        # explicit opt-in (run goal-statusline-install) so we never touch a
+        # status line the user set up themselves without being asked.
+        exit 0
+        ;;
+
+    install)
+        if [ ! -f "$WRAP" ]; then
+            echo "goal-statusline-install: wrapper not found at $WRAP" >&2
+            echo "  install the goal plugin's hooks first (install.sh / goal-setup)." >&2
+            exit 1
+        fi
+        if is_wrapper "$CUR"; then
+            : > "$MARKER" 2>/dev/null || true
+            echo "Goal cockpit already wired (statusLine -> goal wrapper). Nothing to do."
+            exit 0
+        fi
+        if apply_wrap "$CUR"; then
+            : > "$MARKER" 2>/dev/null || true
+            register_ensure_hook || true
+            if [ -n "$CUR" ]; then
+                echo "Wrapped your existing status line — it is preserved and untouched."
+                echo "  your status line : $CUR"
+            else
+                echo "No status line was configured; installed one with the goal cockpit."
+            fi
+            echo "  statusLine       : $WRAP_CMD  (refreshInterval: 10s)"
+            echo "  the goal line is added below your status line whenever a goal is active."
+            echo "  it survives /statusline — the SessionStart hook re-wraps automatically."
+        else
+            echo "goal-statusline-install: failed to update $SETTINGS" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
+esac

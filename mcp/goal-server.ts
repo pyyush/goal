@@ -294,7 +294,19 @@ import lockfile from "proper-lockfile";
 // ────────────────────────────────────────────────────────────────────────────
 
 // v2 adds relaying and queued; v1 readers must tolerate these on read.
-type GoalStatus = "pursuing" | "paused" | "achieved" | "unmet" | "budget-limited" | "relaying" | "queued";
+type GoalStatus = "pursuing" | "paused" | "achieved" | "needs-input" | "budget-limited" | "relaying" | "queued";
+
+/** Structured objective from the `goalframe` skill. All fields optional; stored verbatim. */
+interface GoalSpec {
+  title?: string;
+  outcome?: string;
+  verification?: string;
+  constraints?: string;
+  boundaries?: string;
+  iteration?: string;
+  blocked_when?: string;
+  assumptions?: string;
+}
 
 interface HistoryEntry {
   ts: string;
@@ -329,6 +341,12 @@ interface GoalState {
   schema_version?: number;
   goal_id: string;
   objective: string;
+  /**
+   * Structured objective produced by the `goalframe` skill at /goal time.
+   * Stored once; the Stop-hook dispatcher references it on every continuation
+   * tick instead of re-pasting the raw objective. Opaque to this server.
+   */
+  spec?: GoalSpec | null;
   status: GoalStatus;
   created_at: string;
   updated_at: string;
@@ -811,7 +829,7 @@ function readGoalState(paths: GoalPaths): GoalState | null {
 
 // All 7 lifecycle statuses — v2 adds relaying and queued.
 const VALID_STATUSES: GoalStatus[] = [
-  "pursuing", "paused", "achieved", "unmet", "budget-limited", "relaying", "queued",
+  "pursuing", "paused", "achieved", "needs-input", "budget-limited", "relaying", "queued",
 ];
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -997,7 +1015,7 @@ function makeView(state: GoalState): GoalView {
 }
 
 function liveGoalSeconds(state: GoalState): number {
-  if ((state.status === "achieved" || state.status === "unmet" || state.status === "budget-limited") && state.time_used_seconds_final != null) {
+  if ((state.status === "achieved" || state.status === "budget-limited") && state.time_used_seconds_final != null) {
     return state.time_used_seconds_final;
   }
   let elapsed = state.time_used_seconds ?? state.pursuing_seconds ?? 0;
@@ -1068,7 +1086,7 @@ function asObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function validateCreateGoalArgs(args: unknown): { objective: string; token_budget: number | null } {
+function validateCreateGoalArgs(args: unknown): { objective: string; token_budget: number | null; spec: GoalSpec | null } {
   const obj = asObject(args ?? {});
   const objective = obj.objective;
   if (typeof objective !== "string") {
@@ -1089,7 +1107,20 @@ function validateCreateGoalArgs(args: unknown): { objective: string; token_budge
     }
     token_budget = tb;
   }
-  return { objective: trimmed, token_budget };
+  let spec: GoalSpec | null = null;
+  if (obj.spec !== undefined && obj.spec !== null) {
+    if (typeof obj.spec !== "object" || Array.isArray(obj.spec)) {
+      throw new ToolError("invalid_input", '"spec" must be an object when provided');
+    }
+    const src = obj.spec as Record<string, unknown>;
+    const picked: GoalSpec = {};
+    for (const k of ["title","outcome","verification","constraints","boundaries","iteration","blocked_when","assumptions"] as const) {
+      const v = src[k];
+      if (typeof v === "string") picked[k] = v;
+    }
+    spec = picked;
+  }
+  return { objective: trimmed, token_budget, spec };
 }
 
 function validateUpdateGoalArgs(args: unknown): { status: "complete" } {
@@ -1131,7 +1162,7 @@ function atomicWriteStateV2(goalFile: string, state: GoalState): void {
 // ────────────────────────────────────────────────────────────────────────────
 
 async function toolCreateGoal(args: unknown): Promise<GoalView> {
-  const { objective, token_budget } = validateCreateGoalArgs(args);
+  const { objective, token_budget, spec } = validateCreateGoalArgs(args);
   const resolved = resolveRootForCreate();
   // Run migration first, then re-resolve so paths reflect the post-migration state.
   const paths = await resolvePathsWithMigration(resolved.root);
@@ -1158,6 +1189,7 @@ async function toolCreateGoal(args: unknown): Promise<GoalView> {
         ...(isV2 ? { schema_version: 2 as const } : {}),
         goal_id: newId,
         objective,
+        ...(spec ? { spec } : {}),
         status: "pursuing",
         created_at: ts,
         updated_at: ts,
@@ -1309,7 +1341,7 @@ async function toolGetGoal(): Promise<GoalView> {
 // ────────────────────────────────────────────────────────────────────────────
 // P5: Five new MCP tool implementations (coordination only, not lifecycle)
 // Per spec §9 and §13: these are asymmetric-safe (model CAN call them);
-// model still cannot pause/resume/budget/mark-unmet (existing 3 tools).
+// model still cannot pause/resume/budget/mark-needs-input (existing 3 tools).
 // ────────────────────────────────────────────────────────────────────────────
 
 /** Resolve the .goal/ directory for P5 tools. */
@@ -1866,6 +1898,10 @@ const TOOLS: Tool[] = [
           minimum: 1,
           description: "Optional positive token budget. When exceeded, the goal auto-transitions to budget-limited and a wrap-up steering message is injected.",
         },
+        spec: {
+          type: "object",
+          description: "Optional structured objective from the `goalframe` skill (title, outcome, verification, constraints, boundaries, iteration, blocked_when, assumptions). Stored once and referenced by the continuation dispatcher so the raw objective is not re-pasted every turn.",
+        },
       },
       additionalProperties: false,
     },
@@ -1881,7 +1917,7 @@ const TOOLS: Tool[] = [
         status: {
           type: "string",
           enum: ["complete"],
-          description: "Only 'complete' is valid. The model cannot pause, resume, replace, modify budget, or mark unmet through this tool — those are user-only operations.",
+          description: "Only 'complete' is valid. The model cannot pause, resume, replace, modify budget, or mark a failure through this tool — those are user-only operations.",
         },
       },
       additionalProperties: false,
@@ -2143,7 +2179,7 @@ const CONTINUATION_MESSAGE =
   "Continue working toward the active project goal. " +
   "Call `mcp__goal__get_goal()` if you need the current objective and status. " +
   "If you determine the goal is achieved, call `mcp__goal__update_goal({status:\"complete\"})` " +
-  "after running a completion audit. If you are blocked, stop and report — do not auto-mark unmet.";
+  "after running a completion audit. If you are blocked, state the blocker and stop — do not mark the goal failed.";
 
 const BOOT_GRACE_MS = 2_000;
 const DEFAULT_DEBOUNCE_MS = 5_000;
@@ -2411,7 +2447,7 @@ class ChannelPushManager {
     }
 
     if (state.status !== "pursuing") {
-      // We don't push for paused/achieved/unmet/budget-limited. Each is a
+      // We don't push for paused/achieved/needs-input/budget-limited. Each is a
       // distinct outcome string so events file analytics can break them out.
       const safe = state.status.replace(/[^a-z0-9_-]/gi, "_");
       return { kind: "skip", outcome: `skipped_status_${safe}` as PushOutcome, goalId: state.goal_id };
@@ -2501,7 +2537,7 @@ async function main(): Promise<void> {
         "On receipt, call mcp__goal__get_goal() if you need the current objective and status, " +
         "then continue working toward it. If you determine the goal is achieved, " +
         "call mcp__goal__update_goal({status:\"complete\"}) after a thorough completion audit. " +
-        "If you are blocked, stop and report — do not auto-mark unmet.",
+        "If you are blocked, state the blocker and stop — do not mark the goal failed.",
     },
   );
 
