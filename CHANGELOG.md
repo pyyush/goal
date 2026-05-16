@@ -30,6 +30,24 @@ Verified against Claude Code 2.1.143 and the open-source Codex implementation.
   fire, every 25 ticks, re-orientation). v2 re-pasted the full objective every
   turn.
 
+### Per-goal token + cost tracking
+- The Stop hook now accounts each turn's full token `usage` and Claude Code's
+  own per-turn `costUSD` (cache- and model-aware) — verified present in the
+  CC 2.1.143 transcript. The plugin maintains no price table: the cost figure
+  is CC's own, so it cannot drift. If `costUSD` is unavailable, cost stays 0
+  and only tokens are reported — never guessed.
+- Monotonic delta accounting: the baseline lives inside the goal record
+  (`.accounting`), written atomically with the counters. `tokens_used` and
+  `cost_usd` only ever rise; a transcript/session swap re-baselines safely
+  (at worst a one-fire undercount, never a backward jump). The first fire
+  baselines, so pre-goal conversation in the same session is excluded.
+  Fixes a v2 bug where a lost side-file baseline reset `tokens_used` to 0.
+- `tokens_used` is now fresh input + cache-write + output (was output-only),
+  so a token budget caps real consumption, not just visible output.
+- `cost_usd` / `cost_usd_final` freeze on `achieved` / `budget-limited`.
+- The status line shows the goal's notional cost (`≈$…`) across every state,
+  labelled approximate; it is API-equivalent for subscription users, not a bill.
+
 ### UX
 - New cockpit status line: state-driven glyph + colour, evidence meter, live
   timer. Renders only for the owning session; terminal states do not stick.

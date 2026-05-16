@@ -63,39 +63,61 @@ if [ -e "$KILL_SWITCH" ]; then
     exit 0
 fi
 
-# --- read status; only `pursuing` goals are driven --------------------------
-
-STATUS=$(jq -r '.status // ""' "$GOAL_FILE" 2>/dev/null) || STATUS=""
-if [ "$STATUS" != "pursuing" ]; then
-    log "not-pursuing" "status=$STATUS"
-    exit 0
-fi
-
-OBJECTIVE=$(jq -r '.objective // ""' "$GOAL_FILE" 2>/dev/null) || OBJECTIVE=""
-[ -n "$OBJECTIVE" ] || { log "no-objective" ""; exit 0; }
-
-# --- token accounting (OUTSIDE the lock — may take seconds on a big file) ----
+# --- read goal record fields ------------------------------------------------
 
 is_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
-TOKEN_BUDGET=$(jq -r '.token_budget // "null"' "$GOAL_FILE" 2>/dev/null) || TOKEN_BUDGET=null
-TOKENS_USED=$(jq -r '.tokens_used // 0'        "$GOAL_FILE" 2>/dev/null) || TOKENS_USED=0
-is_int "$TOKENS_USED" || TOKENS_USED=0
+# atomic_update <jq-filter> [jq-args…] — apply a CAS-guarded jq filter to the
+# goal record atomically (temp on the same fs → atomic rename). The caller must
+# hold the per-goal lock. Returns 0 on success; on any failure the record is
+# left untouched.
+atomic_update() {
+    local filter="$1"; shift
+    local tmp; tmp=$(mktemp "$GOAL_DIR/goals/.t.XXXXXX" 2>/dev/null) || return 1
+    if jq "$@" "$filter" "$GOAL_FILE" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$GOAL_FILE" 2>/dev/null && return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    return 1
+}
 
-BASELINE_FILE="$GOAL_DIR/cursors/$GOAL_ID.tokenbase"
-COMPUTED_USED="$TOKENS_USED"
+STATUS=$(jq -r '.status // ""'  "$GOAL_FILE" 2>/dev/null) || STATUS=""
+[ -n "$STATUS" ] || { log "no-status" ""; exit 0; }
+OBJECTIVE=$(jq -r '.objective // ""'   "$GOAL_FILE" 2>/dev/null) || OBJECTIVE=""
+TOKEN_BUDGET=$(jq -r '.token_budget // "null"' "$GOAL_FILE" 2>/dev/null) || TOKEN_BUDGET=null
+
+# --- transcript usage scan (OUTSIDE the lock — slow on a big transcript) -----
+#
+# Claude Code records, per assistant turn, the full token `usage` block and its
+# OWN computed dollar cost (`costUSD` — cache- and model-aware). We sum the
+# cumulative transcript totals here; the accounting pass (below, under the lock)
+# turns that into a per-goal delta. `usage` is the documented shape; `costUSD`
+# is CC's own number, used verbatim so this plugin never maintains a price
+# table. If `costUSD` is absent, cost simply stays 0 and only tokens are
+# reported — never guessed.
+#
+# CUR_TOKENS counts "fresh" work: uncached input + cache writes + output. Cache
+# READS (cheap re-sends of context) are excluded so a long loop's count is not
+# inflated by the same context being re-read every turn.
+
+CUR_TOKENS=0 CUR_COST=0 SCAN_OK=0
 if [ -n "$TRANSCRIPT_PATH" ] && [ -r "$TRANSCRIPT_PATH" ]; then
-    CURRENT_TOTAL=$(jq -r '.message.usage.output_tokens // empty' "$TRANSCRIPT_PATH" 2>/dev/null \
-                    | awk '/^[0-9]+$/ {s+=$1} END {print s+0}' 2>/dev/null) || CURRENT_TOTAL=""
-    if is_int "$CURRENT_TOTAL"; then
-        if [ ! -f "$BASELINE_FILE" ]; then
-            printf '%s' "$CURRENT_TOTAL" > "$BASELINE_FILE" 2>/dev/null || true
-            COMPUTED_USED=0
-        else
-            BASELINE=$(cat "$BASELINE_FILE" 2>/dev/null || printf '0')
-            is_int "$BASELINE" || BASELINE=0
-            COMPUTED_USED=$((CURRENT_TOTAL - BASELINE))
-            [ "$COMPUTED_USED" -lt 0 ] && COMPUTED_USED=0
+    _scan=$(jq -r 'select(.type=="assistant")
+                   | [ (.message.usage.input_tokens // 0),
+                       (.message.usage.output_tokens // 0),
+                       (.message.usage.cache_creation_input_tokens // 0),
+                       (.costUSD // 0) ] | @tsv' \
+                  "$TRANSCRIPT_PATH" 2>/dev/null \
+            | awk -F'\t' '{tok += $1 + $2 + $3; cost += $4}
+                          END {printf "%d %.6f", tok+0, cost+0}' 2>/dev/null) || _scan=""
+    if [ -n "$_scan" ]; then
+        _t=$(printf '%s' "$_scan" | awk '{print $1+0}' 2>/dev/null)
+        _c=$(printf '%s' "$_scan" | awk '{print $2+0}' 2>/dev/null)
+        if is_int "$_t"; then
+            CUR_TOKENS="$_t"
+            case "$_c" in ''|*[!0-9.]*) _c=0 ;; esac
+            CUR_COST="$_c"
+            SCAN_OK=1
         fi
     fi
 fi
@@ -127,35 +149,90 @@ if ! lock_acquire; then
 fi
 trap 'lock_release' EXIT INT TERM
 
-# Persist the recomputed token count (CAS-guarded; atomic; temp in .goal/goals/).
-if [ "$COMPUTED_USED" != "$TOKENS_USED" ] && is_int "$COMPUTED_USED"; then
-    _tmp=$(mktemp "$GOAL_DIR/goals/.t.XXXXXX" 2>/dev/null) || _tmp=""
-    if [ -n "$_tmp" ]; then
-        if jq --argjson u "$COMPUTED_USED" --arg ts "$(date -u +%FT%TZ)" --arg gid "$GOAL_ID" \
-              'if (.goal_id // "")==$gid then .tokens_used=$u | .updated_at=$ts else . end' \
-              "$GOAL_FILE" > "$_tmp" 2>/dev/null
-        then
-            mv "$_tmp" "$GOAL_FILE" 2>/dev/null && TOKENS_USED="$COMPUTED_USED" || rm -f "$_tmp" 2>/dev/null
-        else
-            rm -f "$_tmp" 2>/dev/null
-        fi
-    fi
+# --- accounting pass: fold this turn's usage into the goal record -----------
+#
+# Monotonic delta accounting. The baseline (last cumulative transcript totals)
+# lives IN the goal record under `.accounting`, written atomically with the
+# counters — so it can never drift from them or be lost as a stray side file.
+#   * pursuing            → add max(0, delta) to tokens_used / cost_usd
+#   * achieved|budget…    → add the final turn ONCE, then freeze *_final
+#   * paused|needs-input  → add nothing; just re-baseline (paused time is not
+#                           goal work) so the next resume measures cleanly
+#   * transcript changed  → delta 0 + re-baseline (a session swap can only cost
+#                           one fire of under-count, never a backward jump;
+#                           the first fire also baselines, excluding any
+#                           pre-goal conversation in the same session)
+#   * scan failed         → counters AND baseline left untouched (show stale,
+#                           never wrong)
+# tokens_used only ever rises; a bad transcript can undercount but never
+# produce a wrong-direction number.
+
+ACCT_FILTER='
+  if (.goal_id // "") != $gid then . else
+    ((.accounting // {})) as $acc
+    | ($acc.last_tokens // 0) as $ltok
+    | ($acc.last_cost   // 0) as $lcost
+    | ($acc.transcript  // "") as $ltp
+    | (.status // "") as $st
+    | ($ltp != $transcript) as $rebase
+    | (if   ($scan_ok != 1) then 0
+       elif $rebase         then 0
+       else ([($cur_tokens - $ltok), 0] | max) end) as $dtok
+    | (if   ($scan_ok != 1) then 0
+       elif $rebase         then 0
+       else ([($cur_cost  - $lcost), 0] | max) end) as $dcost
+    | (($st == "pursuing")
+       or (($st == "achieved" or $st == "budget-limited") and (.cost_usd_final == null))) as $add
+    | (if $add then ((.tokens_used // 0) + $dtok) else (.tokens_used // 0) end) as $ntok
+    | (if $add then ((.cost_usd   // 0) + $dcost) else (.cost_usd  // 0) end) as $ncost
+    | .tokens_used = $ntok
+    | .cost_usd    = $ncost
+    | .updated_at  = $ts
+    | (if (($st == "achieved" or $st == "budget-limited") and (.cost_usd_final == null))
+         then (.cost_usd_final = $ncost | .tokens_used_final = $ntok)
+         else . end)
+    | (if $scan_ok == 1
+         then .accounting = { last_tokens: $cur_tokens, last_cost: $cur_cost,
+                              transcript: $transcript, updated_at: $ts }
+         else . end)
+  end'
+
+atomic_update "$ACCT_FILTER" \
+    --arg gid "$GOAL_ID" --arg ts "$(date -u +%FT%TZ)" \
+    --arg transcript "${TRANSCRIPT_PATH:-}" \
+    --argjson scan_ok "$SCAN_OK" \
+    --argjson cur_tokens "$CUR_TOKENS" \
+    --argjson cur_cost "$CUR_COST" \
+  || log "accounting-write-failed" "tokens=$CUR_TOKENS cost=$CUR_COST"
+
+# --- terminal goals: accounting is done; nothing more to drive --------------
+
+if [ "$STATUS" != "pursuing" ]; then
+    log "not-pursuing" "status=$STATUS"
+    lock_release; trap - EXIT INT TERM
+    exit 0
 fi
 
+[ -n "$OBJECTIVE" ] || { log "no-objective" ""; lock_release; trap - EXIT INT TERM; exit 0; }
+
 # --- budget enforcement (system-set; the model can never set this) ----------
+#
+# tokens_used is now fresh input + cache-write + output — the real consumption
+# measure — so a token budget caps real work, not just visible output.
+
+TOKENS_USED=$(jq -r '.tokens_used // 0' "$GOAL_FILE" 2>/dev/null) || TOKENS_USED=0
+is_int "$TOKENS_USED" || TOKENS_USED=0
 
 if is_int "$TOKEN_BUDGET" && [ "$TOKEN_BUDGET" -gt 0 ] && [ "$TOKENS_USED" -ge "$TOKEN_BUDGET" ]; then
-    _tmp=$(mktemp "$GOAL_DIR/goals/.t.XXXXXX" 2>/dev/null) || _tmp=""
-    if [ -n "$_tmp" ]; then
-        jq --arg ts "$(date -u +%FT%TZ)" --arg gid "$GOAL_ID" \
-           'if (.goal_id // "")==$gid then
-                .status="budget-limited" | .updated_at=$ts
-                | .history=((.history // [])+[{ts:$ts,action:"budget-limit",note:"token budget reached"}])
-            else . end' \
-           "$GOAL_FILE" > "$_tmp" 2>/dev/null \
-        && { mv "$_tmp" "$GOAL_FILE" 2>/dev/null || rm -f "$_tmp" 2>/dev/null; } \
-        || rm -f "$_tmp" 2>/dev/null
-    fi
+    atomic_update '
+      if (.goal_id // "") != $gid then . else
+        .status = "budget-limited" | .updated_at = $ts
+        | .cost_usd_final    = (.cost_usd    // 0)
+        | .tokens_used_final = (.tokens_used // 0)
+        | .history = ((.history // []) + [{ts:$ts, action:"budget-limit", note:"token budget reached"}])
+      end' \
+      --arg gid "$GOAL_ID" --arg ts "$(date -u +%FT%TZ)" \
+      || log "budget-write-failed" "${TOKENS_USED}/${TOKEN_BUDGET}"
     log "budget-limit" "${TOKENS_USED}/${TOKEN_BUDGET}"
     lock_release; trap - EXIT INT TERM
     jq -n --arg o "$OBJECTIVE" --arg u "$TOKENS_USED" --arg b "$TOKEN_BUDGET" '{

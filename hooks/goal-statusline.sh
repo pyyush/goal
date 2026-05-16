@@ -58,12 +58,13 @@ ROW=$(jq -r --arg s "$US" '
           | (if (.status // "") == "pursuing"
                then ($base + (($now - $obs) | if . < 0 then 0 else . end))
                else (.time_used_seconds_final // $base) end)
-          | floor | tostring )
+          | floor | tostring ),
+        ((.cost_usd_final // .cost_usd // 0) | tostring)
       ] | join($s)
 ' "$GOAL_FILE" 2>/dev/null) || exit 0
 [ -n "$ROW" ] || exit 0
 
-IFS=$US read -r STATUS TITLE STRIKES TICKS TOKENS CHECKS SECONDS <<EOF
+IFS=$US read -r STATUS TITLE STRIKES TICKS TOKENS CHECKS SECONDS COST <<EOF
 $ROW
 EOF
 
@@ -88,6 +89,17 @@ fmt_tokens() {
         else if (n < 100000)  printf "%.1fK", n/1000;
         else if (n < 1000000) printf "%.0fK", n/1000;
         else                  printf "%.1fM", n/1000000;
+    }'
+}
+# fmt_cost -- Claude Code's own per-turn costUSD, summed for this goal. Notional
+# (API-equivalent) for subscription users -- prefixed with the approx sign to
+# say so. Prints nothing when cost is zero/unknown, so callers append freely.
+fmt_cost() {
+    awk -v c="${1:-0}" 'BEGIN {
+        c = c + 0;
+        if (c <= 0) exit;
+        if (c < 1) printf "≈$%.3f", c;
+        else       printf "≈$%.2f", c;
     }'
 }
 
@@ -130,6 +142,10 @@ case "$STATUS" in
     paused|budget-limited)
         SEG="${GLYPH} ${LABEL}${DOT}${TITLE}" ;;
 esac
+
+# Append the goal's notional cost to every state (when known and non-zero).
+COSTSEG=$(fmt_cost "$COST")
+[ -n "$COSTSEG" ] && SEG="${SEG}${DOT}${COSTSEG}"
 
 if [ "${GOAL_STATUSLINE_STYLE:-color}" = "plain" ]; then
     printf '%s' "$SEG"

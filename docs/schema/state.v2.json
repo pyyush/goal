@@ -60,7 +60,7 @@
       "type": "integer",
       "minimum": 0,
       "default": 0,
-      "description": "Cumulative output tokens consumed by this goal across all agents."
+      "description": "Cumulative tokens this goal has consumed: fresh input + cache-write + output, summed per turn via monotonic delta accounting (cache reads excluded). Maintained only by the Stop hook."
     },
     "time_used_seconds": {
       "type": "integer",
@@ -90,7 +90,29 @@
       "type": ["integer", "null"],
       "minimum": 0,
       "default": null,
-      "description": "Terminal token snapshot."
+      "description": "Terminal token snapshot. Renderers never recompute after this is set."
+    },
+    "cost_usd": {
+      "type": "number",
+      "minimum": 0,
+      "default": 0,
+      "description": "Cumulative notional API cost of this goal in USD. Summed per turn from Claude Code's own per-turn costUSD (cache- and model-aware); the plugin maintains no price table. For subscription users this is an API-equivalent estimate, not a bill. 0 when costUSD is unavailable."
+    },
+    "cost_usd_final": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "default": null,
+      "description": "Terminal cost snapshot, frozen when the goal reaches achieved or budget-limited."
+    },
+    "accounting": {
+      "type": ["object", "null"],
+      "description": "Stop-hook delta-accounting baseline. Stores the last cumulative transcript totals (last_tokens, last_cost) and the transcript path they were read from, written atomically with tokens_used/cost_usd so the baseline can never drift from the counters. Internal; not user-edited.",
+      "properties": {
+        "last_tokens": { "type": "integer", "minimum": 0 },
+        "last_cost": { "type": "number", "minimum": 0 },
+        "transcript": { "type": "string" },
+        "updated_at": { "type": "string" }
+      }
     },
     "tick_count": {
       "type": "integer",

@@ -43,10 +43,11 @@ write_sl() { jq -n --arg now "$NOW" --arg gid "$SLID" "$1" > "$TMP/.goal/goals/$
 SL() { GOAL_STATUSLINE_STYLE=plain bash "$STATUSLINE" "$TMP" "$SESS" 2>/dev/null; }
 
 # pursuing (healthy): the owning session renders the cockpit segment + live time
-write_sl '{goal_id:$gid,objective:"Refactor the auth module",status:"pursuing",idle_strikes:0,tick_count:3,token_budget:50000,tokens_used:12500,time_used_seconds:300,observed_at:$now,active_turn_started_at:$now,pursuing_seconds:300,pursuing_since:$now,created_at:$now,updated_at:$now,history:[]}'
+write_sl '{goal_id:$gid,objective:"Refactor the auth module",status:"pursuing",idle_strikes:0,tick_count:3,token_budget:50000,tokens_used:12500,cost_usd:0.42,time_used_seconds:300,observed_at:$now,active_turn_started_at:$now,pursuing_seconds:300,pursuing_since:$now,created_at:$now,updated_at:$now,history:[]}'
 OUT=$(SL)
 printf '%s\n' "$OUT" | grep -q "◎" || fail "pursuing: healthy glyph missing: [$OUT]"
 printf '%s\n' "$OUT" | grep -q '5m' || fail "pursuing: live time missing: [$OUT]"
+printf '%s\n' "$OUT" | grep -q '0.42' || fail "pursuing: notional cost missing: [$OUT]"
 
 # Bug-3 guard: a session that owns no goal renders NOTHING
 OUT=$(GOAL_STATUSLINE_STYLE=plain bash "$STATUSLINE" "$TMP" "stranger" 2>/dev/null)
@@ -61,11 +62,12 @@ write_sl '{goal_id:$gid,objective:"Refactor the auth module",status:"needs-input
 SL | grep -q "needs input" || fail "needs-input render wrong: [$(SL)]"
 
 # achieved: frozen final time + tokens
-write_sl '{goal_id:$gid,objective:"Refactor the auth module",status:"achieved",idle_strikes:0,tick_count:9,time_used_seconds_final:420,tokens_used_final:47000,active_turn_started_at:null,pursuing_seconds:420,created_at:$now,updated_at:$now,history:[]}'
+write_sl '{goal_id:$gid,objective:"Refactor the auth module",status:"achieved",idle_strikes:0,tick_count:9,time_used_seconds_final:420,tokens_used_final:47000,cost_usd_final:2.81,active_turn_started_at:null,pursuing_seconds:420,created_at:$now,updated_at:$now,history:[]}'
 OUT=$(SL)
 printf '%s\n' "$OUT" | grep -q "goal achieved" || fail "achieved label wrong: [$OUT]"
 printf '%s\n' "$OUT" | grep -q '7m'    || fail "achieved final time wrong: [$OUT]"
 printf '%s\n' "$OUT" | grep -q '47.0K' || fail "achieved final tokens wrong: [$OUT]"
+printf '%s\n' "$OUT" | grep -q '2.81'  || fail "achieved final cost wrong: [$OUT]"
 
 step "4. MCP scoped tools: progress, breadcrumbs, stuck, queue, steer"
 rpc() {
