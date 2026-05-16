@@ -1,6 +1,6 @@
 # A stable, Codex-faithful `/goal`
 
-Branch: `feat/v3-session-scoped-goals` — 4 commits, +1939 / -1387 across 17 files.
+Branch: `feat/v3-session-scoped-goals` — 5 commits, +2470 / -1740 across 30 files.
 
 ## Why
 
@@ -49,6 +49,10 @@ Codex-shaped.
   citing the persisted spec, with a full re-paste only on context-loss signals
   (first fire of a session, every 25 ticks, a re-orientation turn). v2
   re-pasted the full objective on every turn.
+- `mcp__goal__create_goal` now accepts and persists the structured `goalframe`
+  spec, so the spec is stored once and the dispatcher has something concrete to
+  reference. (Codex re-pastes the objective every continuation turn; this is the
+  one place the plugin is deliberately leaner than Codex.)
 
 **UX — the cockpit status line**
 - `goal-statusline.sh` rewritten: state-driven glyph and colour (circle-dot
@@ -63,11 +67,15 @@ Codex-shaped.
 
 ## Verification
 
-- All hook scripts pass `bash -n`; all JSON validates.
-- End-to-end Stop-hook loop tested: progress -> continue, no-progress ->
-  re-orient -> park to `needs-input`, budget reached -> `budget-limited`.
-- Zero stderr across a hook fire.
-- Continuation prompt tiers (short reference vs full spec) confirmed.
+- All nine hook scripts pass `bash -n`; all JSON validates.
+- `scripts/smoke-v3-harness.sh` green: authoring, templates, the cockpit
+  status line across pursuing / stalled / needs-input / achieved (including the
+  Bug-3 guard that an unowned session renders nothing), and the MCP tools.
+- `scripts/smoke-phase-1.sh` and the migration smoke green; the MCP server
+  builds clean (`tsc`) and `mcp/test/smoke.mjs` + `channel-smoke.mjs` pass.
+- End-to-end Stop-hook loop: progress -> continue, no-progress -> re-orient ->
+  park to `needs-input`, budget reached -> `budget-limited`; zero stderr.
+- No `unmet` remains in any live code path — verified by sweep.
 
 ## How to apply
 
