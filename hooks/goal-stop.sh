@@ -123,17 +123,56 @@ if [ -n "$TRANSCRIPT_PATH" ] && [ -r "$TRANSCRIPT_PATH" ]; then
 fi
 
 # --- per-goal lock (mkdir mutex) --------------------------------------------
+#
+# v3 lock model — read this before touching:
+#
+#   Stop hook locks PER-GOAL at .goal/locks/<gid>.lock so a slow transcript scan
+#   on goal A cannot starve goal B (B's Stop hook in a different session in the
+#   same project gets its own lock). The MCP server locks PROJECT-LEVEL at
+#   .goal/lock (via proper-lockfile) so all of its RMW serializes across goals.
+#   These are two different locks at two different paths — deliberate.
+#
+#   Why they don't race on the same goal file:
+#     * Same session: MCP runs DURING a turn; Stop fires AFTER. Claude Code's
+#       turn boundary serializes them in time. No concurrent access.
+#     * Different sessions, same project: v3 ownership says one goal is owned
+#       by exactly one session. Session A's Stop only writes goal A; Session B's
+#       Stop only writes goal B. Different files → no conflict.
+#     * Shared append logs (events.jsonl): a single `>>` append of a small line
+#       is atomic on POSIX (< PIPE_BUF); Node's appendFileSync is the same.
+#       Interleaved appends from bash + MCP produce correct, ordered lines.
+#
+# If you add a writer that must coordinate with the MCP across goals, take the
+# project-level lock (goal-lock.sh: goal_lock_acquire), not this one.
 
 lock_acquire() {
     local started elapsed
     started=$(date +%s 2>/dev/null || echo 0)
+    mkdir -p "$(dirname "$GOAL_LOCK")" 2>/dev/null || true
     while :; do
-        mkdir "$GOAL_LOCK" 2>/dev/null && { printf '%d' "$$" > "$GOAL_LOCK/pid" 2>/dev/null; return 0; }
-        # Steal a lock whose owner is gone, or one held absurdly long (>30s).
+        if mkdir "$GOAL_LOCK" 2>/dev/null; then
+            # Acquired. Stamp pid, then verify ownership by reading back —
+            # closes the race where a concurrent stealer renames our fresh
+            # lockdir aside between our mkdir and pid-write (TOCTOU fix part 2).
+            printf '%d' "$$" > "$GOAL_LOCK/pid" 2>/dev/null
+            local _v; _v=$(cat "$GOAL_LOCK/pid" 2>/dev/null | tr -d ' \t\r\n')
+            [ "$_v" = "$$" ] && return 0
+            sleep 0.02 2>/dev/null || true
+            continue
+        fi
+        # Steal a lock whose owner is gone. ATOMIC STEAL via rename(2): only one
+        # stealer wins; if the lock was just released and re-acquired in the
+        # meantime, our rename misses and the active holder is undisturbed.
+        # Closes the TOCTOU race where a naive `rm -rf` could blow away a fresh
+        # lock between our staleness read and our removal.
         if [ -f "$GOAL_LOCK/pid" ]; then
             local owner; owner=$(cat "$GOAL_LOCK/pid" 2>/dev/null || echo "")
             if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-                rm -rf "$GOAL_LOCK" 2>/dev/null; continue
+                local dead="${GOAL_LOCK}.dead.$$.$(date +%s 2>/dev/null || echo 0)"
+                if mv "$GOAL_LOCK" "$dead" 2>/dev/null; then
+                    rm -rf "$dead" 2>/dev/null
+                fi
+                continue
             fi
         fi
         elapsed=$(( $(date +%s 2>/dev/null || echo 0) - started ))
