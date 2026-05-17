@@ -34,20 +34,40 @@ step "2. Template instantiation and backlog decomposition"
 "$GOALCTL" --root "$TMP" template list >/tmp/v3-templates
 grep -q dependency-upgrade /tmp/v3-templates || fail "template list missing shipped template"
 
-step "3. V3 statusline live time, token freshness, and final snapshot"
+step "3. V3 cockpit statusline -- owned-session render across states"
+mkdir -p "$TMP/.goal/goals" "$TMP/.goal/sessions"
+SLID="g-cockpit"; SESS="sess-cockpit"
+printf '%s' "$SLID" > "$TMP/.goal/sessions/$SESS"
 NOW=$(date -u +%FT%TZ)
-OLD=$(date -u -v-45S +%FT%TZ 2>/dev/null || date -u -d '45 seconds ago' +%FT%TZ)
-jq --arg now "$NOW" --arg old "$OLD" '
-  .status="pursuing" | .token_budget=50000 | .tokens_used=12500 |
-  .time_used_seconds=300 | .observed_at=$now | .active_turn_started_at=$now |
-  .tokens_used_observed_at=$old
-' "$TMP/.goal/state.json" > "$TMP/.goal/state.tmp" && mv "$TMP/.goal/state.tmp" "$TMP/.goal/state.json"
-touch "$TMP/.goal/heartbeat"
-OUT=$(GOAL_STATUSLINE_STYLE=plain bash "$STATUSLINE" "$TMP" "" 2>/dev/null)
-printf '%s\n' "$OUT" | grep -q '12.5K/50K\*' || fail "statusline missing stale token asterisk: $OUT"
-jq '.status="achieved" | .time_used_seconds_final=420 | .tokens_used_final=47000 | .active_turn_started_at=null' "$TMP/.goal/state.json" > "$TMP/.goal/state.tmp" && mv "$TMP/.goal/state.tmp" "$TMP/.goal/state.json"
-OUT=$(GOAL_STATUSLINE_STYLE=plain bash "$STATUSLINE" "$TMP" "" 2>/dev/null)
-printf '%s\n' "$OUT" | grep -q '✓ 7m · 47K tokens' || fail "achieved final snapshot render: $OUT"
+write_sl() { jq -n --arg now "$NOW" --arg gid "$SLID" "$1" > "$TMP/.goal/goals/$SLID.json"; }
+SL() { GOAL_STATUSLINE_STYLE=plain bash "$STATUSLINE" "$TMP" "$SESS" 2>/dev/null; }
+
+# pursuing (healthy): the owning session renders the cockpit segment + live time
+write_sl '{goal_id:$gid,objective:"Refactor the auth module",status:"pursuing",idle_strikes:0,tick_count:3,token_budget:50000,tokens_used:12500,cost_usd:0.42,time_used_seconds:300,observed_at:$now,active_turn_started_at:$now,pursuing_seconds:300,pursuing_since:$now,created_at:$now,updated_at:$now,history:[]}'
+OUT=$(SL)
+printf '%s\n' "$OUT" | grep -q "◎" || fail "pursuing: healthy glyph missing: [$OUT]"
+printf '%s\n' "$OUT" | grep -q '5m' || fail "pursuing: live time missing: [$OUT]"
+printf '%s\n' "$OUT" | grep -q '0.42' || fail "pursuing: notional cost missing: [$OUT]"
+
+# Bug-3 guard: a session that owns no goal renders NOTHING
+OUT=$(GOAL_STATUSLINE_STYLE=plain bash "$STATUSLINE" "$TMP" "stranger" 2>/dev/null)
+[ -z "$OUT" ] || fail "unowned session must render nothing: [$OUT]"
+
+# stalled: amber glyph + label after a no-progress turn
+write_sl '{goal_id:$gid,objective:"Refactor the auth module",status:"pursuing",idle_strikes:1,tick_count:4,time_used_seconds:360,observed_at:$now,active_turn_started_at:$now,pursuing_seconds:360,pursuing_since:$now,created_at:$now,updated_at:$now,history:[]}'
+SL | grep -q "goal stalled" || fail "stalled render wrong: [$(SL)]"
+
+# needs-input: parked + resumable, NOT a failure state
+write_sl '{goal_id:$gid,objective:"Refactor the auth module",status:"needs-input",idle_strikes:2,tick_count:5,time_used_seconds:600,observed_at:$now,pursuing_seconds:600,created_at:$now,updated_at:$now,history:[]}'
+SL | grep -q "needs input" || fail "needs-input render wrong: [$(SL)]"
+
+# achieved: frozen final time + tokens
+write_sl '{goal_id:$gid,objective:"Refactor the auth module",status:"achieved",idle_strikes:0,tick_count:9,time_used_seconds_final:420,tokens_used_final:47000,cost_usd_final:2.81,active_turn_started_at:null,pursuing_seconds:420,created_at:$now,updated_at:$now,history:[]}'
+OUT=$(SL)
+printf '%s\n' "$OUT" | grep -q "goal achieved" || fail "achieved label wrong: [$OUT]"
+printf '%s\n' "$OUT" | grep -q '7m'    || fail "achieved final time wrong: [$OUT]"
+printf '%s\n' "$OUT" | grep -q '47.0K' || fail "achieved final tokens wrong: [$OUT]"
+printf '%s\n' "$OUT" | grep -q '2.81'  || fail "achieved final cost wrong: [$OUT]"
 
 step "4. MCP scoped tools: progress, breadcrumbs, stuck, queue, steer"
 rpc() {

@@ -13,7 +13,7 @@
  *   goal.created           → counter goal.created
  *   goal.completed         → counter goal.completed + histograms (token_count,
  *                            elapsed_seconds, continuation_turns) when present
- *   goal.unmet             → counter goal.unmet
+ *   goal.needs_input             → counter goal.needs_input
  *   goal.budget_limited    → counter goal.budget_limited
  *   goal.tokens_updated    → histogram goal.token_count (tokens_used, attr goal_id)
  *   goal.relayed           → counter goal.relayed (attrs: reason, from, to)
@@ -173,7 +173,7 @@ interface Instruments {
   counters: {
     created: import("@opentelemetry/api").Counter;
     completed: import("@opentelemetry/api").Counter;
-    unmet: import("@opentelemetry/api").Counter;
+    needs_input: import("@opentelemetry/api").Counter;
     budget_limited: import("@opentelemetry/api").Counter;
     relayed: import("@opentelemetry/api").Counter;
     queued: import("@opentelemetry/api").Counter;
@@ -199,8 +199,8 @@ function buildInstruments(): Instruments {
       completed: meter.createCounter("goal.completed", {
         description: "Goals marked complete by the model",
       }),
-      unmet: meter.createCounter("goal.unmet", {
-        description: "Goals user-marked as unmet/blocked",
+      needs_input: meter.createCounter("goal.needs_input", {
+        description: "Goals user-marked as needs-input/blocked",
       }),
       budget_limited: meter.createCounter("goal.budget_limited", {
         description: "Goals that hit their token budget",
@@ -281,8 +281,8 @@ function dispatch(ev: GoalEvent): void {
         inst.histograms.token_count.record(ev.tokens_used, attrs);
       }
       break;
-    case "goal.unmet":
-      inst.counters.unmet.add(1, attrs);
+    case "goal.needs_input":
+      inst.counters.needs_input.add(1, attrs);
       break;
     case "goal.budget_limited":
       inst.counters.budget_limited.add(1, attrs);

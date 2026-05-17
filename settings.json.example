@@ -1,55 +1,22 @@
 {
+  "//": "Manual (non-plugin) install of goal. The goal cockpit is wired into the status line ADDITIVELY by bin/goal-statusline-install, which the installer runs for you — it preserves any status line you already have. statusLine and the SessionStart hook below are shown for reference; for a fresh install you can copy them verbatim.",
+  "statusLine": {
+    "type": "command",
+    "command": "bash $HOME/.claude/hooks/goal-statusline-wrap.sh",
+    "refreshInterval": 10
+  },
   "hooks": {
     "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/goal-ticker.sh"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Task",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/goal-ticker.sh"
-          }
-        ]
-      }
+      { "hooks": [ { "type": "command", "command": "bash $HOME/.claude/bin/goal-statusline-install --ensure" } ] }
     ],
     "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/goal-stop.sh"
-          }
-        ]
-      }
+      { "hooks": [ { "type": "command", "command": "bash $HOME/.claude/hooks/goal-stop.sh" } ] }
     ],
     "Notification": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/goal-notify.sh"
-          }
-        ]
-      }
+      { "hooks": [ { "type": "command", "command": "bash $HOME/.claude/hooks/goal-notify.sh" } ] }
     ],
     "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/goal-prompt.sh"
-          }
-        ]
-      }
+      { "hooks": [ { "type": "command", "command": "bash $HOME/.claude/hooks/goal-prompt.sh" } ] }
     ]
   }
 }

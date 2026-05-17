@@ -58,9 +58,23 @@ goal_lock_acquire() {
 
     while :; do
         if mkdir "$lockdir" 2>/dev/null; then
-            # Acquired. Stamp pid + timestamp inside.
+            # Acquired. Stamp pid + timestamp inside, then VERIFY ownership by
+            # reading the pid back. A concurrent stealer that races between our
+            # mkdir and our pid-write can `mv` our fresh lockdir aside (still
+            # appearing "stale" from its pre-fetched view) and recreate it; our
+            # pidfile then ends up under .dead.<X>/, not at $pidfile, so the
+            # readback will show empty or a different pid. If so, we did NOT
+            # actually win — loop and retry. This is the second half of the
+            # TOCTOU fix; the rename-based steal alone isn't sufficient.
             printf '%d\n%d\n' "$$" "$(goal_lock_now_ms)" > "$pidfile" 2>/dev/null || true
-            return 0
+            local _verify
+            _verify=$(head -n1 "$pidfile" 2>/dev/null | tr -d ' \t\r\n')
+            if [ "$_verify" = "$$" ]; then
+                return 0
+            fi
+            # Got swapped — give the racing stealer a moment, then retry.
+            goal_lock_sleep_ms 25
+            continue
         fi
 
         # Held — check for staleness.
@@ -71,20 +85,34 @@ goal_lock_acquire() {
                 IFS= read -r held_at || held_at=""
             } < "$pidfile" 2>/dev/null
 
+            local should_steal=0
             if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
                 # Owner is dead. Steal.
-                rm -rf "$lockdir" 2>/dev/null
-                continue
-            fi
-            if [ -n "$held_at" ]; then
+                should_steal=1
+            elif [ -n "$held_at" ]; then
                 local now_ms held_for_ms
                 now_ms=$(goal_lock_now_ms)
                 held_for_ms=$((now_ms - held_at))
                 if [ "$held_for_ms" -ge "$stale_ms" ]; then
                     # Held too long. Steal — owner is hung.
-                    rm -rf "$lockdir" 2>/dev/null
-                    continue
+                    should_steal=1
                 fi
+            fi
+
+            if [ "$should_steal" = 1 ]; then
+                # ATOMIC STEAL: rename the stale lockdir aside, THEN remove it.
+                # `mv` is rename(2) — atomic. Only one stealer wins; if the lock
+                # was already released and re-acquired by another process, our
+                # rename misses (source no longer exists, or its inode changed)
+                # and the active holder is undisturbed. This closes the TOCTOU
+                # race where `rm -rf` could blow away a fresh lock that another
+                # process had legitimately acquired in the window between our
+                # staleness read and our removal.
+                local dead="${lockdir}.dead.$$.$(goal_lock_now_ms)"
+                if mv "$lockdir" "$dead" 2>/dev/null; then
+                    rm -rf "$dead" 2>/dev/null
+                fi
+                continue
             fi
         fi
 

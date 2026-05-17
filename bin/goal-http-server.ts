@@ -9,7 +9,7 @@
  *   POST  /goal                  → 201 goal-json | 409 {"error":"goal_exists_and_active"}
  *                                  Body: {objective: string, token_budget?: number}
  *   PATCH /goal                  → 200 goal-json | 400 invalid action | 404 no goal
- *                                  Body: {action: "pause"|"resume"|"clear"|"set-budget"|"mark-unmet", value?: any}
+ *                                  Body: {action: "pause"|"resume"|"clear"|"set-budget"|"mark-needs-input", value?: any}
  *                                  For "clear": returns 204 No Content.
  *   GET   /events?since=<iso>    → application/x-ndjson stream of events from
  *                                  .goal/events.jsonl. Stays open and
@@ -35,7 +35,7 @@ import lockfile from "proper-lockfile";
 // ---- types ----------------------------------------------------------------
 
 // v2 adds relaying and queued; readers must tolerate them.
-type GoalStatus = "pursuing" | "paused" | "achieved" | "unmet" | "budget-limited" | "relaying" | "queued";
+type GoalStatus = "pursuing" | "paused" | "achieved" | "needs-input" | "budget-limited" | "relaying" | "queued";
 
 interface HistoryEntry {
     ts: string;
@@ -347,7 +347,7 @@ function pushHistory(goal: Goal, action: string, note: string, ts: string): Goal
  * Read goal as-is from disk but apply the same backward-compat seeding the
  * MCP server does: missing pursuing_seconds → 0, and on a pursuing legacy
  * file missing pursuing_since → seed from created_at. This keeps the
- * delta-accumulation in pause/mark-unmet correct even on a file that was
+ * delta-accumulation in pause/mark-needs-input correct even on a file that was
  * created by an old version.
  */
 function normalizePursuitFields(g: Goal): Goal {
@@ -466,7 +466,7 @@ const VALID_ACTIONS = new Set([
     "resume",
     "clear",
     "set-budget",
-    "mark-unmet",
+    "mark-needs-input",
 ]);
 
 async function handleGetGoal(store: Store, res: http.ServerResponse): Promise<void> {
@@ -679,21 +679,21 @@ async function handlePatchGoal(
             return;
         }
 
-        if (action === "mark-unmet") {
+        if (action === "mark-needs-input") {
             const note =
                 typeof body.value === "string" && body.value.length > 0
                     ? body.value
                     : "via http";
             const acc = accumulateOnExit(cur);
             const next: Goal = {
-                ...pushHistory(cur, "mark-unmet", note, ts),
-                status: "unmet",
+                ...pushHistory(cur, "mark-needs-input", note, ts),
+                status: "needs-input",
                 pursuing_seconds: acc.pursuing_seconds,
                 pursuing_since: acc.pursuing_since,
             };
             await store.write(next, cur.goal_id);
             await store
-                .appendEvent({ ts, type: "goal.unmet", goal_id: next.goal_id, note })
+                .appendEvent({ ts, type: "goal.needs_input", goal_id: next.goal_id, note })
                 .catch(() => undefined);
             sendJson(res, 200, next);
             return;
