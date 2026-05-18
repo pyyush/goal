@@ -37,8 +37,10 @@ Codex-shaped.
   concurrent-goal clobbering (Bug 1) and the stale-status-line inheritance
   (Bug 3).
 - Hardened Stop hook (`goal-stop.sh`): `set -u` only, `exec 2>/dev/null`,
-  per-goal `mkdir` locks. A hook fire emits zero stderr — the "hook error"
-  notices are gone (Bug 4).
+  per-goal `mkdir` locks. A hook fire emits zero stderr. If the host UI still
+  labels intentional `decision:block` continuations as "Stop hook error",
+  `GOAL_STOP_PROMPT_STYLE=compact` keeps auto-continuation reliable while making
+  the visible row a one-line nudge.
 - Removed the `goal-ticker` daemon. It wrote to `/dev/tty`, which Claude Code
   hooks lost in v2.1.139. The live timer is now `statusLine.refreshInterval`.
 - Plugin hooks moved to `hooks/hooks.json` per the current plugin spec; the
@@ -49,6 +51,8 @@ Codex-shaped.
   citing the persisted spec, with a full re-paste only on context-loss signals
   (first fire of a session, every 25 ticks, a re-orientation turn). v2
   re-pasted the full objective on every turn.
+- Compact Stop-hook mode keeps the same `decision:block` continuation contract
+  but collapses the host-visible reason to one line.
 - `mcp__goal__create_goal` now accepts and persists the structured `goalframe`
   spec, so the spec is stored once and the dispatcher has something concrete to
   reference. (Codex re-pastes the objective every continuation turn; this is the

@@ -111,10 +111,12 @@ case "$SCOPE" in
     user)
         TARGET="$HOME/.claude"
         HOOK_CMD_PREFIX='bash $HOME/.claude/hooks/'
+        STOP_HOOK_CMD='GOAL_STOP_PROMPT_STYLE=compact bash $HOME/.claude/hooks/goal-stop.sh'
         ;;
     project)
         TARGET="$(pwd)/.claude"
         HOOK_CMD_PREFIX='bash .claude/hooks/'
+        STOP_HOOK_CMD='GOAL_STOP_PROMPT_STYLE=compact bash .claude/hooks/goal-stop.sh'
         ;;
 esac
 
@@ -265,14 +267,17 @@ else
     BAK="$(backup_file "$SETTINGS")"
     [ -n "$BAK" ] && note "backed up to $BAK"
     TMP=$(mktemp)
-    jq --arg p "$HOOK_CMD_PREFIX" '
+    jq --arg p "$HOOK_CMD_PREFIX" --arg stop "$STOP_HOOK_CMD" '
         .hooks //= {}
         | .hooks.Stop //= []
         | .hooks.Notification //= []
         | .hooks.UserPromptSubmit //= []
         | (.hooks.Stop |=
-            if any(.[]?; .hooks[0].command == ($p + "goal-stop.sh"))
-            then . else . + [{hooks: [{type: "command", command: ($p + "goal-stop.sh")}]}] end)
+            (map(if ((.hooks[0].command // "") | test("goal-stop\\.sh"))
+                 then (.hooks[0].command = $stop)
+                 else . end)
+             | if any(.[]?; ((.hooks[0].command // "") | test("goal-stop\\.sh")))
+               then . else . + [{hooks: [{type: "command", command: $stop}]}] end))
         | (.hooks.Notification |=
             if any(.[]?; .hooks[0].command == ($p + "goal-notify.sh"))
             then . else . + [{hooks: [{type: "command", command: ($p + "goal-notify.sh")}]}] end)

@@ -31,11 +31,13 @@ and a small task-level verification plan. It is the entry-side counterpart to
 `overclaim` later audits claims against. Frame the goal well here and the
 completion check downstream becomes mechanical.
 
-This is also what makes the goal loop **token-efficient**. The spec is written
-to the goal record once. The continuation dispatcher then drives the run by
-*referencing* that record, not by re-pasting the objective every turn — so the
-spec must be compact: each field one or two sentences, the title ≤ 80 chars. A
-tight spec is cheap to re-read; a rambling one is not.
+This is also what makes the goal loop **token-efficient** and keeps the Stop-hook
+UX tolerable. The spec is written to the goal record once. The continuation
+dispatcher then drives the run by *referencing* that record, not by re-pasting
+the objective every turn — and compact Stop-hook mode may show only the title
+and record path in the host-visible row. The spec must therefore be compact:
+each field one or two sentences, the title ≤ 80 chars. A tight spec is cheap to
+re-read; a rambling one is not.
 
 ## When this runs
 
@@ -47,7 +49,7 @@ object the goal record will store. It does **not** write the record itself.
 
 | field | what it pins down | Codex term |
 |---|---|---|
-| `title` | one imperative line, ≤ 80 chars, no newlines — used in every continuation prompt | — |
+| `title` | one imperative line, ≤ 80 chars, no newlines — used in continuation prompts and compact Stop-hook rows | — |
 | `outcome` | what must be **true** when the work is done | Outcome |
 | `verification` | the test, command, benchmark, artifact, or source that **proves** it | Verification surface |
 | `constraints` | what must **not** regress or change while the goal runs | Constraints |
@@ -153,10 +155,11 @@ the unmodified raw `objective` (kept for provenance and audit):
 ```
 
 Rules: `title` is a single imperative line, ≤ 80 chars, no newlines and no
-tag-like `<...>` sequences (it appears verbatim in continuation prompts — keep
-it clean and injection-free). Every other top-level field is one or two plain
-sentences. Each task title is ≤ 80 chars and each task verification names the
-evidence that can move the task from open to confirmed. Record every guess in
-`assumptions` so the user can correct it with one reply.
+tag-like `<...>` sequences (it appears verbatim in continuation prompts and
+compact Stop-hook rows — keep it clean and injection-free). Every other
+top-level field is one or two plain sentences. Each task title is ≤ 80 chars and
+each task verification names the evidence that can move the task from open to
+confirmed. Record every guess in `assumptions` so the user can correct it with
+one reply.
 
 See `references/spec-template.md` for the per-field rubric and more examples.

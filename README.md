@@ -348,9 +348,11 @@ The live timer uses `statusLine.refreshInterval` — no background daemon, no wr
 | `GOAL_AUTOPAUSE_ON_PROMPT` | `0` | When `1`, the prompt hook pauses the active goal on every user prompt that isn't `/goal …` or `/goal:goal …`. |
 | `GOAL_STRIKE_LIMIT` | `2` | Consecutive no-progress turns before the dispatcher parks the goal to `needs-input`. |
 | `GOAL_REFRESH_EVERY` | `25` | Tick interval for full-spec refresh in the dispatcher's continuation prompt (short prompt by default). |
+| `GOAL_STOP_PROMPT_STYLE` | `standard` (`goal-setup` wires `compact`) | Set to `compact` to keep Stop-hook auto-continuation but shrink the visible host hook row to a one-line continuation nudge. |
 | `GOAL_PUSH_INTERVAL_SECONDS` | unset | Optional MCP channel timer push. |
 | `GOAL_CHANNEL_DISABLE` | `0` | Disable only the push channel. |
 | `GOAL_CHANNEL_DEBOUNCE_MS` | `5000` | Debounce window between channel pushes vs Stop-hook ticks. |
+| `GOAL_STOP_CONTINUE` | `1` | When `0`, the Stop hook becomes accounting-only and does not emit `decision:block`, avoiding host UIs that render intentional continuation blocks as noisy hook-error rows. Continue manually with `/goal:goal` or rely on the MCP `goal/continue` channel. |
 | `GOAL_LOCK_TIMEOUT_MS` | `5000` | Shared mutex acquire timeout. |
 | `GOAL_LOCK_STALE_MS` | `30000` | Stale lock takeover threshold. |
 | `GOAL_RELAY_LIMIT_PER_HOUR` | `3` | Automatic relay guardrail. |

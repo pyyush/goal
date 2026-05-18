@@ -19,6 +19,14 @@
 #     dispatcher's progress check bounds unproductive loops in two strikes,
 #     while a productive loop is allowed to run for days.
 #
+# UX mode:
+#   * Set GOAL_STOP_PROMPT_STYLE=compact to keep reliable Stop-hook continuation
+#     while shrinking the visible host "Stop hook error" row to one line.
+#   * Set GOAL_STOP_CONTINUE=0 to make this hook accounting-only. It still folds
+#     usage into the goal record and enforces terminal/budget state, but it does
+#     not emit `decision:block`. Use this when the host renders intentional Stop
+#     hook blocks as noisy "Stop hook error" rows.
+#
 # Requires bash 3.2+, jq.
 
 set -u
@@ -66,6 +74,20 @@ fi
 # --- read goal record fields ------------------------------------------------
 
 is_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+goal_stop_compact_prompts() {
+    case "${GOAL_STOP_PROMPT_STYLE:-standard}" in
+        compact|short|minimal|quiet) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+goal_stop_continue_enabled() {
+    case "${GOAL_STOP_CONTINUE:-1}" in
+        0|false|FALSE|no|NO|off|OFF) return 1 ;;
+        *) return 0 ;;
+    esac
+}
 
 # atomic_update <jq-filter> [jq-args…] — apply a CAS-guarded jq filter to the
 # goal record atomically (temp on the same fs → atomic rename). The caller must
@@ -268,12 +290,22 @@ if is_int "$TOKEN_BUDGET" && [ "$TOKEN_BUDGET" -gt 0 ] && [ "$TOKENS_USED" -ge "
         .status = "budget-limited" | .updated_at = $ts
         | .cost_usd_final    = (.cost_usd    // 0)
         | .tokens_used_final = (.tokens_used // 0)
-        | .history = ((.history // []) + [{ts:$ts, action:"budget-limit", note:"token budget reached"}])
-      end' \
-      --arg gid "$GOAL_ID" --arg ts "$(date -u +%FT%TZ)" \
-      || log "budget-write-failed" "${TOKENS_USED}/${TOKEN_BUDGET}"
+	        | .history = ((.history // []) + [{ts:$ts, action:"budget-limit", note:"token budget reached"}])
+	      end' \
+	      --arg gid "$GOAL_ID" --arg ts "$(date -u +%FT%TZ)" \
+	      || log "budget-write-failed" "${TOKENS_USED}/${TOKEN_BUDGET}"
     log "budget-limit" "${TOKENS_USED}/${TOKEN_BUDGET}"
     lock_release; trap - EXIT INT TERM
+    if ! goal_stop_continue_enabled; then
+        exit 0
+    fi
+    if goal_stop_compact_prompts; then
+        jq -n --arg u "$TOKENS_USED" --arg b "$TOKEN_BUDGET" '{
+          decision:"block",
+          reason:("Goal reached token budget (" + $u + "/" + $b + "). Wrap up: summarize progress, remaining work, and one next step.")
+        }'
+        exit 0
+    fi
     jq -n --arg o "$OBJECTIVE" --arg u "$TOKENS_USED" --arg b "$TOKEN_BUDGET" '{
       decision:"block",
       reason:("This goal has reached its token budget (" + $u + "/" + $b + "). It is now "
@@ -285,6 +317,13 @@ if is_int "$TOKEN_BUDGET" && [ "$TOKEN_BUDGET" -gt 0 ] && [ "$TOKENS_USED" -ge "
 fi
 
 # --- hand off to the dispatcher ---------------------------------------------
+
+if ! goal_stop_continue_enabled; then
+    log "continue-suppressed" "GOAL_STOP_CONTINUE=0"
+    lock_release
+    trap - EXIT INT TERM
+    exit 0
+fi
 
 # shellcheck disable=SC1091
 . "$HOOK_DIR/goal-dispatch.sh"

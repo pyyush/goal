@@ -134,6 +134,13 @@ _disp_write() {
 
 _disp_emit_block() { jq -n --arg r "$1" '{decision:"block", reason:$r}'; }
 
+_disp_compact_prompts() {
+    case "${GOAL_STOP_PROMPT_STYLE:-standard}" in
+        compact|short|minimal|quiet) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # _disp_field <jq-path> — a single goal-record field, empty on miss.
 _disp_field() { jq -r "$1 // \"\"" "$GOAL_FILE" 2>/dev/null || printf ''; }
 
@@ -174,6 +181,10 @@ _disp_nonce() {
 # SHORT continuation prompt — default. No objective body; references the record.
 _disp_short_prompt() {
     local title="$1"
+    if _disp_compact_prompts; then
+        printf 'Continue goal [%s] "%s". Take one tool step now; read %s if needed; run overclaim before completion.' "${GOAL_ID:0:8}" "$title" "$GOAL_FILE"
+        return 0
+    fi
     cat <<EOF
 Continue goal [${GOAL_ID:0:8}] — "${title}". Take one concrete, tool-using step
 toward it this turn; do not just plan. Full spec, constraints, and status are in
@@ -188,6 +199,10 @@ EOF
 # Emitted on context-loss signals only.
 _disp_full_prompt() {
     local title="$1" body nonce
+    if _disp_compact_prompts; then
+        printf 'Continue goal [%s] "%s". Context may be stale; read %s, then take one tool step. Run overclaim before completion.' "${GOAL_ID:0:8}" "$title" "$GOAL_FILE"
+        return 0
+    fi
     body=$(_disp_spec_block)
     nonce=$(_disp_nonce)
     cat <<EOF
@@ -216,6 +231,10 @@ EOF
 # (the model is visibly off-track) and demands a tool call or an honest block.
 _disp_reorient_prompt() {
     local title="$1" body nonce
+    if _disp_compact_prompts; then
+        printf 'Goal [%s] "%s" made no progress last turn. Read %s; take one tool step now or state the exact user input needed.' "${GOAL_ID:0:8}" "$title" "$GOAL_FILE"
+        return 0
+    fi
     body=$(_disp_spec_block)
     nonce=$(_disp_nonce)
     cat <<EOF

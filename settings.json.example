@@ -10,7 +10,7 @@
       { "hooks": [ { "type": "command", "command": "bash $HOME/.claude/bin/goal-statusline-install --ensure" } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "bash $HOME/.claude/hooks/goal-stop.sh" } ] }
+      { "hooks": [ { "type": "command", "command": "GOAL_STOP_PROMPT_STYLE=compact bash $HOME/.claude/hooks/goal-stop.sh" } ] }
     ],
     "Notification": [
       { "hooks": [ { "type": "command", "command": "bash $HOME/.claude/hooks/goal-notify.sh" } ] }

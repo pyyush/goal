@@ -118,6 +118,14 @@ Concrete defects in `goal-stop.sh`:
 * **Inline migration on every fire.** Migration runs (and can fail, and can hit
   the lock) on *every* `Stop` invocation, not once.
 * **`mktemp` returning success-on-failure.** `tmp=$(mktemp ...) || return 0` —
+
+Follow-up UX hardening: Claude Code may still label an intentional
+`{"decision":"block"}` Stop-hook continuation as a "Stop hook error" row in the
+transcript UI. That label is host-owned; the plugin cannot rename it. The
+mitigation is `GOAL_STOP_PROMPT_STYLE=compact`, which keeps the reliable block
+path but shrinks the visible row to a single-line continuation nudge. Do not use
+`GOAL_STOP_CONTINUE=0` when the requirement is guaranteed auto-continuation; that
+mode is accounting-only and intentionally suppresses the block.
   `write_state` returns `0` (success) when the temp file could not be created,
   so the caller believes the write happened.
 * **Lock starvation.** The multi-second transcript `jq` runs *while holding the
@@ -351,6 +359,7 @@ run by *reference*, with two prompt tiers:
 
 | tier | size | content | sent when |
 |---|---|---|---|
+| **compact** | one line | goal id, title, record path, one-tool-step instruction, `overclaim` reminder | when `GOAL_STOP_PROMPT_STYLE=compact` is set; default installer behavior for a cleaner host transcript |
 | **short** | ~35 tokens | goal id, title, record path, `overclaim` reminder — **no objective body** | default (context assumed intact) |
 | **full** | spec only (6 compact fields, fenced as untrusted data) | the structured `spec` | first dispatch fire of a session · every `GOAL_REFRESH_EVERY` ticks (default 25) · every re-orientation turn |
 

@@ -1,10 +1,11 @@
 # Goal spec — field rubric and template
 
 The artifact `goalframe` produces. Written into the goal record as `spec`.
-Keep it compact: the continuation dispatcher re-reads it, so every wasted
-sentence is a recurring token cost. The `tasks[]` entries are also materialized
-as the initial audit checklist, so they become the user's visible progress
-surface.
+Keep it compact: the continuation dispatcher re-reads it, and compact Stop-hook
+mode points at it instead of dumping it into the host-visible hook row. Every
+wasted sentence is recurring token and attention cost. The `tasks[]` entries are
+also materialized as the initial audit checklist, so they become the user's
+visible progress surface.
 
 ## Template
 
@@ -34,10 +35,10 @@ surface.
 ## Per-field rubric
 
 **title** — what a human glances at to know the run. Imperative voice ("Cut",
-"Migrate", "Make ... pass"). It is injected verbatim into every continuation
-prompt, so it must be a single clean line: no newlines, no `<tag>`-like
-sequences, ≤ 80 chars. This field is why the loop can continue without
-re-pasting the whole objective.
+"Migrate", "Make ... pass"). It is injected verbatim into continuation prompts
+and compact Stop-hook rows, so it must be a single clean line: no newlines, no
+`<tag>`-like sequences, ≤ 80 chars. This field is why the loop can continue
+without re-pasting the whole objective.
 
 **outcome** — a state, not an activity. "p95 < 120 ms" not "work on latency".
 If you cannot phrase it as something that is either true or false, the goal is

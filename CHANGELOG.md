@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — compact Stop-hook UX + slash-command hardening
+
+### UX
+- `goal-stop.sh` keeps reliable Stop-hook auto-continuation enabled, but
+  supports `GOAL_STOP_PROMPT_STYLE=compact` so Claude Code's visible hook row is
+  a one-line nudge instead of the full continuation paragraph/spec.
+- `bin/goal-setup` now wires the Stop hook with compact prompt style by default.
+  `GOAL_STOP_CONTINUE=0` remains available as an accounting-only escape hatch,
+  but it is documented as trading away Stop-hook-forced continuation.
+- The `/goal` slash command no longer uses a bare `.goal/goals/*.json` glob, so
+  an empty v3 goals directory does not trip zsh's `no matches found` failure.
+- The slash command can infer the current Claude session id from the newest
+  workspace transcript when Claude does not expose the session env var, so a new
+  goal binds to `.goal/sessions/<sid>` and appears in the statusline immediately.
+
+### Tests
+- Added `scripts/test-goal-md-preamble.sh` to execute the embedded slash-command
+  preambles under zsh.
+- Added `hooks/test-stop-quiet.sh` to cover accounting-only mode and compact
+  one-line continuation blocks.
+- Extended `mcp/test/v3-handshake.mjs` to verify explicit `session_id`
+  creation still resolves and renders in the statusline when the MCP server env
+  has no session id.
+
 ## v0.2.3 — cowork relay + HTTP shim join v3
 
 The last two v2 holdouts — `bin/goal-bridge` (the cowork relay daemon) and

@@ -12,7 +12,7 @@ Your only authority over goal status is to mark a goal **`achieved`** — and on
 
 ## How the loop runs
 
-With the companion `Stop` hook installed (the default for this plugin), Claude **auto-continues** while status is `pursuing`. After each turn a deterministic dispatcher checks whether the last turn made observable progress — a tool call, or a change to the working tree. If it did, the hook returns `{"decision":"block"}` with a short continuation prompt and another turn runs. If two consecutive turns make no progress, the dispatcher parks the goal at `needs-input` and stops the loop cleanly.
+With the companion `Stop` hook installed (the default for this plugin), Claude **auto-continues** while status is `pursuing`. After each turn a deterministic dispatcher checks whether the last turn made observable progress — a tool call, or a change to the working tree. If it did, the hook returns `{"decision":"block"}` with a continuation prompt and another turn runs. If two consecutive turns make no progress, the dispatcher parks the goal at `needs-input` and stops the loop cleanly. If the host UI renders intentional Stop-hook blocks as noisy hook-error rows, prefer `GOAL_STOP_PROMPT_STYLE=compact`; it keeps reliable continuation but shrinks the row to one line. `GOAL_STOP_CONTINUE=0` hides the block entirely, but continuation becomes manual (`/goal:goal`) or channel-driven.
 
 **No model evaluates completion.** The loop is a state machine; completion is your own audited `update_goal` call. Without the Stop hook, advance the loop manually by running `/goal:goal` with no arguments.
 
@@ -37,7 +37,9 @@ If `mcp__goal__get_goal`, `mcp__goal__create_goal`, and `mcp__goal__update_goal`
 
 ## Current Claude session id
 
-!`sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-${GOAL_SESSION_ID:-}}}"; printf 'SESSION_ID=%s\n' "$sid"`
+Claude normally exports the session id to slash-command shell preambles. If a host build only exposes it to hooks/statusline payloads, infer it from the newest transcript for this workspace so a newly created goal still binds to the current session and renders immediately in the statusline.
+
+!`sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-${GOAL_SESSION_ID:-}}}"; if [ -z "$sid" ] && [ -n "${HOME:-}" ]; then slug=$(printf '%s' "$PWD" | tr '/' '-'); proj="$HOME/.claude/projects/$slug"; if [ -d "$proj" ]; then f=$(find "$proj" -maxdepth 1 -type f -name '*.jsonl' -exec ls -t {} + 2>/dev/null | head -n 1); if [ -n "$f" ]; then base="${f##*/}"; sid="${base%.jsonl}"; fi; fi; fi; printf 'SESSION_ID=%s\n' "$sid"`
 
 ## User arguments
 

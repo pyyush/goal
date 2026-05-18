@@ -9,7 +9,9 @@
 //   4. Assert it sets GOAL_ID equal to the gid the MCP returned.
 //   5. Assert the bundled statusline helper renders a non-empty line for the
 //      owning session and an empty line for any other session.
-//   6. Migration regression: drop a v2 .goal/state.json into a second tmpdir,
+//   6. Explicit session regression: call create_goal with session_id while the
+//      server env has no session id, then assert resolver/statusline ownership.
+//   7. Migration regression: drop a v2 .goal/state.json into a second tmpdir,
 //      call get_goal, assert the file was migrated to .goal/goals/<gid>.json
 //      and the legacy state.json was removed.
 //
@@ -162,8 +164,42 @@ async function step1_freshCreate() {
   }
 }
 
-async function step2_v2Migration() {
-  console.error("\n[2] v2 state.json → v3 forward migration");
+async function step2_explicitSessionArg() {
+  console.error("\n[2] explicit create_goal session_id → owned statusline render");
+  const root = mkdtempSync(join(tmpdir(), "v3-handshake-explicit-"));
+  const sid = "slash-sess-" + Math.random().toString(36).slice(2, 10);
+  const handle = spawnServer({
+    GOAL_ROOT: root,
+    CLAUDE_CODE_SESSION_ID: "",
+    CLAUDE_SESSION_ID: "",
+    GOAL_SESSION_ID: "",
+  });
+  try {
+    await initialize(handle);
+    const res = await rpc(handle.child, handle.pending, "tools/call", {
+      name: "create_goal",
+      arguments: { objective: "explicit slash session test goal", session_id: sid },
+    });
+    expect(!res.result?.isError, `explicit-session create_goal succeeded (got ${res.result?.content?.[0]?.text})`);
+    const gid = JSON.parse(res.result.content[0].text).goal_id;
+
+    expect(existsSync(join(root, ".goal", "sessions", sid)),
+           `explicit session pointer exists at .goal/sessions/${sid}`);
+    const r = bashResolve(sid, root);
+    expect(r.owned === true, "bash resolves the explicit session id");
+    expect(r.goal_id === gid, `bash explicit-session GOAL_ID=${gid} (got ${r.goal_id})`);
+
+    const slOwner = bashStatusline(sid, root);
+    const slStranger = bashStatusline("stranger-sess", root);
+    expect(slOwner.length > 0, `statusline renders for explicit session owner: ${JSON.stringify(slOwner.slice(0, 80))}`);
+    expect(slStranger.length === 0, `statusline remains empty for unrelated session (got ${JSON.stringify(slStranger.slice(0, 80))})`);
+  } finally {
+    handle.child.kill("SIGTERM");
+  }
+}
+
+async function step3_v2Migration() {
+  console.error("\n[3] v2 state.json → v3 forward migration");
   const root = mkdtempSync(join(tmpdir(), "v3-handshake-mig-"));
   const sid = "sess-" + Math.random().toString(36).slice(2, 10);
   mkdirSync(join(root, ".goal"), { recursive: true });
@@ -217,8 +253,8 @@ async function step2_v2Migration() {
   }
 }
 
-async function step3_sessionOwnershipIsolation() {
-  console.error("\n[3] two sessions in one folder → two independent goals");
+async function step4_sessionOwnershipIsolation() {
+  console.error("\n[4] two sessions in one folder → two independent goals");
   const root = mkdtempSync(join(tmpdir(), "v3-handshake-iso-"));
   const sidA = "sessA-" + Math.random().toString(36).slice(2, 6);
   const sidB = "sessB-" + Math.random().toString(36).slice(2, 6);
@@ -258,8 +294,9 @@ async function step3_sessionOwnershipIsolation() {
 
 async function main() {
   await step1_freshCreate();
-  await step2_v2Migration();
-  await step3_sessionOwnershipIsolation();
+  await step2_explicitSessionArg();
+  await step3_v2Migration();
+  await step4_sessionOwnershipIsolation();
   if (failures.length) {
     console.error(`\nv3-handshake: ${failures.length} failure(s)`);
     process.exit(1);
