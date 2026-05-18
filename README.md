@@ -26,7 +26,7 @@ In scopes where this plugin is enabled, `/goal` is this project-scoped implement
 
 | Feature | What it does |
 |---|---|
-| Durable project state | Stores the active goal in `.goal/state.json`, not only the current chat transcript. |
+| Durable project state | Stores each goal as its own file under `.goal/goals/<goal_id>.json`, owned by exactly one session via `.goal/sessions/<sid>` — not only the current chat transcript. |
 | Audit-gated completion | The model can mark a goal complete only after checking the prompt against concrete files, commands, tests, and artifacts. |
 | Auto-continuation | A Claude Code `Stop` hook keeps the run moving while status is `pursuing`. |
 | Statusline | Shows active time, budget, terminal state, cowork relay state, and stale token observations. |
@@ -89,7 +89,7 @@ Claude Code keeps working until the goal is audited as complete, parked for inpu
 | Need | Claude Code built-in `/goal` | This plugin |
 |---|---|---|
 | One session, simple condition | Best fit. | Works, but heavier than needed. |
-| Survive `/clear`, compaction, or restart | Session-bound behavior. | Project state persists in `.goal/state.json`. |
+| Survive `/clear`, compaction, or restart | Session-bound behavior. | Goal state persists at `.goal/goals/<goal_id>.json`; the owning session re-binds on next launch. |
 | Inspect files/tests before completion | Evaluator checks conversation context; it does not run tools. | Audit checklist maps requirements to files, commands, and evidence. |
 | Terminal/CI/IDE control | Not the focus. | `goalctl`, HTTP, MCP, and git sync operate on the same state. |
 | Multi-agent handoff | Not the focus. | Claude Code ↔ Codex relay through `.goal/handoff/`. |
@@ -97,10 +97,25 @@ Claude Code keeps working until the goal is audited as complete, parked for inpu
 
 ## Architecture
 
-`.goal/state.json` is the single source of truth. The slash command, hooks, MCP server, bridge, `goalctl`, and HTTP shim all coordinate through `.goal/lock`. Writes are atomic (`mktemp` + `rename(2)`) and CAS-guarded by `goal_id`.
+A goal is **owned by exactly one session**. The on-disk layout makes that explicit:
+
+```
+.goal/
+  goals/<goal_id>.json       per-goal record   (writers: MCP, Stop hook, /goal)
+  sessions/<session_id>      pointer file      (content: the owned goal_id)
+  locks/<goal_id>.lock       per-goal mkdir mutex
+  locks/_coord.lock          cross-goal coordination lock (lanes, handoff seq)
+  cursors/<goal_id>          dispatcher progress cursor (tool-call count + wt hash)
+  events.jsonl               append-only diagnostics
+  pause                      hard kill switch
+```
+
+Resolution is read-only: the bash resolver and MCP both look up `sessions/<sid>` to find which `goals/<gid>.json` to act on, and they never adopt a session into a goal as a side effect of resolving. Two Claude sessions in one folder produce two independent records under two per-goal locks — they never share a mutable file.
+
+Writes are atomic (`mktemp` + `rename(2)`) and CAS-guarded by `goal_id`. The MCP server's per-goal lock and the bash hooks' per-goal `mkdir` mutex use the same lockfile path, so both runtimes serialize against each other.
 
 <p align="center">
-  <img src="docs/architecture.png" alt="goal architecture — writers sharing .goal/state.json under a lock" width="100%">
+  <img src="docs/architecture.png" alt="goal architecture — session-owned records with per-goal locks" width="100%">
 </p>
 
 ### System map
@@ -121,7 +136,7 @@ goalctl bridge start codex --root /path/to/project
 When a runner hits a rate limit or server error:
 
 1. The bridge writes `.goal/handoff/NNNN.md`.
-2. `state.json` moves to `relaying`.
+2. The goal record moves to `relaying`.
 3. The peer reads the handoff and continues.
 4. State returns to `pursuing` after the peer's first successful turn.
 5. If every configured provider is throttled, the goal becomes `queued` until headroom returns.

@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.2.1 — MCP server completes the v3 cutover (statusline fix)
+
+The v3 PR (`feat/v3-session-scoped-goals`) rewrote the hooks for session-scoped
+ownership but the MCP server kept writing the v2 layout — one `.goal/state.json`
+per project. Result: every `/goal` created a record the resolver could never
+find, so the statusline cockpit was permanently blank, the Stop-hook
+continuation loop never resumed, and the latent `goal-prompt.sh`/`goal-notify.sh`
+calls to the non-existent `resolve_goal` symbol aborted silently on `set -e`.
+
+### Fixed
+- **MCP `mcp/goal-server.ts`** now writes the v3 layout:
+  - per-goal records at `.goal/goals/<goal_id>.json`
+  - per-session pointer files at `.goal/sessions/<session_id>` (text content = the gid)
+  - per-goal `mkdir` mutex at `.goal/locks/<goal_id>.lock` (matches the bash hooks)
+  - cross-goal coordination lock at `.goal/locks/_coord.lock` (lanes, handoff seq, breadcrumbs)
+- `create_goal` reads `CLAUDE_SESSION_ID` (falls back to `GOAL_SESSION_ID`),
+  writes both the record and the pointer in one tool call, and rejects a
+  second active goal for the same session.
+- `get_goal` / `update_goal` / all coordination tools resolve via the session
+  pointer; a session without a pointer is resolved to the project's unique
+  active goal if there's exactly one (no auto-bind on read).
+- **v2 → v3 forward migration**: legacy `.goal/state.json` files are moved to
+  `.goal/goals/<gid>.json` on first MCP touch, then deleted. The migrating
+  record stays **unowned** (RFC §5) — the next `/goal` or `/goal adopt` binds.
+- `hooks/goal-prompt.sh` and `hooks/goal-notify.sh` rewritten to use the v3
+  resolver (`goal_resolve_owned`). `set -u` only (matching the v3 Stop hook),
+  per-goal mkdir mutex inline. No more dependency on the project-level
+  `goal-lock.sh` shim — every v3 hook serializes on the same `.goal/locks/<gid>.lock`.
+
+### Tests
+- `mcp/test/smoke.mjs` updated to assert the v3 layout (`goals/<gid>.json` and
+  `sessions/<sid>` pointer); has an explicit regression guard that `state.json`
+  must **not** exist after a v3 create.
+- **New: `mcp/test/v3-handshake.mjs`** — end-to-end MCP-write → bash-resolver-read
+  round trip. Asserts that `goal_resolve_owned` returns the same gid the MCP
+  just minted, that a stranger session renders no statusline segment, that the
+  v2→v3 migration runs idempotently and never auto-binds, and that two sessions
+  in the same folder produce two independent goals. **This is the test that
+  would have caught the original bug.**
+
+### Notes
+- `bin/goalctl` and `scripts/smoke-concurrency.sh` still operate on the v2
+  `.goal/state.json` and the project-wide `.goal/lock` directory; they do not
+  collide with v3 paths (`.goal/goals/`, `.goal/sessions/`, `.goal/locks/`) but
+  they don't yet drive v3 semantics. A follow-up migrates them.
+
+---
+
 ## v0.2.0 — Codex-faithful goal lifecycle
 
 A `/goal` that is stable, reliable, token-efficient, and never silently lost.
