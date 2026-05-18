@@ -1,27 +1,33 @@
 #!/usr/bin/env node
 /**
- * goal-http-server — local HTTP shim over .goal/state.json
+ * goal-http-server — local HTTP shim over the v3 .goal/ tree.
  *
  * Loopback-only (127.0.0.1). Invoked by `goalctl serve-http`.
  *
- * Endpoints:
- *   GET   /goal                  → 200 goal-json | 404 {"error":"no_active_goal"}
- *   POST  /goal                  → 201 goal-json | 409 {"error":"goal_exists_and_active"}
- *                                  Body: {objective: string, token_budget?: number}
- *   PATCH /goal                  → 200 goal-json | 400 invalid action | 404 no goal
- *                                  Body: {action: "pause"|"resume"|"clear"|"set-budget"|"mark-needs-input", value?: any}
- *                                  For "clear": returns 204 No Content.
- *   GET   /events?since=<iso>    → application/x-ndjson stream of events from
- *                                  .goal/events.jsonl. Stays open and
- *                                  streams new lines.
+ * Endpoints (all goal-scoped endpoints resolve which goal to operate on via
+ * a 3-tier lookup: `?goal=<gid>` query param → `X-Claude-Session-Id` header
+ * → the project's single non-terminal goal):
  *
- * Storage layout (single source of truth — must stay in sync with bin/goalctl):
- *   <root>/.goal/state.json
+ *   GET   /goal[?goal=<gid>]      → 200 goal-json | 404 no_active_goal | 409 goal_ambiguous
+ *   POST  /goal                   → 201 goal-json | 409 goal_exists_and_active
+ *                                   Body: {objective: string, token_budget?: number}
+ *                                   Header X-Claude-Session-Id: bind this session to the new goal.
+ *   PATCH /goal[?goal=<gid>]      → 200 goal-json | 400 invalid action | 404 no goal | 409 goal_ambiguous
+ *                                   Body: {action: "pause"|"resume"|"clear"|"set-budget"|"mark-needs-input", value?: any}
+ *                                   `clear` → 204 No Content.
+ *   GET   /goals                  → 200 {goals:[{goal_id,status,objective,updated_at}, …]}
+ *   GET   /events?since=<iso>     → application/x-ndjson stream of .goal/events.jsonl
+ *
+ * v3 on-disk layout (per-goal records, session pointers, per-goal locks):
+ *   <root>/.goal/goals/<gid>.json
+ *   <root>/.goal/sessions/<sid>      pointer text = gid
+ *   <root>/.goal/locks/<gid>.lock    per-goal mkdir mutex (same path the MCP + hooks use)
+ *   <root>/.goal/locks/_coord.lock   project-coordination lock
  *   <root>/.goal/events.jsonl
  *   <root>/.claude/goal-baseline-<goal_id>   (cleared on create/replace/clear)
  *
  * Atomic writes via mktemp-in-same-dir + rename. CAS via goal_id check
- * between read and write.
+ * between read and write. v1→v2→v3 forward migration on first touch.
  */
 
 import * as http from "node:http";
@@ -114,42 +120,53 @@ function die(msg: string): never {
 
 // ---- storage helpers ------------------------------------------------------
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
- * Migrate v1 (.claude/goal.json) to v2 (.goal/state.json) if needed.
- * Returns the canonical state file path after migration.
- * Respects GOAL_DISABLE_MIGRATION=1.
+ * Run any pending v1→v2→v3 forward migration on the .goal/ tree. Idempotent.
+ * Mirrors the MCP server's migrateIfNeeded byte-for-byte. Respects
+ * GOAL_DISABLE_MIGRATION=1.
  */
-async function migrateIfNeeded(root: string): Promise<string> {
+async function migrateForward(root: string): Promise<void> {
+    if (process.env.GOAL_DISABLE_MIGRATION === "1") return;
+    const claudeDir = path.join(root, ".claude");
+    const goalDir = path.join(root, ".goal");
+    const goalsDir = path.join(goalDir, "goals");
+    const v1File = path.join(claudeDir, "goal.json");
+    const v2File = path.join(goalDir, "state.json");
+
+    // Stage 1: v1 → v2 (rare).
+    if (await fileExists(v1File) && !(await dirExists(goalDir))) {
+        await migrateV1ToV2(root);
+    }
+
+    // Stage 2: v2 → v3 (the common case post-merge).
+    if (await fileExists(v2File)) {
+        await migrateV2ToV3(root, v2File, goalsDir);
+    }
+}
+
+async function fileExists(p: string): Promise<boolean> {
+    try { const s = await fsp.lstat(p); return s.isFile() && !s.isSymbolicLink(); }
+    catch { return false; }
+}
+async function dirExists(p: string): Promise<boolean> {
+    try { const s = await fsp.lstat(p); return s.isDirectory() && !s.isSymbolicLink(); }
+    catch { return false; }
+}
+
+async function migrateV1ToV2(root: string): Promise<void> {
     const claudeDir = path.join(root, ".claude");
     const goalDir = path.join(root, ".goal");
     const v1File = path.join(claudeDir, "goal.json");
     const v2File = path.join(goalDir, "state.json");
     const markerFile = path.join(claudeDir, "MIGRATED_TO_GOAL");
 
-    if (process.env.GOAL_DISABLE_MIGRATION === "1") return v1File;
-
-    // Already migrated.
-    try {
-        const st = await fsp.stat(goalDir);
-        if (st.isDirectory()) return v2File;
-    } catch { /* .goal/ not present */ }
-
-    // Nothing to migrate.
-    try {
-        await fsp.access(v1File);
-    } catch {
-        return v2File; // fresh start: v2/v3 state lives in .goal/
-    }
-
-    // Parse v1.
     let v1Raw: Record<string, unknown>;
     try {
         const raw = await fsp.readFile(v1File, "utf8");
         v1Raw = JSON.parse(raw) as Record<string, unknown>;
-    } catch {
-        // Can't parse — leave v1 in place.
-        return v1File;
-    }
+    } catch { return; }
 
     const v1Status = typeof v1Raw.status === "string" ? v1Raw.status : "pursuing";
     const v1Ticks = typeof v1Raw.tick_count === "number" ? v1Raw.tick_count : 0;
@@ -174,95 +191,135 @@ async function migrateIfNeeded(root: string): Promise<string> {
         audit: null, handoff_head: null, queued_until: null,
     };
 
-    try {
-        await fsp.mkdir(goalDir, { recursive: false });
-    } catch {
-        // Race: dir already created. Re-check.
-        try {
-            const st = await fsp.stat(goalDir);
-            if (st.isDirectory()) return v2File;
-        } catch { /* ignore */ }
-        return v1File;
-    }
-
+    await fsp.mkdir(goalDir, { recursive: true });
     const tmpFile = path.join(goalDir, `state.json.${process.pid}.tmp`);
     try {
         await fsp.writeFile(tmpFile, JSON.stringify(v2State, null, 2) + "\n", "utf8");
         await fsp.rename(tmpFile, v2File);
     } catch (err) {
         try { await fsp.unlink(tmpFile); } catch { /* ignore */ }
-        try { await fsp.rmdir(goalDir); } catch { /* ignore */ }
-        process.stderr.write(`goal-http-server: migration failed: ${(err as Error)?.message}\n`);
-        return v1File;
+        process.stderr.write(`goal-http-server: v1→v2 migration failed: ${(err as Error)?.message}\n`);
+        return;
     }
+    try { await fsp.rm(path.join(claudeDir, "goal.lock"), { recursive: true, force: true }); } catch {}
+    try { await fsp.writeFile(markerFile, nowTs + "\n", "utf8"); } catch {}
+}
 
-    // Remove old lock dir (we're not inside a lock here so just clean up).
-    const oldLock = path.join(claudeDir, "goal.lock");
+async function migrateV2ToV3(root: string, v2File: string, goalsDir: string): Promise<void> {
+    let raw: Record<string, unknown>;
     try {
-        await fsp.rm(oldLock, { recursive: true, force: true });
-    } catch { /* non-fatal */ }
-
+        const txt = await fsp.readFile(v2File, "utf8");
+        raw = JSON.parse(txt) as Record<string, unknown>;
+    } catch (e) {
+        process.stderr.write(`goal-http-server: v2→v3 parse failed: ${(e as Error)?.message}\n`);
+        return;
+    }
+    const gid = typeof raw.goal_id === "string" ? raw.goal_id : "";
+    if (!UUID_RE.test(gid)) {
+        process.stderr.write(`goal-http-server: v2→v3 skipped — invalid goal_id "${gid}"\n`);
+        return;
+    }
+    await fsp.mkdir(goalsDir, { recursive: true });
+    const target = path.join(goalsDir, `${gid}.json`);
     try {
-        await fsp.writeFile(markerFile, nowTs + "\n", "utf8");
-    } catch { /* best-effort */ }
-
-    return v2File;
+        // If the v3 record already exists (idempotent re-run, or another writer
+        // migrated first), drop the legacy file and exit.
+        if (await fileExists(target)) {
+            try { await fsp.unlink(v2File); } catch {}
+            return;
+        }
+        await fsp.rename(v2File, target);
+        // Emit a one-line event so the MCP/dashboards see it.
+        const eventsFile = path.join(path.dirname(goalsDir), "events.jsonl");
+        const line = JSON.stringify({
+            ts: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+            type: "goal.migrated",
+            goal_id: gid,
+            note: "v2 state.json → v3 goals/<gid>.json (unowned; bind via /goal adopt)",
+        }) + "\n";
+        try { await fsp.appendFile(eventsFile, line, "utf8"); } catch {}
+    } catch (err) {
+        process.stderr.write(`goal-http-server: v2→v3 rename failed: ${(err as Error)?.message}\n`);
+    }
 }
 
 class Store {
-    readonly file: string;
-    readonly eventsFile: string;
-    readonly dir: string;       // state file's parent directory
-    readonly claudeDir: string; // always .claude/ for legacy baselines/marker
     readonly root: string;
+    readonly claudeDir: string;
+    readonly goalDir: string;
+    readonly goalsDir: string;
+    readonly sessionsDir: string;
+    readonly locksDir: string;
+    readonly eventsFile: string;
 
-    constructor(root: string, stateFile: string) {
+    constructor(root: string) {
         this.root = root;
         this.claudeDir = path.join(root, ".claude");
-        this.file = stateFile;
-        this.dir = path.dirname(stateFile);
-        this.eventsFile = path.join(path.dirname(stateFile), "events.jsonl");
+        this.goalDir = path.join(root, ".goal");
+        this.goalsDir = path.join(this.goalDir, "goals");
+        this.sessionsDir = path.join(this.goalDir, "sessions");
+        this.locksDir = path.join(this.goalDir, "locks");
+        this.eventsFile = path.join(this.goalDir, "events.jsonl");
     }
 
     static async create(root: string): Promise<Store> {
-        const stateFile = await migrateIfNeeded(root);
-        return new Store(root, stateFile);
+        await migrateForward(root);
+        const s = new Store(root);
+        await s.ensureDirs();
+        return s;
     }
 
-    async ensureDir(): Promise<void> {
+    async ensureDirs(): Promise<void> {
         await fsp.mkdir(this.claudeDir, { recursive: true });
-        await fsp.mkdir(this.dir, { recursive: true });
+        await fsp.mkdir(this.goalDir, { recursive: true });
+        await fsp.mkdir(this.goalsDir, { recursive: true });
+        await fsp.mkdir(this.sessionsDir, { recursive: true });
+        await fsp.mkdir(this.locksDir, { recursive: true });
     }
+
+    goalRecordPath(gid: string): string { return path.join(this.goalsDir, `${gid}.json`); }
+    sessionPointerPath(sid: string): string { return path.join(this.sessionsDir, sid); }
+    goalLockfilePath(gid: string): string { return path.join(this.locksDir, `${gid}.lock`); }
+    coordLockfilePath(): string { return path.join(this.locksDir, "_coord.lock"); }
 
     /**
-     * Acquire the cross-writer lock. Post-migration: .goal/lock; pre: .claude/goal.lock.
-     * Coordinates with the MCP server (proper-lockfile on the same lockfilePath)
-     * and with the bash hooks / goalctl (mkdir-based mutex on the same dir).
+     * Acquire a per-goal lock at .goal/locks/<gid>.lock. Coordinates with the
+     * MCP server (proper-lockfile, same path) and the bash hooks (mkdir mutex,
+     * same path).
      */
-    async withLock<T>(fn: () => Promise<T>): Promise<T> {
-        await this.ensureDir();
-        // Post-migration: lock lives in .goal/; pre-migration: .claude/goal.lock
-        const lockDir = this.dir;
-        const lockfilePath = path.join(lockDir, this.dir.endsWith(".goal") ? "lock" : "goal.lock");
-        const release = await lockfile.lock(lockDir, {
+    async withGoalLock<T>(gid: string, fn: () => Promise<T>): Promise<T> {
+        await this.ensureDirs();
+        const lockfilePath = this.goalLockfilePath(gid);
+        const release = await lockfile.lock(this.locksDir, {
             lockfilePath,
             retries: { retries: 50, minTimeout: 50, maxTimeout: 250, factor: 1.5 },
             stale: 30_000,
+            realpath: false,
         });
-        try {
-            return await fn();
-        } finally {
-            try {
-                await release();
-            } catch {
-                /* lock already released or stolen */
-            }
-        }
+        try { return await fn(); }
+        finally { try { await release(); } catch {} }
     }
 
-    async read(): Promise<Goal | null> {
+    /**
+     * Acquire the project-coordination lock. Used for create_goal (which doesn't
+     * yet have a gid) and other cross-goal operations.
+     */
+    async withCoordLock<T>(fn: () => Promise<T>): Promise<T> {
+        await this.ensureDirs();
+        const lockfilePath = this.coordLockfilePath();
+        const release = await lockfile.lock(this.locksDir, {
+            lockfilePath,
+            retries: { retries: 50, minTimeout: 50, maxTimeout: 250, factor: 1.5 },
+            stale: 30_000,
+            realpath: false,
+        });
+        try { return await fn(); }
+        finally { try { await release(); } catch {} }
+    }
+
+    async readGoal(gid: string): Promise<Goal | null> {
         try {
-            const raw = await fsp.readFile(this.file, "utf8");
+            const raw = await fsp.readFile(this.goalRecordPath(gid), "utf8");
             return JSON.parse(raw) as Goal;
         } catch (err: unknown) {
             if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -271,46 +328,124 @@ class Store {
     }
 
     /**
-     * Atomic write: mktemp in same dir, write, rename.
-     * If expectedGoalId is given, performs CAS — fails with Error("cas_mismatch")
-     * if the on-disk goal_id no longer matches.
+     * Atomic write: mktemp in same dir, write, rename. If expectedGoalId is
+     * given, performs CAS — fails with Error("cas_mismatch") if the on-disk
+     * goal_id no longer matches.
      */
-    async write(goal: Goal, expectedGoalId?: string): Promise<void> {
+    async writeGoal(goal: Goal, expectedGoalId?: string): Promise<void> {
+        const file = this.goalRecordPath(goal.goal_id);
         if (expectedGoalId !== undefined) {
-            const cur = await this.read();
+            const cur = await this.readGoal(goal.goal_id);
             if (!cur || cur.goal_id !== expectedGoalId) {
                 throw new Error("cas_mismatch");
             }
         }
-        await this.ensureDir();
+        await this.ensureDirs();
         const tmp = path.join(
-            this.dir,
+            this.goalsDir,
             `.state.${process.pid}.${crypto.randomBytes(6).toString("hex")}`,
         );
         await fsp.writeFile(tmp, JSON.stringify(goal, null, 2) + "\n", "utf8");
-        await fsp.rename(tmp, this.file);
+        await fsp.rename(tmp, file);
     }
 
-    async unlink(): Promise<void> {
-        try {
-            await fsp.unlink(this.file);
-        } catch (err: unknown) {
+    async unlinkGoal(gid: string): Promise<void> {
+        try { await fsp.unlink(this.goalRecordPath(gid)); }
+        catch (err: unknown) {
             if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
+        // Also drop any session pointers naming this gid + the per-goal lock dir.
+        try {
+            const entries = await fsp.readdir(this.sessionsDir);
+            await Promise.all(entries.map(async (n) => {
+                try {
+                    const txt = (await fsp.readFile(path.join(this.sessionsDir, n), "utf8")).trim();
+                    if (txt === gid) await fsp.unlink(path.join(this.sessionsDir, n));
+                } catch {}
+            }));
+        } catch {}
+        try { await fsp.rm(this.goalLockfilePath(gid), { recursive: true, force: true }); } catch {}
     }
 
-    async clearBaselines(): Promise<void> {
-        // Baselines always live in .claude/ regardless of v1/v2.
-        let entries: string[] = [];
+    async writeSessionPointer(sid: string, gid: string): Promise<void> {
+        await this.ensureDirs();
+        const ptr = this.sessionPointerPath(sid);
+        const tmp = path.join(this.sessionsDir, `.ptr.${process.pid}.${crypto.randomBytes(6).toString("hex")}`);
+        await fsp.writeFile(tmp, gid + "\n", "utf8");
+        await fsp.rename(tmp, ptr);
+    }
+
+    async readSessionPointer(sid: string): Promise<string | null> {
         try {
-            entries = await fsp.readdir(this.claudeDir);
-        } catch (err: unknown) {
+            const txt = (await fsp.readFile(this.sessionPointerPath(sid), "utf8")).trim();
+            return UUID_RE.test(txt) ? txt : null;
+        } catch { return null; }
+    }
+
+    /**
+     * List every v3 goal record. Used for `GET /goals` and for the
+     * single-active resolution fallback.
+     */
+    async listGoals(): Promise<Goal[]> {
+        let entries: string[] = [];
+        try { entries = await fsp.readdir(this.goalsDir); }
+        catch (err: unknown) {
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+            throw err;
+        }
+        const out: Goal[] = [];
+        for (const name of entries) {
+            if (!name.endsWith(".json") || name.startsWith(".")) continue;
+            const gid = name.slice(0, -5);
+            if (!UUID_RE.test(gid)) continue;
+            const g = await this.readGoal(gid).catch(() => null);
+            if (g) out.push(g);
+        }
+        return out;
+    }
+
+    /**
+     * Resolve which goal a request operates on. Order:
+     *   1) `?goal=<gid>` query param
+     *   2) `X-Claude-Session-Id` header → sessions/<sid> pointer
+     *   3) Exactly one non-terminal goal in the project (single-active)
+     * Returns { gid } on success, or { error, status } on failure.
+     */
+    async resolveRequestGoal(req: http.IncomingMessage, url: URL): Promise<{ gid: string } | { error: string; status: number }> {
+        // 1) explicit gid
+        const qgid = url.searchParams.get("goal");
+        if (qgid !== null) {
+            if (!UUID_RE.test(qgid)) return { error: "invalid_goal_id", status: 400 };
+            if (!(await this.readGoal(qgid))) return { error: "no_active_goal", status: 404 };
+            return { gid: qgid };
+        }
+        // 2) session pointer
+        const sid = headerString(req, "x-claude-session-id") ?? headerString(req, "x-goal-session-id");
+        if (sid) {
+            const gid = await this.readSessionPointer(sid);
+            if (gid && (await this.readGoal(gid))) return { gid };
+        }
+        // 3) single-active fallback
+        const actives = (await this.listGoals()).filter((g) =>
+            g.status === "pursuing" || g.status === "paused" ||
+            g.status === "needs-input" || g.status === "relaying" || g.status === "queued",
+        );
+        if (actives.length === 1) return { gid: actives[0].goal_id };
+        if (actives.length === 0) return { error: "no_active_goal", status: 404 };
+        return { error: "goal_ambiguous", status: 409 };
+    }
+
+    async clearBaselines(gidForFilter?: string): Promise<void> {
+        let entries: string[] = [];
+        try { entries = await fsp.readdir(this.claudeDir); }
+        catch (err: unknown) {
             if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
             throw err;
         }
         await Promise.all(
             entries
                 .filter((n) => n.startsWith("goal-baseline-"))
+                .filter((n) => !gidForFilter || n === `goal-baseline-${gidForFilter}` || n.startsWith(`goal-baseline-${gidForFilter}`))
                 .map((n) =>
                     fsp.unlink(path.join(this.claudeDir, n)).catch(() => undefined),
                 ),
@@ -318,13 +453,20 @@ class Store {
     }
 
     async appendEvent(evt: Record<string, unknown>): Promise<void> {
-        await this.ensureDir();
+        await this.ensureDirs();
         await fsp.appendFile(
             this.eventsFile,
             JSON.stringify(evt) + "\n",
             "utf8",
         );
     }
+}
+
+function headerString(req: http.IncomingMessage, name: string): string | null {
+    const v = req.headers[name];
+    if (typeof v === "string" && v.trim().length > 0) return v.trim();
+    if (Array.isArray(v) && v.length > 0 && typeof v[0] === "string" && v[0].trim().length > 0) return v[0].trim();
+    return null;
 }
 
 // ---- domain ops -----------------------------------------------------------
@@ -469,13 +611,29 @@ const VALID_ACTIONS = new Set([
     "mark-needs-input",
 ]);
 
-async function handleGetGoal(store: Store, res: http.ServerResponse): Promise<void> {
-    const g = await store.read();
-    if (!g) {
-        sendJson(res, 404, { error: "no_active_goal" });
-        return;
-    }
+async function handleGetGoal(
+    store: Store,
+    req: http.IncomingMessage,
+    url: URL,
+    res: http.ServerResponse,
+): Promise<void> {
+    const r = await store.resolveRequestGoal(req, url);
+    if ("error" in r) { sendJson(res, r.status, { error: r.error }); return; }
+    const g = await store.readGoal(r.gid);
+    if (!g) { sendJson(res, 404, { error: "no_active_goal" }); return; }
     sendJson(res, 200, g);
+}
+
+async function handleListGoals(store: Store, res: http.ServerResponse): Promise<void> {
+    const goals = await store.listGoals();
+    sendJson(res, 200, {
+        goals: goals.map((g) => ({
+            goal_id: g.goal_id,
+            status: g.status,
+            objective: typeof g.objective === "string" ? g.objective.slice(0, 240) : "",
+            updated_at: g.updated_at,
+        })),
+    });
 }
 
 async function handlePostGoal(
@@ -484,10 +642,7 @@ async function handlePostGoal(
     res: http.ServerResponse,
 ): Promise<void> {
     const parsed = await readJsonBody(req);
-    if (!parsed.ok) {
-        sendJson(res, parsed.status, { error: parsed.error });
-        return;
-    }
+    if (!parsed.ok) { sendJson(res, parsed.status, { error: parsed.error }); return; }
     const body = parsed.value as { objective?: unknown; token_budget?: unknown };
     if (typeof body.objective !== "string" || body.objective.length === 0) {
         sendJson(res, 400, { error: "objective (string) is required" });
@@ -497,66 +652,83 @@ async function handlePostGoal(
     if (body.token_budget !== undefined && body.token_budget !== null) {
         const n = body.token_budget;
         if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) {
-            sendJson(res, 400, {
-                error: "token_budget must be a positive integer or null",
-            });
+            sendJson(res, 400, { error: "token_budget must be a positive integer or null" });
             return;
         }
         budget = n;
     }
+    const sid = headerString(req, "x-claude-session-id") ?? headerString(req, "x-goal-session-id");
 
-    const result = await store.withLock(async () => {
-        const existing = await store.read();
-        if (existing && (existing.status === "pursuing" || existing.status === "paused")) {
-            return { code: 409, body: { error: "goal_exists_and_active" } };
+    const result = await store.withCoordLock(async () => {
+        // Refuse if this session already owns an active goal (RFC v3 §3:
+        // one non-terminal goal per session).
+        if (sid) {
+            const ownedGid = await store.readSessionPointer(sid);
+            if (ownedGid) {
+                const existing = await store.readGoal(ownedGid);
+                if (existing && (existing.status === "pursuing" || existing.status === "paused")) {
+                    return { code: 409, body: { error: "goal_exists_and_active", existing_goal_id: ownedGid } };
+                }
+            }
+        } else {
+            // No session id — fall back to project-wide single-active check so
+            // a non-Claude caller doesn't create a duplicate it could never
+            // resolve.
+            const actives = (await store.listGoals()).filter((g) =>
+                g.status === "pursuing" || g.status === "paused");
+            if (actives.length > 0) {
+                return {
+                    code: 409,
+                    body: {
+                        error: "goal_exists_and_active",
+                        existing_goal_id: actives[0].goal_id,
+                        hint: "send X-Claude-Session-Id header to bind a per-session goal",
+                    },
+                };
+            }
         }
+
         const ts = nowIso();
-        // Detect v2 file (store.file is .goal/state.json).
-        const isV2 = store.file.endsWith("state.json");
+        const newId = newGoalId();
         const goal: Goal = {
-            ...(isV2 ? { schema_version: 2 } : {}),
-            goal_id: newGoalId(),
+            schema_version: 2,
+            goal_id: newId,
             objective: body.objective as string,
             status: "pursuing",
             created_at: ts,
             updated_at: ts,
-            ...(isV2 ? {
-                time_used_seconds: 0,
-                observed_at: ts,
-                active_turn_started_at: ts,
-                tokens_used_observed_at: ts,
-                time_used_seconds_final: null,
-                tokens_used_final: null,
-            } : {}),
+            time_used_seconds: 0,
+            observed_at: ts,
+            active_turn_started_at: ts,
+            tokens_used_observed_at: ts,
+            time_used_seconds_final: null,
+            tokens_used_final: null,
             token_budget: budget,
             tokens_used: 0,
             tick_count: 0,
             pursuing_seconds: 0,
             pursuing_since: ts,
-            history: [{ ts, action: existing ? "replace" : "create", note: "via http" }],
-            ...(isV2 ? {
-                compat: ["claude-code"],
-                roles: { lead: null, build: null, review: null },
-                current: { agent: null, session: null, since: null },
-                budget: null,
-                lineage: [],
-                audit: null,
-                handoff_head: null,
-                queued_until: null,
-            } : {}),
+            history: [{ ts, action: "create", note: "via http" }],
+            compat: ["claude-code"],
+            roles: { lead: null, build: null, review: null },
+            current: { agent: null, session: sid ?? null, since: sid ? ts : null },
+            budget: null,
+            lineage: [],
+            audit: null,
+            handoff_head: null,
+            queued_until: null,
         };
         await store.clearBaselines();
-        await store.write(goal);
-        await store
-            .appendEvent({
-                ts,
-                type: "goal.created",
-                goal_id: goal.goal_id,
-                objective: goal.objective,
-                actor: "sdk",
-                token_budget: goal.token_budget,
-            })
-            .catch(() => undefined);
+        await store.writeGoal(goal);
+        if (sid) await store.writeSessionPointer(sid, newId);
+        await store.appendEvent({
+            ts, type: "goal.created",
+            goal_id: goal.goal_id,
+            objective: goal.objective,
+            actor: "http",
+            owner_session_id: sid ?? null,
+            token_budget: goal.token_budget,
+        }).catch(() => undefined);
         return { code: 201, body: goal };
     });
     sendJson(res, result.code, result.body);
@@ -565,150 +737,121 @@ async function handlePostGoal(
 async function handlePatchGoal(
     store: Store,
     req: http.IncomingMessage,
+    url: URL,
     res: http.ServerResponse,
 ): Promise<void> {
     const parsed = await readJsonBody(req);
-    if (!parsed.ok) {
-        sendJson(res, parsed.status, { error: parsed.error });
-        return;
-    }
+    if (!parsed.ok) { sendJson(res, parsed.status, { error: parsed.error }); return; }
     const body = parsed.value as { action?: unknown; value?: unknown };
     const action = body.action;
     if (typeof action !== "string" || !VALID_ACTIONS.has(action)) {
-        sendJson(res, 400, {
-            error: `action must be one of: ${Array.from(VALID_ACTIONS).join(", ")}`,
-        });
+        sendJson(res, 400, { error: `action must be one of: ${Array.from(VALID_ACTIONS).join(", ")}` });
         return;
     }
+    const r = await store.resolveRequestGoal(req, url);
+    if ("error" in r) { sendJson(res, r.status, { error: r.error }); return; }
+    const gid = r.gid;
 
-    await store.withLock(async () => {
-    const rawCur = await store.read();
-    if (!rawCur) {
-        sendJson(res, 404, { error: "no_active_goal" });
-        return;
-    }
-    // Apply backward-compat seeding so transitions accumulate correctly even
-    // on legacy files. Any writes use the normalized record as a base.
-    const cur = normalizePursuitFields(rawCur);
+    await store.withGoalLock(gid, async () => {
+        const rawCur = await store.readGoal(gid);
+        if (!rawCur) { sendJson(res, 404, { error: "no_active_goal" }); return; }
+        const cur = normalizePursuitFields(rawCur);
+        const ts = nowIso();
 
-    const ts = nowIso();
-
-    try {
-        if (action === "clear") {
-            await store.unlink();
-            await store.clearBaselines();
-            await store
-                .appendEvent({ ts, type: "goal.cleared", goal_id: cur.goal_id })
-                .catch(() => undefined);
-            sendNoContent(res);
-            return;
-        }
-
-        if (action === "pause") {
-            if (cur.status !== "pursuing") {
-                sendJson(res, 400, {
-                    error: `can only pause a pursuing goal (current: ${cur.status})`,
-                });
+        try {
+            if (action === "clear") {
+                await store.unlinkGoal(gid);
+                await store.clearBaselines(gid);
+                await store.appendEvent({ ts, type: "goal.cleared", goal_id: cur.goal_id })
+                    .catch(() => undefined);
+                sendNoContent(res);
                 return;
             }
-            const acc = accumulateOnExit(cur);
-            const next: Goal = {
-                ...pushHistory(cur, "pause", "via http", ts),
-                status: "paused",
-                pursuing_seconds: acc.pursuing_seconds,
-                pursuing_since: acc.pursuing_since,
-            };
-            await store.write(next, cur.goal_id);
-            await store
-                .appendEvent({ ts, type: "goal.paused", goal_id: next.goal_id })
-                .catch(() => undefined);
-            sendJson(res, 200, next);
-            return;
-        }
 
-        if (action === "resume") {
-            if (cur.status !== "paused") {
-                sendJson(res, 400, {
-                    error: `can only resume a paused goal (current: ${cur.status})`,
-                });
+            if (action === "pause") {
+                if (cur.status !== "pursuing") {
+                    sendJson(res, 400, { error: `can only pause a pursuing goal (current: ${cur.status})` });
+                    return;
+                }
+                const acc = accumulateOnExit(cur);
+                const next: Goal = {
+                    ...pushHistory(cur, "pause", "via http", ts),
+                    status: "paused",
+                    pursuing_seconds: acc.pursuing_seconds,
+                    pursuing_since: acc.pursuing_since,
+                };
+                await store.writeGoal(next, cur.goal_id);
+                await store.appendEvent({ ts, type: "goal.paused", goal_id: next.goal_id })
+                    .catch(() => undefined);
+                sendJson(res, 200, next);
                 return;
             }
-            const next: Goal = {
-                ...pushHistory(cur, "resume", "via http", ts),
-                status: "pursuing",
-                pursuing_since: ts,
-            };
-            await store.write(next, cur.goal_id);
-            await store
-                .appendEvent({ ts, type: "goal.resumed", goal_id: next.goal_id })
-                .catch(() => undefined);
-            sendJson(res, 200, next);
-            return;
-        }
 
-        if (action === "set-budget") {
-            const v = body.value;
-            let newBudget: number | null;
-            if (v === null) {
-                newBudget = null;
-            } else if (typeof v === "number" && Number.isInteger(v) && v > 0) {
-                newBudget = v;
-            } else {
-                sendJson(res, 400, {
-                    error: "set-budget: value must be a positive integer or null",
-                });
+            if (action === "resume") {
+                if (cur.status !== "paused") {
+                    sendJson(res, 400, { error: `can only resume a paused goal (current: ${cur.status})` });
+                    return;
+                }
+                const next: Goal = {
+                    ...pushHistory(cur, "resume", "via http", ts),
+                    status: "pursuing",
+                    pursuing_since: ts,
+                };
+                await store.writeGoal(next, cur.goal_id);
+                await store.appendEvent({ ts, type: "goal.resumed", goal_id: next.goal_id })
+                    .catch(() => undefined);
+                sendJson(res, 200, next);
                 return;
             }
-            const note = newBudget === null ? "cleared" : String(newBudget);
-            // set-budget does NOT change status, so pursuit fields are unchanged
-            // except that they may have been backfilled by normalizePursuitFields.
-            const next: Goal = {
-                ...pushHistory(cur, "set-budget", note, ts),
-                token_budget: newBudget,
-            };
-            await store.write(next, cur.goal_id);
-            await store
-                .appendEvent({
-                    ts,
-                    type: "goal.budget_changed",
-                    goal_id: next.goal_id,
+
+            if (action === "set-budget") {
+                const v = body.value;
+                let newBudget: number | null;
+                if (v === null) newBudget = null;
+                else if (typeof v === "number" && Number.isInteger(v) && v > 0) newBudget = v;
+                else {
+                    sendJson(res, 400, { error: "set-budget: value must be a positive integer or null" });
+                    return;
+                }
+                const note = newBudget === null ? "cleared" : String(newBudget);
+                const next: Goal = {
+                    ...pushHistory(cur, "set-budget", note, ts),
                     token_budget: newBudget,
-                })
-                .catch(() => undefined);
-            sendJson(res, 200, next);
-            return;
-        }
+                };
+                await store.writeGoal(next, cur.goal_id);
+                await store.appendEvent({
+                    ts, type: "goal.budget_changed",
+                    goal_id: next.goal_id, token_budget: newBudget,
+                }).catch(() => undefined);
+                sendJson(res, 200, next);
+                return;
+            }
 
-        if (action === "mark-needs-input") {
-            const note =
-                typeof body.value === "string" && body.value.length > 0
-                    ? body.value
-                    : "via http";
-            const acc = accumulateOnExit(cur);
-            const next: Goal = {
-                ...pushHistory(cur, "mark-needs-input", note, ts),
-                status: "needs-input",
-                pursuing_seconds: acc.pursuing_seconds,
-                pursuing_since: acc.pursuing_since,
-            };
-            await store.write(next, cur.goal_id);
-            await store
-                .appendEvent({ ts, type: "goal.needs_input", goal_id: next.goal_id, note })
-                .catch(() => undefined);
-            sendJson(res, 200, next);
-            return;
-        }
+            if (action === "mark-needs-input") {
+                const note = typeof body.value === "string" && body.value.length > 0 ? body.value : "via http";
+                const acc = accumulateOnExit(cur);
+                const next: Goal = {
+                    ...pushHistory(cur, "mark-needs-input", note, ts),
+                    status: "needs-input",
+                    pursuing_seconds: acc.pursuing_seconds,
+                    pursuing_since: acc.pursuing_since,
+                };
+                await store.writeGoal(next, cur.goal_id);
+                await store.appendEvent({ ts, type: "goal.needs_input", goal_id: next.goal_id, note })
+                    .catch(() => undefined);
+                sendJson(res, 200, next);
+                return;
+            }
 
-        // unreachable
-        sendJson(res, 400, { error: "unhandled action" });
-    } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg === "cas_mismatch") {
-            sendJson(res, 409, { error: "goal_id_mismatch" });
-            return;
+            sendJson(res, 400, { error: "unhandled action" });
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg === "cas_mismatch") {
+                sendJson(res, 409, { error: "goal_id_mismatch" });
+                return;
+            }
+            throw err;
         }
-        throw err;
-    }
     });
 }
 
@@ -731,7 +874,7 @@ async function handleEvents(
     }
 
     // ensure file exists so fs.watch is happy
-    await store.ensureDir();
+    await store.ensureDirs();
     try {
         await fsp.access(store.eventsFile);
     } catch {
@@ -898,7 +1041,7 @@ function startServer(args: CliArgs, store: Store, shutdown: ShutdownState): void
 
         const dispatch = async (): Promise<void> => {
             if (route === "/goal" && method === "GET") {
-                await handleGetGoal(store, res);
+                await handleGetGoal(store, req, url, res);
                 return;
             }
             if (route === "/goal" && method === "POST") {
@@ -906,7 +1049,11 @@ function startServer(args: CliArgs, store: Store, shutdown: ShutdownState): void
                 return;
             }
             if (route === "/goal" && method === "PATCH") {
-                await handlePatchGoal(store, req, res);
+                await handlePatchGoal(store, req, url, res);
+                return;
+            }
+            if (route === "/goals" && method === "GET") {
+                await handleListGoals(store, res);
                 return;
             }
             if (route === "/events" && method === "GET") {
