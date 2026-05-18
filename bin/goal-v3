@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHmac, randomUUID } from "node:crypto";
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, lstatSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -8,8 +8,11 @@ const [,, cmd, rootArg, jsonFlag, ...args] = process.argv;
 const root = resolve(rootArg || process.cwd());
 const json = jsonFlag === "1";
 const goalDir = join(root, ".goal");
-const stateFile = join(goalDir, "state.json");
+const goalsDir = join(goalDir, "goals");
+const sessionsDir = join(goalDir, "sessions");
+const legacyStateFile = join(goalDir, "state.json");      // pre-v3 path; used by `archiveGoal` for migration awareness
 const eventsFile = join(goalDir, "events.jsonl");
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function die(msg, code = 1) {
   process.stderr.write(`goalctl: ${msg}\n`);
@@ -29,9 +32,60 @@ function appendJsonl(file, value) {
   mkdirSync(dirname(file), { recursive: true });
   appendFileSync(file, JSON.stringify(value) + "\n");
 }
+
+// resolveGoalFile() — v3-aware, mirrors goalctl/MCP resolution.
+//   1) env GOAL_ID (callers like archiveGoal can set this for direct targeting)
+//   2) session pointer via CLAUDE_SESSION_ID / GOAL_SESSION_ID
+//   3) single non-terminal goal in .goal/goals/
+// Returns the absolute path, or null if nothing resolves.
+function resolveGoalFile() {
+  // 1) explicit gid
+  const explicitGid = process.env.GOAL_ID;
+  if (explicitGid && UUID_RE.test(explicitGid)) {
+    const f = join(goalsDir, `${explicitGid}.json`);
+    if (existsSync(f)) return f;
+  }
+  // 2) session pointer
+  const sid = (process.env.CLAUDE_SESSION_ID || process.env.GOAL_SESSION_ID || "").trim();
+  if (sid && !sid.includes("/") && !sid.includes("..")) {
+    const ptr = join(sessionsDir, sid);
+    try {
+      const lst = lstatSync(ptr);
+      if (lst.isFile() && !lst.isSymbolicLink()) {
+        const gid = readFileSync(ptr, "utf8").trim();
+        if (UUID_RE.test(gid)) {
+          const f = join(goalsDir, `${gid}.json`);
+          if (existsSync(f)) return f;
+        }
+      }
+    } catch {}
+  }
+  // 3) single-active fallback
+  if (existsSync(goalsDir)) {
+    let entries = [];
+    try { entries = readdirSync(goalsDir).filter((n) => n.endsWith(".json")); } catch {}
+    const actives = [];
+    for (const name of entries) {
+      const f = join(goalsDir, name);
+      const s = readJson(f);
+      if (!s) continue;
+      if (["pursuing", "paused", "needs-input", "relaying", "queued"].includes(s.status)) {
+        actives.push(f);
+      }
+    }
+    if (actives.length === 1) return actives[0];
+  }
+  // 4) Legacy v2 .goal/state.json — last resort so this helper still works
+  //    in a project that hasn't been touched by the migrator yet.
+  if (existsSync(legacyStateFile)) return legacyStateFile;
+  return null;
+}
+
 function state() {
-  const s = readJson(stateFile);
-  if (!s) die(`no v2/v3 goal state found at ${stateFile}`);
+  const f = resolveGoalFile();
+  if (!f) die(`no v3 goal state found under ${goalsDir} (or legacy ${legacyStateFile})`);
+  const s = readJson(f);
+  if (!s) die(`could not read goal record at ${f}`);
   return s;
 }
 function fmtTokens(n) {
@@ -75,11 +129,20 @@ function auditCounts(s) {
 }
 function archiveGoal(reason = "terminal") {
   const s = state();
+  const sourceFile = resolveGoalFile() || join(goalsDir, `${s.goal_id}.json`);
   const ts = nowIso().replace(/[-:T]/g, "").slice(0, 13);
   const id = s.goal_id || randomUUID();
   const dir = join(goalDir, "history", `${ts}_${id}`);
   mkdirSync(dir, { recursive: true });
-  for (const [src, dst] of [[stateFile, "state.json"], [eventsFile, "events.jsonl"], [join(goalDir, "breadcrumbs.jsonl"), "breadcrumbs.jsonl"]]) {
+  // The archive copy is a frozen snapshot — name it after the gid for parity
+  // with the v3 layout and keep state.json too for legacy tooling reading
+  // archived records.
+  for (const [src, dst] of [
+    [sourceFile, `${id}.json`],
+    [sourceFile, "state.json"],
+    [eventsFile, "events.jsonl"],
+    [join(goalDir, "breadcrumbs.jsonl"), "breadcrumbs.jsonl"],
+  ]) {
     if (existsSync(src)) copyFileSync(src, join(dir, dst));
   }
   if (existsSync(join(goalDir, "handoff"))) {
@@ -104,8 +167,15 @@ function archiveGoal(reason = "terminal") {
 function listHistory() {
   const dir = join(goalDir, "history");
   const rows = existsSync(dir) ? readdirSync(dir).sort().reverse().map((name) => {
-    const s = readJson(join(dir, name, "state.json"), {});
-    return { id: name, status: s.status || "unknown", objective: s.objective || "", path: join(dir, name) };
+    const archDir = join(dir, name);
+    // Each archive stores both <gid>.json (v3) and state.json (legacy). Prefer
+    // the per-gid file when present so a future migration can drop state.json.
+    let snap = null;
+    const sub = (() => { try { return readdirSync(archDir); } catch { return []; } })();
+    const gidJson = sub.find((n) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i.test(n));
+    if (gidJson) snap = readJson(join(archDir, gidJson), null);
+    if (!snap) snap = readJson(join(archDir, "state.json"), {});
+    return { id: name, status: snap.status || "unknown", objective: snap.objective || "", path: archDir };
   }) : [];
   if (json) console.log(JSON.stringify({ history: rows }, null, 2));
   else rows.forEach((r) => console.log(`${r.status === "achieved" ? "✓" : "×"} ${r.id}  ${r.objective}`));

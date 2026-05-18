@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# goalctl — headless CLI for the /goal state file.
+# goalctl — headless CLI for the v3 /goal state.
 #
-# Approximates Codex CLI's app-server thread_goal_processor (JSON-RPC):
-# create / get / status / pause / resume / clear / set-budget / mark-unmet
-# all operate on .goal/state.json directly, so external orchestrators
-# (CI jobs, multi-agent runners, IDE integrations) can drive a goal
-# without owning a Claude Code session.
+# Drives a Codex-style session-owned goal from outside Claude Code: CI jobs,
+# multi-agent runners, IDE plugins, shell automation. v3 layout:
 #
-# Resolution: walks up from $PWD to find .goal/state.json, stopping at
-# $HOME. Use --root <dir> to override.
+#   .goal/goals/<goal_id>.json       one record per goal
+#   .goal/sessions/<session_id>      pointer (text = goal_id) for session-owned resolution
+#   .goal/locks/<goal_id>.lock       per-goal mkdir mutex
+#   .goal/locks/_coord.lock          cross-goal coordination lock
+#
+# Resolution: --goal/--session flags override; otherwise read
+# CLAUDE_SESSION_ID / GOAL_SESSION_ID env vars; otherwise fall back to the
+# project's single non-terminal goal if there's exactly one (RFC §3.2). A v2
+# .goal/state.json is migrated forward to .goal/goals/<gid>.json on first touch
+# and left unowned (per RFC §5: the next /goal create or /goal adopt binds).
 #
 # Requires: bash 3.2+, jq, uuidgen (or /proc/sys/kernel/random/uuid).
 
@@ -18,19 +23,20 @@ die() { printf 'goalctl: %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<EOF
-usage: goalctl <command> [args]
+usage: goalctl [global-opts] <command> [args]
 
 commands:
-  create <objective> [--budget N]   set a new goal (fails if one exists)
-  replace <objective> [--budget N]  overwrite the existing goal
-  get [--json]                      print goal.json (--json: raw JSON, same effect)
-  status [--json]                   print a one-line status (--json: structured object)
+  create <objective> [--budget N]   create a new goal (one per session)
+  replace <objective> [--budget N]  replace the session's existing goal
+  adopt <goal_id>                   bind this session to an existing goal
+  get [--json]                      print the goal record
+  status [--json]                   print a one-line status (--json: structured)
   pause                             set status=paused
   resume                            set status=pursuing
-  clear                             delete the goal file
+  clear                             delete the goal record + session pointer
   set-budget <N>                    update token_budget (positive int or 'none')
   mark-achieved                     set status=achieved (skips audit — caller-owned)
-  mark-unmet [note]                 set status=unmet with optional note
+  list [--json]                     list all goals in the project
   listen [--grep PAT] [--since ISO] tail .goal/events.jsonl
   serve-http [--port N]             local HTTP shim (loopback only, default 7474)
   bridge start <runner>             start goal-bridge for <runner> in background
@@ -51,10 +57,18 @@ commands:
   template list                     list/materialize shipped goal templates
   notifier start|stop               manage notification marker
 
-options:
-  --root <dir>     use <dir>/.goal/state.json instead of walking up
-  --json           machine-readable output (applies to: get, status, bridge start/stop,
-                   handoff list/show, lanes, relay, quota)
+global options:
+  --root <dir>      project root (walks up from \$PWD otherwise)
+  --goal <gid>      target this exact goal id (overrides session resolution)
+  --session <sid>   resolve via this session pointer (overrides CLAUDE_SESSION_ID)
+  --json            machine-readable output
+
+env:
+  CLAUDE_SESSION_ID / GOAL_SESSION_ID   resolve which goal this session owns
+  GOAL_DISABLE_MIGRATION=1              skip v1→v2→v3 forward migration
+
+There is no \`mark-unmet\` / \`abandon\` route in v3 — a stuck goal parks to
+\`needs-input\` automatically and remains resumable; only the user clears.
 EOF
 }
 
@@ -62,11 +76,15 @@ EOF
 
 ROOT_OVERRIDE=""
 JSON_OUTPUT=0
+GOAL_OVERRIDE=""
+SESSION_OVERRIDE=""
 ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --root) ROOT_OVERRIDE="$2"; shift 2 ;;
         --json) JSON_OUTPUT=1; shift ;;
+        --goal) GOAL_OVERRIDE="$2"; shift 2 ;;
+        --session) SESSION_OVERRIDE="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) ARGS+=("$1"); shift ;;
     esac
@@ -86,12 +104,12 @@ resolve_root() {
     fi
     local d="$PWD"
     while [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ -n "$d" ]; do
-        # Prefer v2 state dir.
-        if [ -f "$d/.goal/state.json" ] && [ ! -L "$d/.goal/state.json" ]; then
+        # v3: .goal/ directory anywhere up the tree.
+        if [ -d "$d/.goal" ] && [ ! -L "$d/.goal" ]; then
             printf '%s' "$d"
             return
         fi
-        # Fall back to v1 file.
+        # v1 legacy: .claude/goal.json.
         if [ -f "$d/.claude/goal.json" ] && [ ! -L "$d/.claude/goal.json" ]; then
             printf '%s' "$d"
             return
@@ -105,23 +123,132 @@ resolve_root() {
     esac
 }
 
-# resolve_state_file: given a root, return the canonical state file path.
-# Prefers v2 (.goal/state.json), falls back to v1 (.claude/goal.json).
-# When GOAL_DISABLE_MIGRATION=1, always uses v1 path.
-resolve_state_file() {
-    local root="$1"
-    if [ "${GOAL_DISABLE_MIGRATION:-0}" != "1" ] && [ -f "$root/.goal/state.json" ] && [ ! -L "$root/.goal/state.json" ]; then
-        printf '%s/.goal/state.json' "$root"
-    elif [ "${GOAL_DISABLE_MIGRATION:-0}" != "1" ]; then
-        printf '%s/.goal/state.json' "$root"
-    else
-        printf '%s/.claude/goal.json' "$root"
+# session_id: pick the session id for resolution.
+#   1) --session flag (explicit override)
+#   2) CLAUDE_SESSION_ID env (set by Claude Code when launching MCP servers)
+#   3) GOAL_SESSION_ID env (test/explicit override)
+# Empty if none — callers fall back to single-active resolution.
+session_id() {
+    if [ -n "$SESSION_OVERRIDE" ]; then
+        printf '%s' "$SESSION_OVERRIDE"; return
     fi
+    if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
+        printf '%s' "$CLAUDE_SESSION_ID"; return
+    fi
+    if [ -n "${GOAL_SESSION_ID:-}" ]; then
+        printf '%s' "$GOAL_SESSION_ID"; return
+    fi
+    printf ''
 }
 
-# goalctl_migrate_if_needed: inline migration helper for goalctl.
-# Runs before any read/write so the state file is at the v2 path when possible.
-goalctl_migrate_if_needed() {
+# valid_uuid <s> — exit 0 if s looks like a v3 goal_id (UUID-shaped, no path tricks).
+valid_uuid() {
+    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+# resolve_goal_record <root> — print the path of the goal record for this
+# call. Resolution order (matches mcp/goal-server.ts):
+#   1) --goal <gid>          explicit
+#   2) sessions/<sid> ptr    where sid comes from --session / CLAUDE_SESSION_ID / GOAL_SESSION_ID
+#   3) single-active         if exactly one non-terminal goal exists in the project
+# Exits non-zero if nothing resolves and the command requires a target.
+resolve_goal_record() {
+    local root="$1"
+    local goals_dir="$root/.goal/goals"
+
+    # 1) Explicit --goal
+    if [ -n "$GOAL_OVERRIDE" ]; then
+        valid_uuid "$GOAL_OVERRIDE" || die "--goal: not a valid goal_id: $GOAL_OVERRIDE"
+        local f="$goals_dir/$GOAL_OVERRIDE.json"
+        [ -f "$f" ] && [ ! -L "$f" ] || die "--goal: no record at $f"
+        printf '%s' "$f"; return 0
+    fi
+
+    # 2) Session pointer
+    local sid; sid=$(session_id)
+    if [ -n "$sid" ]; then
+        local ptr="$root/.goal/sessions/$sid"
+        if [ -f "$ptr" ] && [ ! -L "$ptr" ]; then
+            local gid
+            gid=$(tr -d ' \t\r\n' < "$ptr" 2>/dev/null || true)
+            if valid_uuid "$gid"; then
+                local f="$goals_dir/$gid.json"
+                if [ -f "$f" ] && [ ! -L "$f" ]; then
+                    local on_disk
+                    on_disk=$(jq -r '.goal_id // ""' "$f" 2>/dev/null || true)
+                    if [ "$on_disk" = "$gid" ]; then
+                        printf '%s' "$f"; return 0
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # 3) Single-active fallback — exactly one non-terminal goal.
+    if [ -d "$goals_dir" ]; then
+        local active=()
+        local f
+        for f in "$goals_dir"/*.json; do
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
+            local st
+            st=$(jq -r '.status // ""' "$f" 2>/dev/null || echo "")
+            case "$st" in
+                pursuing|paused|needs-input|relaying|queued) active+=("$f") ;;
+            esac
+        done
+        if [ "${#active[@]}" -eq 1 ]; then
+            printf '%s' "${active[0]}"; return 0
+        fi
+        if [ "${#active[@]}" -gt 1 ]; then
+            die "multiple active goals in $root/.goal/goals/ — pass --goal <gid> or --session <sid> to disambiguate"
+        fi
+    fi
+
+    return 1
+}
+
+# legacy_v2_state_file <root> — if a pre-migration .goal/state.json is present,
+# return its path. Callers run goalctl_migrate_forward first.
+legacy_v2_state_file() {
+    local f="$1/.goal/state.json"
+    [ "${GOAL_DISABLE_MIGRATION:-0}" = "1" ] && return 1
+    [ -f "$f" ] && [ ! -L "$f" ] && { printf '%s' "$f"; return 0; }
+    return 1
+}
+
+# goalctl_migrate_forward: idempotent v1→v2→v3 forward migration.
+#
+#   v1 → v2:  .claude/goal.json    → .goal/state.json
+#   v2 → v3:  .goal/state.json     → .goal/goals/<gid>.json
+#
+# Runs before any read/write so the on-disk shape matches what the v3 resolver
+# expects. Migrating records are left UNOWNED (RFC §5: the next /goal create or
+# /goal adopt binds a session). Best-effort: failures log to .claude/goal-hook.log
+# and leave the previous state in place. Honors GOAL_DISABLE_MIGRATION=1.
+goalctl_migrate_forward() {
+    local root="$1"
+    local v1_file="$root/.claude/goal.json"
+    local goal_dir="$root/.goal"
+    local v2_file="$goal_dir/state.json"
+    local goals_dir="$goal_dir/goals"
+    local log_file="$root/.claude/goal-hook.log"
+    local marker_file="$root/.claude/MIGRATED_TO_GOAL"
+
+    [ "${GOAL_DISABLE_MIGRATION:-0}" = "1" ] && return 0
+
+    # Stage 1: v1 → v2 (rare in practice; only triggers if .goal/ is absent).
+    if [ -f "$v1_file" ] && [ ! -L "$v1_file" ] && [ ! -d "$goal_dir" ]; then
+        _goalctl_migrate_v1_to_v2 "$root" || true
+    fi
+
+    # Stage 2: v2 → v3 (the common case post-merge).
+    if [ -f "$v2_file" ] && [ ! -L "$v2_file" ] && [ ! -e "$goals_dir/$(jq -r '.goal_id // "_none_"' "$v2_file" 2>/dev/null).json" ]; then
+        _goalctl_migrate_v2_to_v3 "$root" || true
+    fi
+    return 0
+}
+
+_goalctl_migrate_v1_to_v2() {
     local root="$1"
     local v1_file="$root/.claude/goal.json"
     local goal_dir="$root/.goal"
@@ -129,62 +256,26 @@ goalctl_migrate_if_needed() {
     local log_file="$root/.claude/goal-hook.log"
     local marker_file="$root/.claude/MIGRATED_TO_GOAL"
 
-    # Escape hatch.
-    [ "${GOAL_DISABLE_MIGRATION:-0}" = "1" ] && return 0
-    # Already done.
-    [ -d "$goal_dir" ] && return 0
-    # Nothing to migrate.
-    [ -f "$v1_file" ] && [ ! -L "$v1_file" ] || return 0
-
-    # Discover goal-lock.sh.
-    local __GC_LOCK_SH=""
-    local __GC_DIR_CTL
-    __GC_DIR_CTL="$(cd "$(dirname "$0")" && pwd)"
-    for __cand in "$__GC_DIR_CTL/../hooks/goal-lock.sh" "$HOME/.claude/hooks/goal-lock.sh"; do
-        if [ -r "$__cand" ]; then __GC_LOCK_SH="$__cand"; break; fi
-    done
-
-    __goalctl_lock_acquire() {
-        local _root="$1"
-        if [ -n "$__GC_LOCK_SH" ]; then
-            # shellcheck disable=SC1090
-            . "$__GC_LOCK_SH"
-            goal_lock_acquire "$_root"
-        else
-            return 0
-        fi
-    }
-    __goalctl_lock_release() {
-        local _root="$1"
-        if [ -n "$__GC_LOCK_SH" ]; then
-            goal_lock_release "$_root"
-        fi
-    }
-
-    if ! __goalctl_lock_acquire "$root"; then
-        printf 'goalctl: migration: could not acquire lock; skipping\n' >&2
-        return 0
+    mkdir -p "$root/.claude" 2>/dev/null || true
+    local lockdir="$root/.claude/goal.lock"
+    if ! goal_lock_acquire "$lockdir"; then
+        printf 'goalctl: v1→v2 migration: could not acquire .claude/goal.lock; skipping\n' >&2
+        return 1
     fi
-    trap '__goalctl_lock_release "$root"' EXIT INT TERM
+    trap 'goal_lock_release "$lockdir"' EXIT INT TERM
 
-    # Double-check after lock.
     if [ -d "$goal_dir" ]; then
-        __goalctl_lock_release "$root"
-        trap - EXIT INT TERM
-        return 0
+        goal_lock_release "$lockdir"; trap - EXIT INT TERM; return 0
     fi
 
     local tmp_dir
     tmp_dir=$(mktemp -d "$root/.claude/.goal-migrate-XXXXXX") || {
-        printf 'goalctl: migration: mktemp failed\n' >&2
-        __goalctl_lock_release "$root"
-        trap - EXIT INT TERM
-        return 0
+        goal_lock_release "$lockdir"; trap - EXIT INT TERM
+        printf 'goalctl: v1→v2 migration: mktemp failed\n' >&2; return 1
     }
     local tmp_state="$tmp_dir/state.json"
 
-    local ok=0
-    if jq '
+    if ! jq '
         (.status // "pursuing") as $status
         | (.tick_count // 0) as $ticks
         | (.tokens_used // 0) as $tokens
@@ -208,57 +299,125 @@ goalctl_migrate_if_needed() {
                         ended_at: $ended, turns: $ticks, tokens: $tokens,
                         summary: "migrated from v1" }],
             audit: null, handoff_head: null, queued_until: null
-          }
-    ' "$v1_file" > "$tmp_state" 2>/dev/null; then
-        ok=1
-    fi
-
-    if [ "$ok" -ne 1 ]; then
+          }' "$v1_file" > "$tmp_state" 2>/dev/null; then
         rm -rf "$tmp_dir" 2>/dev/null || true
-        printf 'goalctl: migration: jq transform failed; leaving v1 in place\n' >&2
-        __goalctl_lock_release "$root"
-        trap - EXIT INT TERM
-        return 0
+        goal_lock_release "$lockdir"; trap - EXIT INT TERM
+        printf 'goalctl: v1→v2 migration: jq transform failed; leaving v1 in place\n' >&2
+        return 1
     fi
 
-    if ! mkdir "$goal_dir" 2>/dev/null; then
-        rm -rf "$tmp_dir" 2>/dev/null || true
-        __goalctl_lock_release "$root"
-        trap - EXIT INT TERM
-        return 0
-    fi
-
+    mkdir -p "$goal_dir" 2>/dev/null || true
     if ! mv "$tmp_state" "$v2_file" 2>/dev/null; then
         rm -rf "$tmp_dir" 2>/dev/null || true
         rmdir "$goal_dir" 2>/dev/null || true
-        printf 'goalctl: migration: mv failed; leaving v1 in place\n' >&2
-        __goalctl_lock_release "$root"
-        trap - EXIT INT TERM
-        return 0
+        goal_lock_release "$lockdir"; trap - EXIT INT TERM
+        printf 'goalctl: v1→v2 migration: mv failed; leaving v1 in place\n' >&2
+        return 1
     fi
     rm -rf "$tmp_dir" 2>/dev/null || true
-
-    # Release the old lock explicitly (trap handles __goalctl_lock_release
-    # which will now use .goal/lock path). Remove .claude/goal.lock directly.
     rm -rf "$root/.claude/goal.lock" 2>/dev/null || true
-
     printf '%s\n' "$(date -u +%FT%TZ)" > "$marker_file" 2>/dev/null || true
-
     {
-        printf '{"ts":"%s","pid":%d,"cmd":"goalctl","event":"migration-done","root":"%s"}\n' \
+        printf '{"ts":"%s","pid":%d,"cmd":"goalctl","event":"migration-v1-v2-done","root":"%s"}\n' \
             "$(date -u +%FT%TZ)" "$$" "$root"
     } >> "$log_file" 2>/dev/null || true
-
-    __goalctl_lock_release "$root"
-    trap - EXIT INT TERM
+    goal_lock_release "$lockdir"; trap - EXIT INT TERM
     return 0
 }
 
+_goalctl_migrate_v2_to_v3() {
+    local root="$1"
+    local goal_dir="$root/.goal"
+    local v2_file="$goal_dir/state.json"
+    local goals_dir="$goal_dir/goals"
+    local locks_dir="$goal_dir/locks"
+    local log_file="$root/.claude/goal-hook.log"
+
+    [ -f "$v2_file" ] && [ ! -L "$v2_file" ] || return 0
+
+    mkdir -p "$goals_dir" "$locks_dir" 2>/dev/null || true
+    local lockdir="$locks_dir/_coord.lock"
+    if ! goal_lock_acquire "$lockdir"; then
+        printf 'goalctl: v2→v3 migration: could not acquire %s; skipping\n' "$lockdir" >&2
+        return 1
+    fi
+    trap 'goal_lock_release "$lockdir"' EXIT INT TERM
+
+    # Race-free re-check.
+    if [ ! -f "$v2_file" ] || [ -L "$v2_file" ]; then
+        goal_lock_release "$lockdir"; trap - EXIT INT TERM; return 0
+    fi
+
+    local gid
+    gid=$(jq -r '.goal_id // ""' "$v2_file" 2>/dev/null || echo "")
+    if ! valid_uuid "$gid"; then
+        goal_lock_release "$lockdir"; trap - EXIT INT TERM
+        printf 'goalctl: v2→v3 migration: state.json has no valid goal_id (got "%s"); leaving in place\n' "$gid" >&2
+        return 1
+    fi
+
+    local target="$goals_dir/$gid.json"
+    if [ -f "$target" ]; then
+        # Target already exists (idempotent re-run, or another writer beat us).
+        # Prefer the v3 record; drop the legacy file.
+        rm -f "$v2_file" 2>/dev/null || true
+        goal_lock_release "$lockdir"; trap - EXIT INT TERM
+        return 0
+    fi
+
+    # mv is atomic on the same filesystem.
+    if ! mv "$v2_file" "$target" 2>/dev/null; then
+        goal_lock_release "$lockdir"; trap - EXIT INT TERM
+        printf 'goalctl: v2→v3 migration: mv %s → %s failed\n' "$v2_file" "$target" >&2
+        return 1
+    fi
+
+    {
+        printf '{"ts":"%s","pid":%d,"cmd":"goalctl","event":"migration-v2-v3-done","goal_id":"%s","root":"%s"}\n' \
+            "$(date -u +%FT%TZ)" "$$" "$gid" "$root"
+    } >> "$log_file" 2>/dev/null || true
+    # Emit a one-line event to events.jsonl too, so the MCP and other readers see it.
+    printf '{"ts":"%s","type":"goal.migrated","goal_id":"%s","note":"v2 state.json → v3 goals/<gid>.json (unowned; bind via goalctl adopt)"}\n' \
+        "$(date -u +%FT%TZ)" "$gid" >> "$goal_dir/events.jsonl" 2>/dev/null || true
+
+    goal_lock_release "$lockdir"; trap - EXIT INT TERM
+    return 0
+}
+
+# Source the lock helper FIRST so the migration helpers can call it. Discovery:
+#   1) $GOAL_LOCK_SH (explicit override)
+#   2) <repo>/hooks/goal-lock.sh (in-repo: bin/ and hooks/ are siblings)
+#   3) ~/.claude/hooks/goal-lock.sh (user-scope install)
+__GOAL_LOCK_FOUND=0
+if [ -n "${GOAL_LOCK_SH:-}" ] && [ -r "$GOAL_LOCK_SH" ]; then
+    # shellcheck disable=SC1090
+    . "$GOAL_LOCK_SH"; __GOAL_LOCK_FOUND=1
+else
+    __GC_DIR="$(cd "$(dirname "$0")" && pwd)"
+    for __cand in "$__GC_DIR/../hooks/goal-lock.sh" "$HOME/.claude/hooks/goal-lock.sh"; do
+        if [ -r "$__cand" ]; then
+            # shellcheck disable=SC1090
+            . "$__cand"; __GOAL_LOCK_FOUND=1; break
+        fi
+    done
+fi
+if [ "$__GOAL_LOCK_FOUND" -eq 0 ]; then
+    printf 'goalctl: warning — goal-lock.sh not found; concurrent writes may lose updates\n' >&2
+    goal_lock_acquire() { return 0; }
+    goal_lock_release() { :; }
+fi
+
 ROOT=$(resolve_root)
-# Attempt migration then re-resolve the state file.
-goalctl_migrate_if_needed "$ROOT" || true
-FILE=$(resolve_state_file "$ROOT")
+goalctl_migrate_forward "$ROOT" || true
 NOW=$(date -u +%FT%TZ)
+# Goal record / id for THIS call. Empty if no goal resolves (handled per-cmd).
+FILE=""
+GID=""
+if RESOLVED=$(resolve_goal_record "$ROOT" 2>/dev/null); then
+    FILE="$RESOLVED"
+    GID=$(basename "$FILE" .json)
+fi
+SID=$(session_id)
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -293,89 +452,77 @@ compute_pursuit_seconds() {
     ' "$f" 2>/dev/null || printf '0'
 }
 
-# Cross-writer mutex shared with the MCP server (proper-lockfile) and hooks.
-# Discover goal-lock.sh in this order:
-#   1. $GOAL_LOCK_SH (explicit override)
-#   2. <repo>/hooks/goal-lock.sh (in-repo layout: bin/ and hooks/ are siblings)
-#   3. ~/.claude/hooks/goal-lock.sh (user-scope install)
-# If none found, fall back to no-op locking (logged to stderr).
-__GOAL_LOCK_FOUND=0
-if [ -n "${GOAL_LOCK_SH:-}" ] && [ -r "$GOAL_LOCK_SH" ]; then
-    # shellcheck disable=SC1090
-    . "$GOAL_LOCK_SH"; __GOAL_LOCK_FOUND=1
-else
-    __GC_DIR="$(cd "$(dirname "$0")" && pwd)"
-    for __cand in "$__GC_DIR/../hooks/goal-lock.sh" "$HOME/.claude/hooks/goal-lock.sh"; do
-        if [ -r "$__cand" ]; then
-            # shellcheck disable=SC1090
-            . "$__cand"; __GOAL_LOCK_FOUND=1; break
-        fi
-    done
-fi
-if [ "$__GOAL_LOCK_FOUND" -eq 0 ]; then
-    printf 'goalctl: warning — goal-lock.sh not found; concurrent writes may lose updates\n' >&2
-    goal_lock_acquire() { return 0; }
-    goal_lock_release() { :; }
-    goal_lock_path() { printf '%s/.claude/goal.lock' "$1"; }
-fi
-
+# write_state: RMW on the resolved per-goal record under its per-goal lock.
 write_state() {
-    # $1 = jq filter that mutates ., applied to current file.
-    local tmp file_dir
-    if ! goal_lock_acquire "$ROOT"; then
-        die "could not acquire goal lock (held by another writer for >${GOAL_LOCK_TIMEOUT_MS:-5000}ms)"
+    # $1 = jq filter that mutates ., applied to current $FILE.
+    [ -n "$FILE" ] || die "write_state: no goal record resolved"
+    [ -n "$GID" ] || die "write_state: no goal id"
+    local lockdir="$ROOT/.goal/locks/$GID.lock"
+    mkdir -p "$(dirname "$lockdir")" 2>/dev/null || true
+    if ! goal_lock_acquire "$lockdir"; then
+        die "could not acquire $lockdir (held by another writer for >${GOAL_LOCK_TIMEOUT_MS:-5000}ms)"
     fi
-    # Belt-and-suspenders cleanup so an unexpected exit releases the lock.
-    trap 'goal_lock_release "$ROOT"' EXIT INT TERM
-    # Use the state file's own directory for tmp (works for both v1 and v2 paths).
+    trap 'goal_lock_release "$lockdir"' EXIT INT TERM
+    local file_dir tmp
     file_dir=$(dirname "$FILE")
     tmp=$(mktemp "$file_dir/.state.XXXXXX")
     if jq --arg ts "$NOW" "$1" "$FILE" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$FILE"
     else
         rm -f "$tmp"
-        goal_lock_release "$ROOT"
+        goal_lock_release "$lockdir"
         trap - EXIT INT TERM
         die "jq filter failed; goal state unchanged"
     fi
-    goal_lock_release "$ROOT"
+    goal_lock_release "$lockdir"
     trap - EXIT INT TERM
 }
 
-write_new_state() {
-    # Usage: write_new_state <command> [args...]
-    # Runs the command while holding the shared lock, captures stdout to a
-    # temp file beside the state file, then atomically renames it into place.
-    local tmp file_dir
-    if ! goal_lock_acquire "$ROOT"; then
-        die "could not acquire goal lock (held by another writer for >${GOAL_LOCK_TIMEOUT_MS:-5000}ms)"
+# write_new_record: create a brand-new goal record (gid not pre-existing).
+# Takes the project-coord lock so concurrent create_goal calls serialize.
+# Usage: write_new_record <target-path> <command> [args...]
+write_new_record() {
+    local target="$1"; shift
+    local lockdir="$ROOT/.goal/locks/_coord.lock"
+    mkdir -p "$(dirname "$lockdir")" 2>/dev/null || true
+    if ! goal_lock_acquire "$lockdir"; then
+        die "could not acquire $lockdir (held by another writer for >${GOAL_LOCK_TIMEOUT_MS:-5000}ms)"
     fi
-    trap 'goal_lock_release "$ROOT"' EXIT INT TERM
-    file_dir=$(dirname "$FILE")
+    trap 'goal_lock_release "$lockdir"' EXIT INT TERM
+    local file_dir tmp
+    file_dir=$(dirname "$target")
     mkdir -p "$file_dir" 2>/dev/null || true
     tmp=$(mktemp "$file_dir/.state.XXXXXX")
     if "$@" > "$tmp"; then
-        mv "$tmp" "$FILE"
+        mv "$tmp" "$target"
     else
         rm -f "$tmp" 2>/dev/null || true
-        goal_lock_release "$ROOT"
+        goal_lock_release "$lockdir"
         trap - EXIT INT TERM
-        die "state generation failed; goal state unchanged"
+        die "state generation failed; goal record not written"
     fi
-    goal_lock_release "$ROOT"
+    goal_lock_release "$lockdir"
     trap - EXIT INT TERM
 }
 
 ensure_exists() {
-    [ -f "$FILE" ] || die "no goal at $FILE"
+    [ -n "$FILE" ] && [ -f "$FILE" ] || die "no goal resolved (try: goalctl list, or pass --goal <gid>)"
 }
 
 ensure_dir() {
-    # Ensure both .claude/ (for logs, baselines) and the state file's parent dir.
     mkdir -p "$ROOT/.claude" 2>/dev/null || true
-    local file_dir
-    file_dir=$(dirname "$FILE")
-    mkdir -p "$file_dir" 2>/dev/null || true
+    mkdir -p "$ROOT/.goal/goals" "$ROOT/.goal/sessions" "$ROOT/.goal/locks" "$ROOT/.goal/cursors" 2>/dev/null || true
+}
+
+# atomic_write_session_pointer <sid> <gid>
+atomic_write_session_pointer() {
+    local sid="$1" gid="$2"
+    local dir="$ROOT/.goal/sessions"
+    mkdir -p "$dir" 2>/dev/null || true
+    local ptr="$dir/$sid"
+    local tmp; tmp=$(mktemp "$dir/.ptr.XXXXXX") || die "session pointer: mktemp failed"
+    printf '%s\n' "$gid" > "$tmp"
+    mv "$tmp" "$ptr" 2>/dev/null || { rm -f "$tmp"; die "session pointer: mv failed"; }
 }
 
 append_history() {
@@ -402,61 +549,103 @@ create|replace)
     i=0
     while [ "$i" -lt "${#ARGS[@]}" ]; do
         case "${ARGS[$i]}" in
-            --quick)
-                QUICK=1; i=$((i+1)) ;;
-            --template)
-                TEMPLATE="${ARGS[$((i+1))]:-}"
-                [ -n "$TEMPLATE" ] || die "--template requires a name"
-                i=$((i+2)) ;;
-            --decompose)
-                DECOMPOSE=1; i=$((i+1)) ;;
-            --budget)
-                BUDGET="${ARGS[$((i+1))]:-}"
-                [[ "$BUDGET" =~ ^[1-9][0-9]*$ ]] || die "--budget must be a positive integer"
-                i=$((i+2)) ;;
-            *)
-                OBJ_PARTS+=("${ARGS[$i]}"); i=$((i+1)) ;;
+            --quick)     QUICK=1; i=$((i+1)) ;;
+            --template)  TEMPLATE="${ARGS[$((i+1))]:-}"
+                         [ -n "$TEMPLATE" ] || die "--template requires a name"
+                         i=$((i+2)) ;;
+            --decompose) DECOMPOSE=1; i=$((i+1)) ;;
+            --budget)    BUDGET="${ARGS[$((i+1))]:-}"
+                         [[ "$BUDGET" =~ ^[1-9][0-9]*$ ]] || die "--budget must be a positive integer"
+                         i=$((i+2)) ;;
+            *)           OBJ_PARTS+=("${ARGS[$i]}"); i=$((i+1)) ;;
         esac
     done
     OBJECTIVE="${OBJ_PARTS[*]:-}"
-    [ -z "$OBJECTIVE" ] && die "create: objective required"
+    [ -z "$OBJECTIVE" ] && die "$CMD: objective required"
     OBJ_LEN=$(printf '%s' "$OBJECTIVE" | wc -m | tr -d '[:space:]')
     [ "$OBJ_LEN" -le 4000 ] || die "objective is $OBJ_LEN characters; limit is 4000"
-    if [ "$CMD" = "create" ] && [ -f "$FILE" ]; then
-        STATUS=$(read_field '.status')
-        case "$STATUS" in
-            pursuing|paused) die "a $STATUS goal already exists; use 'goalctl replace' to overwrite or 'clear' first" ;;
+
+    ensure_dir
+    # v3 ownership check: only look at the goal THIS session already owns. Do
+    # NOT fall back to single-active here — two sessions in one folder are
+    # independent (each gets its own goal record + pointer). For sessions with
+    # no pointer (CI runs, scripts, fresh terminals) AND no --session flag,
+    # we still need to be conservative: refuse if there's already an unowned
+    # active goal we'd duplicate accidentally.
+    EXISTING_FILE=""; EXISTING_STATUS=""; EXISTING_GID=""
+    if [ -n "$SID" ]; then
+        OWNED_PTR="$ROOT/.goal/sessions/$SID"
+        if [ -f "$OWNED_PTR" ] && [ ! -L "$OWNED_PTR" ]; then
+            OWNED_GID=$(tr -d ' \t\r\n' < "$OWNED_PTR" 2>/dev/null || true)
+            if valid_uuid "$OWNED_GID"; then
+                OWNED_FILE="$ROOT/.goal/goals/$OWNED_GID.json"
+                if [ -f "$OWNED_FILE" ] && [ ! -L "$OWNED_FILE" ]; then
+                    EXISTING_FILE="$OWNED_FILE"
+                    EXISTING_GID="$OWNED_GID"
+                    EXISTING_STATUS=$(jq -r '.status // ""' "$EXISTING_FILE" 2>/dev/null || echo "")
+                fi
+            fi
+        fi
+    elif [ -n "$GOAL_OVERRIDE" ] && [ -f "$ROOT/.goal/goals/$GOAL_OVERRIDE.json" ]; then
+        EXISTING_FILE="$ROOT/.goal/goals/$GOAL_OVERRIDE.json"
+        EXISTING_GID="$GOAL_OVERRIDE"
+        EXISTING_STATUS=$(jq -r '.status // ""' "$EXISTING_FILE" 2>/dev/null || echo "")
+    elif [ -d "$ROOT/.goal/goals" ]; then
+        # No session and no explicit --goal — fall back to "any active goal" so
+        # CI scripts can't accidentally create a duplicate they'd never resolve.
+        for _f in "$ROOT/.goal/goals"/*.json; do
+            [ -f "$_f" ] && [ ! -L "$_f" ] || continue
+            _st=$(jq -r '.status // ""' "$_f" 2>/dev/null || echo "")
+            case "$_st" in
+                pursuing|paused|needs-input)
+                    EXISTING_FILE="$_f"
+                    EXISTING_GID=$(basename "$_f" .json)
+                    EXISTING_STATUS="$_st"
+                    break ;;
+            esac
+        done
+    fi
+
+    if [ "$CMD" = "create" ] && [ -n "$EXISTING_FILE" ]; then
+        case "$EXISTING_STATUS" in
+            pursuing|paused|needs-input)
+                if [ -n "$SID" ]; then
+                    die "this session already owns a $EXISTING_STATUS goal ($EXISTING_GID); use 'goalctl replace' to overwrite or 'clear' first"
+                else
+                    die "a $EXISTING_STATUS goal already exists ($EXISTING_GID) and no CLAUDE_SESSION_ID was provided to bind a different one; use 'goalctl replace' or pass --session"
+                fi
+                ;;
         esac
     fi
-    ensure_dir
+
     NEW_ID=$(new_uuid)
-    OLD_OBJ=""
-    [ -f "$FILE" ] && OLD_OBJ=$(read_field '.objective')
+    NEW_FILE="$ROOT/.goal/goals/$NEW_ID.json"
     ACTION="create"
-    [ -n "$OLD_OBJ" ] && ACTION="replace"
+    [ -n "$EXISTING_FILE" ] && ACTION="replace"
+
+    # Optional anti-loop hint from archived goals.
     SIMILAR_NOTE=""
     if [ -d "$ROOT/.goal/history" ]; then
         FIRST_WORD=$(printf '%s' "$OBJECTIVE" | awk '{print tolower($1)}')
         if [ -n "$FIRST_WORD" ]; then
-            SIMILAR_NOTE=$(find "$ROOT/.goal/history" -maxdepth 3 -name state.json 2>/dev/null | while IFS= read -r _sf; do
+            SIMILAR_NOTE=$(find "$ROOT/.goal/history" -maxdepth 3 \( -name state.json -o -name '*.json' \) 2>/dev/null | while IFS= read -r _sf; do
                 _obj=$(jq -r '.objective // ""' "$_sf" 2>/dev/null)
                 _status=$(jq -r '.status // "unknown"' "$_sf" 2>/dev/null)
                 printf '%s' "$_obj" | tr '[:upper:]' '[:lower:]' | grep -q "$FIRST_WORD" || continue
                 printf '%s: %s\n' "$_status" "$_obj"
             done | head -3)
-            if [ -n "$SIMILAR_NOTE" ]; then
-                printf 'Similar past goals:\n%s\n' "$SIMILAR_NOTE" >&2
-            fi
+            [ -n "$SIMILAR_NOTE" ] && printf 'Similar past goals:\n%s\n' "$SIMILAR_NOTE" >&2
         fi
     fi
+
     AUDIT_JSON="null"
     STRUCTURED_BUDGET="null"
     ROLE_JSON='{ "lead": null, "build": null, "review": null }'
     if [ "$TEMPLATE" = "tdd-feature" ] || [ "$TEMPLATE" = "migration" ] || [ "$TEMPLATE" = "bug-fix" ] || [ "$TEMPLATE" = "dependency-upgrade" ]; then
         case "$TEMPLATE" in
-            tdd-feature) P1="failing test captures behavior"; P2="implementation passes focused test"; P3="regression suite passes" ;;
-            migration) P1="migration path is compatible"; P2="rollback or recovery path documented"; P3="migration smoke test passes" ;;
-            bug-fix) P1="reproduction test captures bug"; P2="fix passes reproduction"; P3="adjacent regression suite passes" ;;
+            tdd-feature)        P1="failing test captures behavior"; P2="implementation passes focused test"; P3="regression suite passes" ;;
+            migration)          P1="migration path is compatible"; P2="rollback or recovery path documented"; P3="migration smoke test passes" ;;
+            bug-fix)            P1="reproduction test captures bug"; P2="fix passes reproduction"; P3="adjacent regression suite passes" ;;
             dependency-upgrade) P1="lockfile updated"; P2="build and tests pass"; P3="compatibility risk documented" ;;
         esac
         AUDIT_JSON=$(jq -n --arg p1 "$P1" --arg p2 "$P2" --arg p3 "$P3" \
@@ -474,50 +663,106 @@ create|replace)
             ]}')
     fi
     if [ "$DECOMPOSE" -eq 1 ]; then
-        mkdir -p "$ROOT/.goal" 2>/dev/null || true
         printf '{"at":"%s","objective":"%s — part 2","status":"pending"}\n' "$NOW" "$OBJECTIVE" >> "$ROOT/.goal/backlog.jsonl"
         printf '{"at":"%s","objective":"%s — verification","status":"pending"}\n' "$NOW" "$OBJECTIVE" >> "$ROOT/.goal/backlog.jsonl"
     fi
-    # Clear stale baseline files from previous goal_id (the Stop hook
-    # writes one per goal_id; replacing leaves orphans).
+    # Clear stale baseline files from previous goal_id.
     rm -f "$ROOT/.claude/goal-baseline-"* 2>/dev/null || true
-    # Detect whether we're writing a v2 file (FILE is inside .goal/).
-    _file_dir=$(dirname "$FILE")
-    _file_base=$(basename "$_file_dir")
-    if [ "$_file_base" = ".goal" ]; then
-        # v2 schema — include all v2 fields.
-        write_new_state jq -n --arg gid "$NEW_ID" --arg obj "$OBJECTIVE" --arg ts "$NOW" \
-              --argjson budget "$BUDGET" --arg action "$ACTION" \
-              --argjson audit "$AUDIT_JSON" --argjson roles "$ROLE_JSON" --argjson sbudget "$STRUCTURED_BUDGET" \
-            '{schema_version: 2,
-              goal_id: $gid, objective: $obj, status: "pursuing",
-              created_at: $ts, updated_at: $ts,
-              time_used_seconds: 0, observed_at: $ts, active_turn_started_at: $ts,
-              tokens_used_observed_at: $ts,
-              time_used_seconds_final: null, tokens_used_final: null,
-              token_budget: $budget, tokens_used: 0, tick_count: 0,
-              pursuing_seconds: 0, pursuing_since: $ts,
-              compat: ["claude-code"],
-              roles: $roles,
-              current: {agent: null, session: null, since: null},
-              budget: $sbudget,
-              lineage: [],
-              audit: $audit, handoff_head: null, queued_until: null,
-              history: [{ts: $ts, action: $action, note: "via goalctl"}]}'
-        if [ -n "$SIMILAR_NOTE" ]; then
-            printf '## Similar Goals\n%s\n' "$SIMILAR_NOTE" > "$ROOT/.goal/preamble.md"
-        fi
-    else
-        # v1 schema — keep minimal shape for backward compat.
-        write_new_state jq -n --arg gid "$NEW_ID" --arg obj "$OBJECTIVE" --arg ts "$NOW" \
-              --argjson budget "$BUDGET" --arg action "$ACTION" \
-            '{goal_id: $gid, objective: $obj, status: "pursuing",
-              created_at: $ts, updated_at: $ts,
-              token_budget: $budget, tokens_used: 0, tick_count: 0,
-              pursuing_seconds: 0, pursuing_since: $ts,
-              history: [{ts: $ts, action: $action, note: "via goalctl"}]}'
+
+    # Build the new record JSON via the project-coord lock.
+    CURRENT_SESSION="null"
+    if [ -n "$SID" ]; then
+        CURRENT_SESSION=$(printf '%s' "$SID" | jq -Rs .)
     fi
+    write_new_record "$NEW_FILE" \
+        jq -n --arg gid "$NEW_ID" --arg obj "$OBJECTIVE" --arg ts "$NOW" \
+              --argjson budget "$BUDGET" --arg action "$ACTION" \
+              --argjson audit "$AUDIT_JSON" --argjson roles "$ROLE_JSON" \
+              --argjson sbudget "$STRUCTURED_BUDGET" --argjson session "$CURRENT_SESSION" \
+        '{schema_version: 2,
+          goal_id: $gid, objective: $obj, status: "pursuing",
+          created_at: $ts, updated_at: $ts,
+          time_used_seconds: 0, observed_at: $ts, active_turn_started_at: $ts,
+          tokens_used_observed_at: $ts,
+          time_used_seconds_final: null, tokens_used_final: null,
+          token_budget: $budget, tokens_used: 0, tick_count: 0,
+          pursuing_seconds: 0, pursuing_since: $ts,
+          compat: ["claude-code"],
+          roles: $roles,
+          current: {agent: null, session: $session, since: (if $session == null then null else $ts end)},
+          budget: $sbudget,
+          lineage: [],
+          audit: $audit, handoff_head: null, queued_until: null,
+          history: [{ts: $ts, action: $action, note: "via goalctl"}]}'
+
+    # On replace: remove the old record + any stale session pointer naming it.
+    if [ "$ACTION" = "replace" ] && [ -n "$EXISTING_GID" ] && [ "$EXISTING_GID" != "$NEW_ID" ]; then
+        rm -f "$ROOT/.goal/goals/$EXISTING_GID.json" 2>/dev/null || true
+        rm -rf "$ROOT/.goal/locks/$EXISTING_GID.lock" 2>/dev/null || true
+        # Drop any session pointers naming the replaced gid.
+        if [ -d "$ROOT/.goal/sessions" ]; then
+            for _p in "$ROOT/.goal/sessions"/*; do
+                [ -f "$_p" ] || continue
+                if grep -qxF "$EXISTING_GID" "$_p" 2>/dev/null; then
+                    rm -f "$_p" 2>/dev/null || true
+                fi
+            done
+        fi
+    fi
+
+    # Bind THIS session to the new goal, if a session id is available.
+    if [ -n "$SID" ]; then
+        atomic_write_session_pointer "$SID" "$NEW_ID"
+    fi
+    if [ -n "$SIMILAR_NOTE" ]; then
+        printf '## Similar Goals\n%s\n' "$SIMILAR_NOTE" > "$ROOT/.goal/preamble.md"
+    fi
+    # Log to events.jsonl so the MCP/channel watchers see the change.
+    printf '{"ts":"%s","type":"goal.created","goal_id":"%s","objective":"%s","actor":"goalctl","owner_session_id":%s,"token_budget":%s}\n' \
+        "$NOW" "$NEW_ID" \
+        "$(printf '%s' "$OBJECTIVE" | jq -Rs . | jq -r .)" \
+        "$CURRENT_SESSION" "$BUDGET" \
+        >> "$ROOT/.goal/events.jsonl" 2>/dev/null || true
+
     printf 'goal %s: %s\n' "$ACTION" "$NEW_ID"
+    ;;
+
+adopt)
+    _TARGET="${ARGS[0]:-}"
+    [ -n "$_TARGET" ] || die "adopt: goal_id required"
+    valid_uuid "$_TARGET" || die "adopt: invalid goal_id: $_TARGET"
+    [ -n "$SID" ] || die "adopt: no session id (set CLAUDE_SESSION_ID, GOAL_SESSION_ID, or pass --session)"
+    _RECORD="$ROOT/.goal/goals/$_TARGET.json"
+    [ -f "$_RECORD" ] && [ ! -L "$_RECORD" ] || die "adopt: no record at $_RECORD"
+    ensure_dir
+    atomic_write_session_pointer "$SID" "$_TARGET"
+    printf '{"ts":"%s","type":"goal.adopted","goal_id":"%s","actor":"goalctl","owner_session_id":"%s"}\n' \
+        "$NOW" "$_TARGET" "$SID" >> "$ROOT/.goal/events.jsonl" 2>/dev/null || true
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        jq -n --arg gid "$_TARGET" --arg sid "$SID" '{ok:true,adopted:$gid,session_id:$sid}'
+    else
+        printf 'session %s adopted goal %s\n' "$SID" "$_TARGET"
+    fi
+    ;;
+
+list)
+    _GDIR="$ROOT/.goal/goals"
+    if [ ! -d "$_GDIR" ]; then
+        if [ "$JSON_OUTPUT" -eq 1 ]; then printf '{"goals":[]}\n'; else printf 'no goals in %s\n' "$_GDIR"; fi
+        exit 0
+    fi
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        jq -n --argjson goals "$(for _f in "$_GDIR"/*.json; do
+            [ -f "$_f" ] || continue
+            jq -c '{goal_id, status, objective: (.objective | .[0:120]), updated_at}' "$_f" 2>/dev/null
+        done | jq -s .)" '{goals:$goals}'
+    else
+        printf '%-36s  %-12s  %s\n' "goal_id" "status" "objective"
+        for _f in "$_GDIR"/*.json; do
+            [ -f "$_f" ] || continue
+            jq -r '"\(.goal_id)  \(.status | (. + "            ") | .[0:12])  \(.objective[:80])"' "$_f" 2>/dev/null
+        done
+    fi
     ;;
 
 get)
@@ -604,13 +849,32 @@ resume)
 
 clear)
     ensure_exists
-    # Wipe both v1 and v2 state paths plus the migration marker, otherwise
-    # re-migration on the next read would resurrect the v1 snapshot.
-    rm -f "$FILE"
-    rm -f "$ROOT/.goal/state.json" "$ROOT/.claude/goal.json"
-    rm -f "$ROOT/.claude/MIGRATED_TO_GOAL"
-    rm -f "$ROOT/.claude/goal-baseline-"* 2>/dev/null || true
-    printf 'cleared\n'
+    # v3: remove the resolved goal record + any session pointers naming it +
+    # its per-goal lock. The .goal/ tree, events.jsonl, lanes.json, and other
+    # goals stay intact — clear is per-goal, not project-wide.
+    rm -f "$FILE" 2>/dev/null || true
+    rm -rf "$ROOT/.goal/locks/$GID.lock" 2>/dev/null || true
+    rm -rf "$ROOT/.goal/cursors/$GID" 2>/dev/null || true
+    if [ -d "$ROOT/.goal/sessions" ]; then
+        for _p in "$ROOT/.goal/sessions"/*; do
+            [ -f "$_p" ] || continue
+            grep -qxF "$GID" "$_p" 2>/dev/null && rm -f "$_p" 2>/dev/null || true
+        done
+    fi
+    # Legacy clean-up: if a v2 state.json or v1 file still happens to name this
+    # gid (e.g. mid-migration crash), drop them too.
+    if [ -f "$ROOT/.goal/state.json" ]; then
+        _legacy_gid=$(jq -r '.goal_id // ""' "$ROOT/.goal/state.json" 2>/dev/null || echo "")
+        [ "$_legacy_gid" = "$GID" ] && rm -f "$ROOT/.goal/state.json" 2>/dev/null || true
+    fi
+    rm -f "$ROOT/.claude/goal-baseline-$GID"* 2>/dev/null || true
+    printf '{"ts":"%s","type":"goal.cleared","goal_id":"%s","actor":"goalctl"}\n' \
+        "$NOW" "$GID" >> "$ROOT/.goal/events.jsonl" 2>/dev/null || true
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        jq -n --arg gid "$GID" '{ok:true,cleared:$gid}'
+    else
+        printf 'cleared %s\n' "$GID"
+    fi
     ;;
 
 set-budget)
@@ -652,27 +916,7 @@ mark-achieved)
     ;;
 
 mark-unmet)
-    ensure_exists
-    NOTE="${ARGS[*]:-via goalctl}"
-    NOTE_ESC=$(printf '%s' "$NOTE" | jq -Rs .)
-    CUR_STATUS=$(read_field '.status')
-    if [ "$CUR_STATUS" = "pursuing" ]; then
-        DELTA=$(compute_pursuit_seconds "$FILE")
-        case "$DELTA" in ''|*[!0-9]*) DELTA=0 ;; esac
-        append_history "mark-unmet" "$(printf '%s' "$NOTE" | sed 's/"/\\"/g')"
-        write_state ".status = \"unmet\"
-            | .pursuing_seconds = ((.pursuing_seconds // 0) + ${DELTA})
-            | .time_used_seconds = ((.time_used_seconds // .pursuing_seconds // 0) + ${DELTA})
-            | .observed_at = \$ts
-            | .active_turn_started_at = null
-            | .time_used_seconds_final = (.time_used_seconds // ((.pursuing_seconds // 0) + ${DELTA}))
-            | .tokens_used_final = (.tokens_used // 0)
-            | .pursuing_since = null"
-    else
-        append_history "mark-unmet" "$(printf '%s' "$NOTE" | sed 's/"/\\"/g')"
-        write_state '.status = "unmet" | .pursuing_since = null'
-    fi
-    printf 'marked unmet\n'
+    die "v3 has no 'unmet' state. A stuck goal parks to 'needs-input' automatically (resumable). Only the user clears a goal: 'goalctl clear' (per-goal)."
     ;;
 
 listen)
@@ -1029,10 +1273,12 @@ lanes)
         _LEASE_ID="${ARGS[1]:-}"
         [ -n "$_LEASE_ID" ] || die "lanes release: lease_id required"
         [ -f "$_LANES_FILE" ] || die "lanes release: no lanes.json at $_LANES_FILE"
-        if ! goal_lock_acquire "$ROOT"; then
-            die "lanes release: could not acquire lock"
+        _LANES_LOCK="$ROOT/.goal/locks/_coord.lock"
+        mkdir -p "$(dirname "$_LANES_LOCK")" 2>/dev/null || true
+        if ! goal_lock_acquire "$_LANES_LOCK"; then
+            die "lanes release: could not acquire $_LANES_LOCK"
         fi
-        trap 'goal_lock_release "$ROOT"' EXIT INT TERM
+        trap 'goal_lock_release "$_LANES_LOCK"' EXIT INT TERM
         _prune_lanes
 
         _BEFORE=$(jq '.leases | length' "$_LANES_FILE" 2>/dev/null || echo 0)
@@ -1042,7 +1288,7 @@ lanes)
             { rm -f "$_LANES_FILE.tmp" 2>/dev/null; die "lanes release: jq failed"; }
         _AFTER=$(jq '.leases | length' "$_LANES_FILE" 2>/dev/null || echo 0)
 
-        goal_lock_release "$ROOT"
+        goal_lock_release "$_LANES_LOCK"
         trap - EXIT INT TERM
 
         if [ "$_BEFORE" -gt "$_AFTER" ]; then
@@ -1100,7 +1346,7 @@ relay)
     ensure_exists
 
     _STATE_AGENT=$(jq -r '.current.agent // ""' "$FILE" 2>/dev/null)
-    [ -n "$_STATE_AGENT" ] || die "relay: no current.agent in state.json — is a bridge running?"
+    [ -n "$_STATE_AGENT" ] || die "relay: no current.agent in $FILE — is a bridge running?"
 
     _FAULT_FILE="$ROOT/.goal/agents/${_STATE_AGENT}.fault"
     mkdir -p "$(dirname "$_FAULT_FILE")" 2>/dev/null || true
