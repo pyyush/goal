@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.2.2 — goalctl, goal-lock, and the concurrency smoke join v3
+
+The previous release left three holdouts on the v2 on-disk shape: `bin/goalctl`,
+`hooks/goal-lock.sh`, and `scripts/smoke-concurrency.sh`. They didn't collide
+with v3 (different lock paths) but they didn't drive v3 semantics either —
+goalctl wrote a single `.goal/state.json` per project, ignored session
+ownership, and exposed a `mark-unmet` route the v3 lifecycle no longer has.
+
+This release closes the gap.
+
+### `bin/goalctl`
+- **v3 layout**: writes records at `.goal/goals/<gid>.json` and session pointers
+  at `.goal/sessions/<sid>`. The `.goal/state.json` path is gone; a stale one
+  is forward-migrated on first touch (goalctl emits `goal.migrated` to
+  `events.jsonl`, matching the MCP server).
+- **Session-owned resolution** for every subcommand: `--goal <gid>` /
+  `--session <sid>` flags override; `CLAUDE_SESSION_ID` / `GOAL_SESSION_ID`
+  env vars are honored; otherwise falls back to the project's single
+  non-terminal goal. Ambiguity (two active, no flags/env) is rejected with a
+  clear error rather than picking one silently.
+- **New `goalctl adopt <gid>`** — binds the calling session to an existing
+  unowned goal (e.g. after v2→v3 migration, or `/clear`, or to deliberately
+  join another session's goal). Counterpart to the slash command's create
+  flow.
+- **New `goalctl list`** — one line per goal in the project (`--json` for
+  machine output). Replaces grepping `.goal/goals/` by hand.
+- **`mark-unmet` removed.** v3 has no failed state for the model to reach;
+  the command now refuses with the v3 guidance (`needs-input` parks
+  automatically; only the user clears).
+- **Per-goal locks**: every RMW takes `.goal/locks/<gid>.lock`; `create`,
+  `replace`, and `lanes release` take the project-coord lock at
+  `.goal/locks/_coord.lock`. Same paths the MCP server (proper-lockfile) and
+  the bash hooks (inline `mkdir` mutex) use, so all three runtimes serialize
+  against each other correctly.
+- **`clear` is per-goal**: removes the record + the session pointer +
+  per-goal lock/cursor. The `.goal/` tree, other goals, `events.jsonl`, and
+  lanes stay intact.
+- **`bin/goal-v3`** (the Node helper backing `goalctl watch / history /
+  debrief / pr / sync / backlog / template / notifier`) now resolves the goal
+  record via the v3 lookup (session pointer → single-active → legacy
+  `state.json` last-resort), so watch/history/debrief work against v3
+  records without changes to the user-visible UX.
+
+### `hooks/goal-lock.sh`
+- Reduced to a **generic `mkdir`-based mutex**. Signature:
+  `goal_lock_acquire <lockdir> [timeout_ms] [stale_ms]`. v3 callers pass the
+  explicit path (`.goal/locks/<gid>.lock` for per-goal, `.goal/locks/_coord.lock`
+  for project-coord). The v2 path-picking logic (`.goal/lock` vs
+  `.claude/goal.lock`) is removed — callers know what to lock.
+- The v3 hooks (`goal-stop.sh`, `goal-prompt.sh`, `goal-notify.sh`) continue
+  to inline this pattern; the helper still exists for `goalctl` and for any
+  external script that wants a portable mutex.
+
+### `scripts/smoke-concurrency.sh`
+- Rebuilt for the v3 signature: steps 1 and 2 exercise the per-goal lock
+  primitive; steps 3 and 4 drive `goalctl --session <sid>` so two parallel
+  sessions create two independent goals under per-goal locks; step 5
+  (events.jsonl append atomicity) is unchanged. **All 5 steps green** on
+  current main.
+
+### Test suite status (this release)
+- `mcp/test/smoke.mjs`, `mcp/test/v3-handshake.mjs`, `mcp/test/channel-smoke.mjs`,
+  `scripts/smoke-concurrency.sh` — all green.
+- `bash -n` clean on every script in `hooks/`, `bin/goalctl`, and `scripts/`.
+
+### Notes (carried from v0.2.1)
+- `bin/goal-bridge` and `bin/goal-http-server.ts` still reference
+  `.goal/state.json` directly. They sit on the cowork relay path and are not
+  exercised by the statusline / Stop-hook loop the previous release fixed.
+  A follow-up migrates them to the v3 layout — leaving them in this release
+  keeps the multi-agent relay working as before during cutover.
+
+---
+
 ## v0.2.1 — MCP server completes the v3 cutover (statusline fix)
 
 The v3 PR (`feat/v3-session-scoped-goals`) rewrote the hooks for session-scoped
