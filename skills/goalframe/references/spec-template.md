@@ -2,7 +2,9 @@
 
 The artifact `goalframe` produces. Written into the goal record as `spec`.
 Keep it compact: the continuation dispatcher re-reads it, so every wasted
-sentence is a recurring token cost.
+sentence is a recurring token cost. The `tasks[]` entries are also materialized
+as the initial audit checklist, so they become the user's visible progress
+surface.
 
 ## Template
 
@@ -15,6 +17,16 @@ sentence is a recurring token cost.
   "boundaries":   "<what may be touched>",
   "iteration":    "<how to pick the next action>",
   "blocked_when": "<when to stop and report instead of pushing on>",
+  "tasks": [
+    {
+      "id": "t1",
+      "title": "<current controllable unit of work>",
+      "outcome": "<what is true when this task is complete>",
+      "verification": "<command, file, or artifact evidence for this task>",
+      "files": ["<optional narrow lane/glob>"],
+      "owner": "<optional role: lead|build|review>"
+    }
+  ],
   "assumptions":  ["<inferences made instead of asking>"]
 }
 ```
@@ -56,6 +68,12 @@ credential / dataset / decision is missing", "no defensible next action remains
 under the boundaries". A goal with no `blocked_when` will either spin or
 overclaim when it hits a wall.
 
+**tasks** — the task-level checkpoints inside the goal. Use 3-7 items for most
+durable goals. Each task should be a controllable unit the agent can own for a
+turn or a short sequence of turns, with evidence specific enough to move it to
+confirmed. The statusline shows the first unconfirmed task, and `overclaim`
+audits the tasks before the goal can be achieved.
+
 **assumptions** — every gap you filled by inference instead of asking. This is
 what lets the user correct the framing with a single reply instead of an
 interview.
@@ -88,6 +106,32 @@ everything working`
   "boundaries": "src/storage/ and its tests; call sites elsewhere only where they invoke storage",
   "iteration": "migrate one call site or module, run the storage tests, commit, pick the next from the grep list",
   "blocked_when": "the async client lacks an equivalent for a sync API in use, or tests need infra not available locally",
+  "tasks": [
+    {
+      "id": "t1",
+      "title": "Map sync storage call sites",
+      "outcome": "every sync-client reference that must change is listed",
+      "verification": "`grep -r SyncStore src/` output is reviewed and captured",
+      "files": ["src/storage/**", "src/**"],
+      "owner": "lead"
+    },
+    {
+      "id": "t2",
+      "title": "Migrate storage module internals",
+      "outcome": "storage module uses the async client internally",
+      "verification": "focused storage tests pass",
+      "files": ["src/storage/**", "tests/storage/**"],
+      "owner": "build"
+    },
+    {
+      "id": "t3",
+      "title": "Verify no legacy sync references remain",
+      "outcome": "`SyncStore` is unreferenced in production code",
+      "verification": "`grep -r SyncStore src/` returns no hits and `npm test` is green",
+      "files": ["src/**", "tests/**"],
+      "owner": "review"
+    }
+  ],
   "assumptions": [
     "verification suite is `npm test` (from package.json)",
     "'everything working' means the existing test suite, not a manual QA pass"

@@ -7,9 +7,10 @@ description: >-
   Claude to "keep working until" something is done. It produces the six things a
   goal needs to be pursuable and auditable — outcome, verification surface,
   constraints, boundaries, iteration policy, blocked-stop condition — plus a
-  short title. Run it even when the objective looks clear: an unframed goal is
-  the single biggest reason long runs drift, never converge, or get marked done
-  too early. Do not write a goal record without a spec from this skill.
+  short title and task-level checkpoints. Run it even when the objective looks
+  clear: an unframed goal is the single biggest reason long runs drift, never
+  converge, or get marked done too early. Do not write a goal record without a
+  spec from this skill.
 ---
 
 # goalframe — give the objective a shape before it becomes a goal
@@ -23,10 +24,11 @@ carry, in itself, everything required to (a) pick the next action, (b) know what
 "Improve performance" has no finish line. "Refactor the auth module" has no
 verification surface. "Make the app better" is not a goal at all.
 
-`goalframe` converts a raw objective into a **goal spec**: six fields plus a
-title. It is the entry-side counterpart to `overclaim` (the exit-side gate). The
-two share one contract — the `verification` field this skill writes is exactly
-what `overclaim` later audits claims against. Frame the goal well here and the
+`goalframe` converts a raw objective into a **goal spec**: six fields, a title,
+and a small task-level verification plan. It is the entry-side counterpart to
+`overclaim` (the exit-side gate). The two share one contract — the
+`verification` field and `tasks[]` this skill writes are exactly what
+`overclaim` later audits claims against. Frame the goal well here and the
 completion check downstream becomes mechanical.
 
 This is also what makes the goal loop **token-efficient**. The spec is written
@@ -41,7 +43,7 @@ Before writing any goal record — i.e. inside `/goal <objective>` and before
 `mcp__goal__create_goal`. It runs on the raw objective and emits the `spec`
 object the goal record will store. It does **not** write the record itself.
 
-## A goal spec — the six fields plus a title
+## A goal spec — the six fields, title, and tasks
 
 | field | what it pins down | Codex term |
 |---|---|---|
@@ -52,6 +54,7 @@ object the goal record will store. It does **not** write the record itself.
 | `boundaries` | which files, dirs, tools, services the goal **may** touch | Boundaries |
 | `iteration` | how to choose the **next action** after each attempt | Iteration policy |
 | `blocked_when` | the condition under which to **stop and report** rather than push on | Blocked stop condition |
+| `tasks` | 3-7 task checkpoints: the current controllable units of work | Task ledger |
 
 The canonical sentence these fields assemble into (Codex's pattern):
 
@@ -86,13 +89,20 @@ The canonical sentence these fields assemble into (Codex's pattern):
    nag, never ask what the repo already answers. If the user wants to skip,
    proceed with explicit assumptions recorded in the spec.
 
-4. **Tighten.** A spec is right when it is *narrow enough to audit but broad
+4. **Break it into tasks.** Add 3-7 ordered checkpoints in `tasks[]`. Each task
+   should be something an agent can actually pick up this turn: a slice of the
+   outcome with its own verification surface. Do not make tasks a vague plan
+   like "implement", "test", "document" unless the objective is truly that
+   simple. Prefer IDs `t1`, `t2`, ... so statusline and `/goal tasks` can show
+   stable handles.
+
+5. **Tighten.** A spec is right when it is *narrow enough to audit but broad
    enough to let the model choose the next action*. "Fix the failing checkout
    test" may be too narrow if the cause is upstream; "improve the system" is too
    broad — no audit surface. "Make the checkout suite pass on this branch
    without changing public API behavior" is the band you want.
 
-5. **Emit the spec** (see Output contract). Keep every field compact.
+6. **Emit the spec** (see Output contract). Keep every field compact.
 
 ## When the objective should not become a goal
 
@@ -128,13 +138,25 @@ the unmodified raw `objective` (kept for provenance and audit):
   "boundaries": "...",
   "iteration": "...",
   "blocked_when": "...",
+  "tasks": [
+    {
+      "id": "t1",
+      "title": "Map auth call sites",
+      "outcome": "all call sites that need migration are known",
+      "verification": "`rg` output or a checked file list records every call site",
+      "files": ["src/auth/**", "tests/auth/**"],
+      "owner": "lead"
+    }
+  ],
   "assumptions": ["any inference made instead of asking the user"]
 }
 ```
 
 Rules: `title` is a single imperative line, ≤ 80 chars, no newlines and no
 tag-like `<...>` sequences (it appears verbatim in continuation prompts — keep
-it clean and injection-free). Every other field is one or two plain sentences.
-Record every guess in `assumptions` so the user can correct it with one reply.
+it clean and injection-free). Every other top-level field is one or two plain
+sentences. Each task title is ≤ 80 chars and each task verification names the
+evidence that can move the task from open to confirmed. Record every guess in
+`assumptions` so the user can correct it with one reply.
 
 See `references/spec-template.md` for the per-field rubric and more examples.

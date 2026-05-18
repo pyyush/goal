@@ -35,7 +35,7 @@ function appendJsonl(file, value) {
 
 // resolveGoalFile() — v3-aware, mirrors goalctl/MCP resolution.
 //   1) env GOAL_ID (callers like archiveGoal can set this for direct targeting)
-//   2) session pointer via CLAUDE_SESSION_ID / GOAL_SESSION_ID
+//   2) session pointer via CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID / GOAL_SESSION_ID
 //   3) single non-terminal goal in .goal/goals/
 // Returns the absolute path, or null if nothing resolves.
 function resolveGoalFile() {
@@ -46,7 +46,7 @@ function resolveGoalFile() {
     if (existsSync(f)) return f;
   }
   // 2) session pointer
-  const sid = (process.env.CLAUDE_SESSION_ID || process.env.GOAL_SESSION_ID || "").trim();
+  const sid = (process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || process.env.GOAL_SESSION_ID || "").trim();
   if (sid && !sid.includes("/") && !sid.includes("..")) {
     const ptr = join(sessionsDir, sid);
     try {

@@ -13,9 +13,11 @@
 #       ◎ pursuing (healthy)   teal     — making progress
 #       ◍ pursuing (stalled)   amber    — no progress last turn, re-orienting
 #       ◌ needs-input          orange   — parked; the user must act
+#       ↔ relaying             violet   — peer agent is taking over
+#       ⌛ queued              amber    — waiting for provider headroom
 #       ✓ achieved             green    — done
 #       ‖ paused               dim      — /goal resume to continue
-#       ⊘ budget-limited       dim      — token budget reached
+#       ⊘ budget-limited       red      — token budget reached
 #   * No `unmet` — the model can never reach a failed state (RFC §3.4).
 #   * Pull-based: re-renders when Claude Code re-renders the status line. Pair
 #     with `refreshInterval` in settings for a live timer — NOT a /dev/tty
@@ -46,6 +48,10 @@ ROW=$(jq -r --arg s "$US" '
     (now | floor) as $now
     | (.spec.title // .objective // "" | gsub("[\t\r\n]"; " ")) as $title
     | (.audit.checklist // []) as $cl
+    | (first($cl[]? | select((.status // "") != "passed" and (.status // "") != "confirmed")) // null) as $task
+    | (if $task == null then ""
+       else (($task.id // "task") + " " + ($task.predicate // "") | gsub("[\t\r\n]"; " ") | .[0:72])
+       end) as $task_label
     | [ (.status // ""),
         ($title | .[0:72]),
         (.idle_strikes // 0 | tostring),
@@ -55,16 +61,20 @@ ROW=$(jq -r --arg s "$US" '
           | tostring) + "/" + ($cl | length | tostring)),
         ( (.time_used_seconds // .pursuing_seconds // 0) as $base
           | ((try ((.observed_at // .updated_at) | fromdateiso8601) catch $now)) as $obs
-          | (if (.status // "") == "pursuing"
+          | (if ((.status // "") == "pursuing" or (.status // "") == "relaying")
                then ($base + (($now - $obs) | if . < 0 then 0 else . end))
                else (.time_used_seconds_final // $base) end)
           | floor | tostring ),
-        ((.cost_usd_final // .cost_usd // 0) | tostring)
+        ((.cost_usd_final // .cost_usd // 0) | tostring),
+        $task_label,
+        ((.history // [] | if length > 0 then .[-1].note // "" else "" end) | gsub("[\t\r\n]"; " ") | .[0:72]),
+        ((.current.agent // .current.session // "") | tostring | .[0:48]),
+        ((.queued_until // "") | tostring | .[0:32])
       ] | join($s)
 ' "$GOAL_FILE" 2>/dev/null) || exit 0
 [ -n "$ROW" ] || exit 0
 
-IFS=$US read -r STATUS TITLE STRIKES TICKS TOKENS CHECKS SECONDS COST <<EOF
+IFS=$US read -r STATUS TITLE STRIKES TICKS TOKENS CHECKS SECONDS COST TASK LAST_NOTE AGENT QUEUED_UNTIL <<EOF
 $ROW
 EOF
 
@@ -111,6 +121,10 @@ case "$STATUS" in
         else
             GLYPH="◎" ; COLOR=$'\033[36m'  ; LABEL="goal"
         fi ;;
+    relaying)
+        GLYPH="↔" ; COLOR=$'\033[35m'  ; LABEL="relaying" ;;
+    queued)
+        GLYPH="⌛" ; COLOR=$'\033[33m'  ; LABEL="queued" ;;
     needs-input)
         GLYPH="◌" ; COLOR=$'\033[38;5;208m' ; LABEL="needs input" ;;
     achieved)
@@ -118,29 +132,42 @@ case "$STATUS" in
     paused)
         GLYPH="‖" ; COLOR=$'\033[2m'   ; LABEL="goal paused" ;;
     budget-limited)
-        GLYPH="⊘" ; COLOR=$'\033[2m'   ; LABEL="goal over budget" ;;
+        GLYPH="⊘" ; COLOR=$'\033[31m'  ; LABEL="budget limit" ;;
     *)
         exit 0 ;;
 esac
 
 DOT=" · "
 SEG=""
+FOCUS="$TITLE"
+[ -n "${TASK:-}" ] && FOCUS="$TASK"
 case "$STATUS" in
     pursuing)
         if [ "$STRIKES" -gt 0 ]; then
-            SEG="${GLYPH} ${LABEL}${DOT}${TITLE}${DOT}$(fmt_time "$SECONDS")"
+            SEG="${GLYPH} ${LABEL}${DOT}${FOCUS}${DOT}$(fmt_time "$SECONDS")"
+            [ -n "${LAST_NOTE:-}" ] && SEG="${SEG}${DOT}${LAST_NOTE}"
         else
             SEG="${GLYPH} ${TITLE}"
+            [ -n "${TASK:-}" ] && SEG="${SEG}${DOT}${TASK}"
             case "$CHECKS" in 0/0|/) : ;; *) SEG="${SEG}${DOT}${CHECKS}" ;; esac
             SEG="${SEG}${DOT}$(fmt_time "$SECONDS")"
         fi ;;
+    relaying)
+        SEG="${GLYPH} ${LABEL}${DOT}${TITLE}"
+        [ -n "${TASK:-}" ] && SEG="${SEG}${DOT}${TASK}"
+        [ -n "${AGENT:-}" ] && SEG="${SEG}${DOT}${AGENT}" ;;
+    queued)
+        SEG="${GLYPH} ${LABEL}${DOT}${FOCUS}"
+        [ -n "${QUEUED_UNTIL:-}" ] && SEG="${SEG}${DOT}retry ${QUEUED_UNTIL}" ;;
     needs-input)
-        SEG="${GLYPH} ${LABEL}${DOT}${TITLE}${DOT}$(fmt_time "$SECONDS")" ;;
+        SEG="${GLYPH} ${LABEL}${DOT}${FOCUS}${DOT}$(fmt_time "$SECONDS")"
+        [ -n "${LAST_NOTE:-}" ] && SEG="${SEG}${DOT}${LAST_NOTE}" ;;
     achieved)
         SEG="${GLYPH} ${LABEL}${DOT}${TITLE}${DOT}$(fmt_time "$SECONDS")"
         [ "$TOKENS" -gt 0 ] 2>/dev/null && SEG="${SEG}${DOT}$(fmt_tokens "$TOKENS")" ;;
     paused|budget-limited)
-        SEG="${GLYPH} ${LABEL}${DOT}${TITLE}" ;;
+        SEG="${GLYPH} ${LABEL}${DOT}${TITLE}"
+        [ -n "${TASK:-}" ] && SEG="${SEG}${DOT}${TASK}" ;;
 esac
 
 # Append the goal's notional cost to every state (when known and non-zero).

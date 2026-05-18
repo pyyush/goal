@@ -24,14 +24,13 @@ if (!existsSync(serverPath)) {
 const goalRoot = mkdtempSync(join(tmpdir(), "goal-mcp-smoke-"));
 const sessionId = "smoke-sess-" + Math.random().toString(36).slice(2, 10);
 console.error(`smoke: GOAL_ROOT=${goalRoot}`);
-console.error(`smoke: CLAUDE_SESSION_ID=${sessionId}`);
+console.error(`smoke: explicit session_id=${sessionId}`);
 
 const child = spawn(process.execPath, [serverPath], {
   env: {
     ...process.env,
     GOAL_ROOT: goalRoot,
     GOAL_MCP_DEBUG: "1",
-    CLAUDE_SESSION_ID: sessionId,
   },
   stdio: ["pipe", "pipe", "pipe"],
 });
@@ -130,7 +129,30 @@ async function run() {
   // 4) create_goal — happy path
   const created = await rpc("tools/call", {
     name: "create_goal",
-    arguments: { objective: "ship Phase 1 of /goal parity tools", token_budget: 5000 },
+    arguments: {
+      objective: "ship Phase 1 of /goal parity tools",
+      session_id: sessionId,
+      token_budget: 5000,
+      spec: {
+        title: "Ship Phase 1 parity tools",
+        outcome: "Phase 1 parity tools are implemented and verified",
+        verification: "MCP smoke passes",
+        tasks: [
+          {
+            id: "t1",
+            title: "Verify MCP creation",
+            outcome: "create_goal writes a v3 record",
+            verification: "this smoke test sees the v3 record",
+          },
+          {
+            id: "t2",
+            title: "Verify status accounting",
+            outcome: "budget and timer fields are present",
+            verification: "this smoke test inspects returned fields",
+          },
+        ],
+      },
+    },
   });
   assert(created.result, "create_goal: no result");
   expect(!created.result.isError, `create_goal: unexpected error: ${created.result.content?.[0]?.text}`);
@@ -162,6 +184,9 @@ async function run() {
   expect(onDisk.schema_version === 2, "on-disk schema_version should be 2 (wire schema)");
   expect(typeof onDisk.time_used_seconds === "number", "on-disk time_used_seconds missing");
   expect(typeof onDisk.observed_at === "string", "on-disk observed_at missing");
+  expect(onDisk.audit?.checklist?.length === 2, `on-disk audit checklist should be initialized from spec.tasks, got ${onDisk.audit?.checklist?.length}`);
+  expect(onDisk.audit?.checklist?.[0]?.id === "t1", "first audit item should keep task id t1");
+  expect(onDisk.audit?.checklist?.[0]?.predicate?.includes("Verify MCP creation"), "first audit predicate should include task title");
 
   // v2 path must NOT exist (regression guard for the bug we just fixed).
   const legacy = join(goalRoot, ".goal", "state.json");
@@ -284,7 +309,7 @@ async function run() {
   // 10) update_goal status:"complete" — happy path
   const done = await rpc("tools/call", {
     name: "update_goal",
-    arguments: { status: "complete" },
+    arguments: { status: "complete", session_id: sessionId },
   });
   expect(!done.result.isError, `update_goal: unexpected error: ${done.result.content?.[0]?.text}`);
   const doneObj = JSON.parse(done.result.content[0].text);

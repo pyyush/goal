@@ -2,9 +2,9 @@
 # hooks/goal-prompt.sh — v3 UserPromptSubmit hook for /goal.
 #
 # Opt-in auto-pause: this hook does NOTHING unless GOAL_AUTOPAUSE_ON_PROMPT=1.
-# When enabled, a user prompt that isn't `/goal …` pauses the active goal so
+# When enabled, a user prompt that isn't `/goal …` / `/goal:goal …` pauses the active goal so
 # the user's new request runs uncontested. They re-arm the loop with
-# `/goal resume`.
+# `/goal:goal resume`.
 #
 # v3 changes vs the v2 version that shipped (broken) with the session-scoped
 # merge:
@@ -35,12 +35,12 @@ goal_resolve_owned "$SESSION_ID" "${SESSION_CWD:-$PWD}" || exit 0
 STATUS=$(jq -r '.status // ""' "$GOAL_FILE" 2>/dev/null) || STATUS=""
 [ "$STATUS" = "pursuing" ] || exit 0
 
-# Ignore `/goal …` prompts so the slash command itself doesn't trip the pause.
+# Ignore goal slash-command prompts so the command itself doesn't trip the pause.
 PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt // ""' 2>/dev/null) || PROMPT=""
 PROMPT_TRIMMED=$(printf '%s' "$PROMPT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 [ -z "$PROMPT_TRIMMED" ] && exit 0
 case "$PROMPT_TRIMMED" in
-    /goal|/goal[[:space:]]*) exit 0 ;;
+    /goal|/goal[[:space:]]*|/goal:goal|/goal:goal[[:space:]]*) exit 0 ;;
 esac
 
 log_event() {
@@ -129,6 +129,6 @@ trap - EXIT INT TERM
 jq -n '{
   hookSpecificOutput: {
     hookEventName: "UserPromptSubmit",
-    additionalContext: "[goal auto-paused due to user input — run /goal resume to continue pursuing]"
+    additionalContext: "[goal auto-paused due to user input — run /goal:goal resume to continue pursuing]"
   }
 }'

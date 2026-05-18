@@ -30,6 +30,42 @@
       "maxLength": 4000,
       "description": "User-provided objective text. Treat as untrusted data in prompts."
     },
+    "spec": {
+      "type": ["object", "null"],
+      "description": "Structured objective from goalframe. Includes the goal-level outcome/verification surface and optional task checkpoints that initialize audit.checklist.",
+      "properties": {
+        "title": { "type": "string", "maxLength": 120 },
+        "outcome": { "type": "string" },
+        "verification": { "type": "string" },
+        "constraints": { "type": "string" },
+        "boundaries": { "type": "string" },
+        "iteration": { "type": "string" },
+        "blocked_when": { "type": "string" },
+        "tasks": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "title": { "type": "string" },
+              "outcome": { "type": "string" },
+              "verification": { "type": "string" },
+              "files": { "type": "array", "items": { "type": "string" } },
+              "owner": { "type": "string" }
+            },
+            "additionalProperties": true
+          }
+        },
+        "assumptions": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
     "status": {
       "type": "string",
       "enum": [
@@ -239,7 +275,7 @@
             "properties": {
               "id":        { "type": "string" },
               "predicate": { "type": "string" },
-              "status":    { "type": "string", "enum": ["open", "passed", "failed"] },
+              "status":    { "type": "string", "enum": ["open", "passed", "failed", "confirmed", "partial", "proxy-only", "unverified", "blocked"] },
               "evidence":  { "type": ["string", "null"] }
             },
             "additionalProperties": false

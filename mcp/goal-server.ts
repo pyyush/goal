@@ -296,6 +296,16 @@ import lockfile from "proper-lockfile";
 // v2 adds relaying and queued; v1 readers must tolerate these on read.
 type GoalStatus = "pursuing" | "paused" | "achieved" | "needs-input" | "budget-limited" | "relaying" | "queued";
 
+/** One task-level checkpoint inside a durable goal spec. */
+interface GoalTaskSpec {
+  id?: string;
+  title?: string;
+  outcome?: string;
+  verification?: string;
+  files?: string[];
+  owner?: string;
+}
+
 /** Structured objective from the `goalframe` skill. All fields optional; stored verbatim. */
 interface GoalSpec {
   title?: string;
@@ -305,7 +315,8 @@ interface GoalSpec {
   boundaries?: string;
   iteration?: string;
   blocked_when?: string;
-  assumptions?: string;
+  tasks?: GoalTaskSpec[];
+  assumptions?: string | string[];
 }
 
 interface HistoryEntry {
@@ -502,18 +513,19 @@ export function resolveRootForCreate(opts: ResolveOptions = {}): ResolvedRoot {
 }
 
 /**
- * Resolve the current session id for binding/owner lookups. Prefers
- * CLAUDE_SESSION_ID (set by Claude Code when launching the MCP server) and
- * falls back to GOAL_SESSION_ID for tests / explicit override. Returns null
- * if no session is available — callers must handle the "unbound" case (the
- * MCP can still write the goal record; the slash command writes the pointer
- * as a fallback via bash).
+ * Resolve the current session id for binding/owner lookups. Claude Code v2.1.x
+ * exposes the live id as CLAUDE_CODE_SESSION_ID; older/local harnesses may set
+ * CLAUDE_SESSION_ID, and tests can use GOAL_SESSION_ID. Returns null if no
+ * session is available — callers must handle the "unbound" case.
  *
  * Hardening: refuse session ids that would escape the sessions/ directory or
  * exceed a sane length cap.
  */
 export function currentSessionId(env: NodeJS.ProcessEnv = process.env): string | null {
-  const raw = env.CLAUDE_SESSION_ID ?? env.GOAL_SESSION_ID ?? null;
+  return sanitizeSessionId(env.CLAUDE_CODE_SESSION_ID ?? env.CLAUDE_SESSION_ID ?? env.GOAL_SESSION_ID ?? null);
+}
+
+function sanitizeSessionId(raw: unknown): string | null {
   if (!raw) return null;
   const trimmed = String(raw).trim();
   if (trimmed.length === 0 || trimmed.length > 256) return null;
@@ -972,7 +984,7 @@ function listAllGoalRecords(paths: GoalPaths): GoalState[] {
  * Resolve a goal for a tool call that operates on an existing goal (get_goal,
  * update_goal, P5 coordination tools). Resolution order:
  *
- *   1) Session pointer  — .goal/sessions/<CLAUDE_SESSION_ID> names the gid.
+ *   1) Session pointer  — .goal/sessions/<session id> names the gid.
  *      The record is loaded and the pointer/record gid-agreement is verified;
  *      a dangling or disagreeing pointer falls through to (2).
  *   2) Single-active fallback — if exactly one non-terminal goal exists in
@@ -983,8 +995,8 @@ function listAllGoalRecords(paths: GoalPaths): GoalState[] {
  * Returns null if no goal can be resolved. Read-only — never writes the
  * session pointer as a side effect.
  */
-function resolveGoalForSession(paths: GoalPaths): { state: GoalState; source: "pointer" | "single-active" } | null {
-  const sid = currentSessionId();
+function resolveGoalForSession(paths: GoalPaths, sessionId?: string | null): { state: GoalState; source: "pointer" | "single-active" } | null {
+  const sid = sessionId ?? currentSessionId();
   if (sid) {
     const gid = readSessionPointer(paths, sid);
     if (gid) {
@@ -1128,6 +1140,7 @@ function validateGoalState(value: unknown): GoalState {
   const history = Array.isArray(v.history) ? (v.history as HistoryEntry[]) : [];
   // v2 additive fields — pass through if present, ignore if absent (v1 compat).
   const schema_version = typeof v.schema_version === "number" ? v.schema_version : undefined;
+  const spec = (v.spec !== undefined) ? (v.spec as GoalSpec | null) : undefined;
   const compat = Array.isArray(v.compat) ? (v.compat as string[]) : undefined;
   const roles = (v.roles !== undefined) ? (v.roles as GoalRoles | null) : undefined;
   const current = (v.current !== undefined) ? (v.current as GoalCurrent | null) : undefined;
@@ -1146,6 +1159,7 @@ function validateGoalState(value: unknown): GoalState {
     ...(schema_version !== undefined ? { schema_version } : {}),
     goal_id: v.goal_id as string,
     objective: v.objective as string,
+    ...(spec !== undefined ? { spec } : {}),
     status: status as GoalStatus,
     created_at: v.created_at as string,
     updated_at: v.updated_at as string,
@@ -1263,8 +1277,21 @@ function asObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function validateCreateGoalArgs(args: unknown): { objective: string; token_budget: number | null; spec: GoalSpec | null } {
+function validateOptionalSessionId(obj: Record<string, unknown>): string | null {
+  if (obj.session_id === undefined || obj.session_id === null) return null;
+  if (typeof obj.session_id !== "string") {
+    throw new ToolError("invalid_input", '"session_id" must be a string when provided');
+  }
+  const sid = sanitizeSessionId(obj.session_id);
+  if (!sid) {
+    throw new ToolError("invalid_input", '"session_id" is invalid');
+  }
+  return sid;
+}
+
+function validateCreateGoalArgs(args: unknown): { objective: string; token_budget: number | null; spec: GoalSpec | null; session_id: string | null } {
   const obj = asObject(args ?? {});
+  const session_id = validateOptionalSessionId(obj);
   const objective = obj.objective;
   if (typeof objective !== "string") {
     throw new ToolError("invalid_input", '"objective" is required and must be a string');
@@ -1291,21 +1318,112 @@ function validateCreateGoalArgs(args: unknown): { objective: string; token_budge
     }
     const src = obj.spec as Record<string, unknown>;
     const picked: GoalSpec = {};
-    for (const k of ["title","outcome","verification","constraints","boundaries","iteration","blocked_when","assumptions"] as const) {
+    for (const k of ["title","outcome","verification","constraints","boundaries","iteration","blocked_when"] as const) {
       const v = src[k];
       if (typeof v === "string") picked[k] = v;
     }
+    const assumptions = src.assumptions;
+    if (typeof assumptions === "string") {
+      picked.assumptions = assumptions;
+    } else if (Array.isArray(assumptions)) {
+      picked.assumptions = assumptions.filter((v): v is string => typeof v === "string").slice(0, 20);
+    }
+    if (Array.isArray(src.tasks)) {
+      const tasks: GoalTaskSpec[] = [];
+      for (const [idx, raw] of src.tasks.slice(0, 20).entries()) {
+        if (typeof raw === "string") {
+          const title = raw.trim();
+          if (title) tasks.push({ id: `t${idx + 1}`, title });
+          continue;
+        }
+        if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+        const taskObj = raw as Record<string, unknown>;
+        const task: GoalTaskSpec = {};
+        for (const k of ["id","title","outcome","verification","owner"] as const) {
+          const v = taskObj[k];
+          if (typeof v === "string" && v.trim()) task[k] = v.trim();
+        }
+        if (Array.isArray(taskObj.files)) {
+          task.files = taskObj.files.filter((v): v is string => typeof v === "string" && v.trim().length > 0).slice(0, 12);
+        }
+        if (task.title || task.outcome || task.verification) tasks.push(task);
+      }
+      if (tasks.length > 0) picked.tasks = tasks;
+    }
     spec = picked;
   }
-  return { objective: trimmed, token_budget, spec };
+  return { objective: trimmed, token_budget, spec, session_id };
 }
 
-function validateUpdateGoalArgs(args: unknown): { status: "complete" } {
+function validateUpdateGoalArgs(args: unknown): { status: "complete"; session_id: string | null } {
   const obj = asObject(args ?? {});
   if (obj.status !== "complete") {
     throw new ToolError("invalid_input", '"status" must be the literal "complete"');
   }
-  return { status: "complete" };
+  return { status: "complete", session_id: validateOptionalSessionId(obj) };
+}
+
+function validateGetGoalArgs(args: unknown): { session_id: string | null } {
+  const obj = asObject(args ?? {});
+  return { session_id: validateOptionalSessionId(obj) };
+}
+
+function auditId(raw: string | undefined, fallback: string, used: Set<string>): string {
+  const cleaned = (raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  let id = cleaned || fallback;
+  if (!used.has(id)) {
+    used.add(id);
+    return id;
+  }
+  let suffix = 2;
+  while (used.has(`${id}-${suffix}`)) suffix++;
+  id = `${id}-${suffix}`;
+  used.add(id);
+  return id;
+}
+
+function taskPredicate(task: GoalTaskSpec): string {
+  const title = (task.title ?? "").trim();
+  const outcome = (task.outcome ?? "").trim();
+  const verification = (task.verification ?? "").trim();
+  const parts: string[] = [];
+  if (title) parts.push(title);
+  if (outcome && outcome !== title) parts.push(outcome);
+  if (verification) parts.push(`verified by ${verification}`);
+  return parts.join(" — ").slice(0, 600) || "task-level checkpoint";
+}
+
+function initialAuditFromSpec(spec: GoalSpec | null): GoalState["audit"] {
+  if (!spec) return null;
+  const used = new Set<string>();
+  const taskItems = (spec.tasks ?? [])
+    .map((task, idx) => ({
+      id: auditId(task.id, `t${idx + 1}`, used),
+      predicate: taskPredicate(task),
+      status: "open",
+      evidence: null,
+    }))
+    .filter((item) => item.predicate.trim().length > 0);
+  if (taskItems.length > 0) {
+    return { checklist: taskItems };
+  }
+
+  const fallback: Array<{ id: string; predicate: string; status: string; evidence: string | null }> = [];
+  if (spec.outcome) {
+    fallback.push({ id: "outcome", predicate: `Outcome is true: ${spec.outcome}`, status: "open", evidence: null });
+  }
+  if (spec.verification) {
+    fallback.push({ id: "verification", predicate: `Verification surface passes: ${spec.verification}`, status: "open", evidence: null });
+  }
+  if (spec.constraints) {
+    fallback.push({ id: "constraints", predicate: `Constraints preserved: ${spec.constraints}`, status: "open", evidence: null });
+  }
+  return fallback.length > 0 ? { checklist: fallback } : null;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1361,10 +1479,10 @@ function atomicWriteText(targetPath: string, contents: string): void {
 // ────────────────────────────────────────────────────────────────────────────
 
 async function toolCreateGoal(args: unknown): Promise<GoalView> {
-  const { objective, token_budget, spec } = validateCreateGoalArgs(args);
+  const { objective, token_budget, spec, session_id } = validateCreateGoalArgs(args);
   const resolved = resolveRootForCreate();
   const paths = await resolvePathsWithMigration(resolved.root);
-  const sid = currentSessionId();
+  const sid = session_id ?? currentSessionId();
   logDebug("create_goal: resolved root", { root: paths.root, source: resolved.source, session: sid ?? "(none)" });
 
   ensureV3Dirs(paths);
@@ -1392,7 +1510,7 @@ async function toolCreateGoal(args: unknown): Promise<GoalView> {
       const projectActive = listAllGoalRecords(paths).filter((g) => g.status === "pursuing" || g.status === "paused");
       if (projectActive.length > 0) {
         throw new ToolError("goal_exists_and_active",
-          "an active goal already exists in this project; no CLAUDE_SESSION_ID was provided to bind to a different one",
+          "an active goal already exists in this project; no session id was provided to bind to a different one",
           { existing_goal_id: projectActive[0].goal_id, existing_status: projectActive[0].status });
       }
     }
@@ -1424,7 +1542,7 @@ async function toolCreateGoal(args: unknown): Promise<GoalView> {
       current: { agent: null, session: sid ?? null, since: sid ? ts : null },
       budget: null,
       lineage: [],
-      audit: null,
+      audit: initialAuditFromSpec(spec),
       handoff_head: null,
       queued_until: null,
     };
@@ -1450,13 +1568,13 @@ async function toolCreateGoal(args: unknown): Promise<GoalView> {
 }
 
 async function toolUpdateGoal(args: unknown): Promise<GoalView & { final_report: { elapsed_seconds: number; tokens_used: number; tick_count: number } }> {
-  validateUpdateGoalArgs(args);
+  const { session_id } = validateUpdateGoalArgs(args);
   const discovered = discoverExistingGoalRoot();
   if (!discovered) {
     throw new ToolError("no_active_goal", "no active goal found (no .goal/ discovered from cwd)");
   }
   const paths = await resolvePathsWithMigration(discovered.root);
-  const resolved = resolveGoalForSession(paths);
+  const resolved = resolveGoalForSession(paths, session_id);
   if (!resolved) {
     throw new ToolError("no_active_goal", "this session owns no goal, and the project does not have a single unambiguous active goal");
   }
@@ -1525,13 +1643,14 @@ async function toolUpdateGoal(args: unknown): Promise<GoalView & { final_report:
   });
 }
 
-async function toolGetGoal(): Promise<GoalView> {
+async function toolGetGoal(args: unknown = {}): Promise<GoalView> {
+  const { session_id } = validateGetGoalArgs(args);
   const discovered = discoverExistingGoalRoot();
   if (!discovered) {
     throw new ToolError("no_active_goal", "no active goal found (no .goal/ discovered from cwd)");
   }
   const paths = await resolvePathsWithMigration(discovered.root);
-  const resolved = resolveGoalForSession(paths);
+  const resolved = resolveGoalForSession(paths, session_id);
   if (!resolved) {
     throw new ToolError("no_active_goal", "this session owns no goal, and the project does not have a single unambiguous active goal");
   }
@@ -1979,12 +2098,16 @@ function composePreamble(paths: GoalPaths, state: GoalState, antiLoopNote = ""):
   writeFileSync(join(goalDir, "preamble.md"), capped, "utf8");
 }
 
-function validateProgressArgs(args: unknown): { audit_item_id: string; status: "passed" | "failed"; evidence_ref: string } {
+type AuditSupportStatus = "passed" | "failed" | "confirmed" | "partial" | "proxy-only" | "unverified" | "blocked";
+
+function validateProgressArgs(args: unknown): { audit_item_id: string; status: AuditSupportStatus; evidence_ref: string } {
   const obj = asObject(args ?? {});
   if (typeof obj.audit_item_id !== "string" || !obj.audit_item_id) throw new ToolError("invalid_input", "audit_item_id is required");
-  if (obj.status !== "passed" && obj.status !== "failed") throw new ToolError("invalid_input", "status must be passed or failed");
+  if (!["passed", "failed", "confirmed", "partial", "proxy-only", "unverified", "blocked"].includes(String(obj.status))) {
+    throw new ToolError("invalid_input", "status must be passed, failed, confirmed, partial, proxy-only, unverified, or blocked");
+  }
   if (typeof obj.evidence_ref !== "string" || !obj.evidence_ref) throw new ToolError("invalid_input", "evidence_ref is required");
-  return { audit_item_id: obj.audit_item_id, status: obj.status, evidence_ref: obj.evidence_ref };
+  return { audit_item_id: obj.audit_item_id, status: obj.status as AuditSupportStatus, evidence_ref: obj.evidence_ref };
 }
 
 async function toolReportProgress(args: unknown): Promise<{ ok: true }> {
@@ -2093,6 +2216,10 @@ const TOOLS: Tool[] = [
           minimum: 1,
           description: "Optional positive token budget. When exceeded, the goal auto-transitions to budget-limited and a wrap-up steering message is injected.",
         },
+        session_id: {
+          type: "string",
+          description: "Optional Claude session id. Pass CLAUDE_CODE_SESSION_ID from the slash-command environment when available so the record is bound to .goal/sessions/<session_id> even if the MCP process was launched before Claude exported it.",
+        },
         spec: {
           type: "object",
           description: "Optional structured objective from the `goalframe` skill (title, outcome, verification, constraints, boundaries, iteration, blocked_when, assumptions). Stored once and referenced by the continuation dispatcher so the raw objective is not re-pasted every turn.",
@@ -2114,6 +2241,10 @@ const TOOLS: Tool[] = [
           enum: ["complete"],
           description: "Only 'complete' is valid. The model cannot pause, resume, replace, modify budget, or mark a failure through this tool — those are user-only operations.",
         },
+        session_id: {
+          type: "string",
+          description: "Optional Claude session id used to resolve this session's owned goal.",
+        },
       },
       additionalProperties: false,
     },
@@ -2124,7 +2255,12 @@ const TOOLS: Tool[] = [
       "Get the current goal for this session: status, budget, tokens used and remaining, elapsed time, recent history. Use this to self-orient at the start of a continuation turn or after compaction, INSTEAD OF reading goal.json directly with the Read tool.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        session_id: {
+          type: "string",
+          description: "Optional Claude session id used to resolve this session's owned goal.",
+        },
+      },
       additionalProperties: false,
     },
   },
@@ -2219,13 +2355,13 @@ const TOOLS: Tool[] = [
   },
   {
     name: "report_progress",
-    description: "Mark one audit item passed or failed with concrete evidence. This cannot change lifecycle status or bypass the final audit gate.",
+    description: "Mark one task/audit item with concrete evidence and an overclaim support level. This cannot change lifecycle status or bypass the final audit gate.",
     inputSchema: {
       type: "object",
       required: ["audit_item_id", "status", "evidence_ref"],
       properties: {
         audit_item_id: { type: "string" },
-        status: { type: "string", enum: ["passed", "failed"] },
+        status: { type: "string", enum: ["passed", "failed", "confirmed", "partial", "proxy-only", "unverified", "blocked"] },
         evidence_ref: { type: "string" },
       },
       additionalProperties: false,
@@ -2312,7 +2448,7 @@ async function dispatch(name: string, args: unknown): Promise<CallToolResult> {
       case "update_goal":
         return toolResultFromObject(await toolUpdateGoal(args));
       case "get_goal":
-        return toolResultFromObject(await toolGetGoal());
+        return toolResultFromObject(await toolGetGoal(args));
       // P5: coordination tools
       case "claim_lane":
         return toolResultFromObject(await toolClaimLane(args));
@@ -2494,10 +2630,9 @@ class ChannelPushManager {
       if (!this.currentRoot) return;
       const paths = pathsFor(this.currentRoot);
       try {
-        // Cheap fingerprint: directory mtime changes when any record is rewritten or added.
-        const mtime = statSync(paths.goalsDir).mtimeMs;
-        if (mtime !== this.lastStateMtimeMs) {
-          this.lastStateMtimeMs = mtime;
+        const fingerprint = this.goalStateFingerprint(paths);
+        if (fingerprint !== this.lastStateMtimeMs) {
+          this.lastStateMtimeMs = fingerprint;
           this.coalesceAndEvaluate("filewatch");
         }
       } catch {
@@ -2506,6 +2641,21 @@ class ChannelPushManager {
     }, 500);
     this.pollTimer.unref?.();
     logDebug("channel: polling fallback installed");
+  }
+
+  private goalStateFingerprint(paths: GoalPaths): number {
+    // Directory mtime catches record add/remove and pause create/remove. File
+    // mtimes catch atomic rewrites or explicit touches when fs.watch is down.
+    let max = 0;
+    try { max = Math.max(max, statSync(paths.goalDir).mtimeMs); } catch { /* best-effort */ }
+    try { max = Math.max(max, statSync(paths.goalsDir).mtimeMs); } catch { /* best-effort */ }
+    try { max = Math.max(max, statSync(paths.pauseFile).mtimeMs); } catch { /* absent is fine */ }
+    let names: string[] = [];
+    try { names = readdirSync(paths.goalsDir).filter((n) => n.endsWith(".json")); } catch { return max; }
+    for (const name of names) {
+      try { max = Math.max(max, statSync(join(paths.goalsDir, name)).mtimeMs); } catch { /* best-effort */ }
+    }
+    return max;
   }
 
   private scheduleBootPush(): void {

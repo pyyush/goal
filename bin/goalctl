@@ -10,7 +10,7 @@
 #   .goal/locks/_coord.lock          cross-goal coordination lock
 #
 # Resolution: --goal/--session flags override; otherwise read
-# CLAUDE_SESSION_ID / GOAL_SESSION_ID env vars; otherwise fall back to the
+# CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID / GOAL_SESSION_ID env vars; otherwise fall back to the
 # project's single non-terminal goal if there's exactly one (RFC §3.2). A v2
 # .goal/state.json is migrated forward to .goal/goals/<gid>.json on first touch
 # and left unowned (per RFC §5: the next /goal create or /goal adopt binds).
@@ -31,6 +31,9 @@ commands:
   adopt <goal_id>                   bind this session to an existing goal
   get [--json]                      print the goal record
   status [--json]                   print a one-line status (--json: structured)
+  tasks [--json]                    list task-level audit checkpoints
+  next [--json]                     show the first unconfirmed task
+  audit [--json]                    summarize confirmed vs unresolved checks
   pause                             set status=paused
   resume                            set status=pursuing
   clear                             delete the goal record + session pointer
@@ -46,6 +49,7 @@ commands:
   lanes [--json]                    list current lane leases
   lanes release <lease_id>          release a lane lease
   relay [--json]                    force relay to peer (writes fault signal)
+  steer <note>                      append a user steering note for the agent
   quota [--json]                    show provider headroom from .goal/quota.json
   cowork init                       write default .goal/cowork.yml
   watch [--allow-control]           render the read-only v3 dashboard
@@ -60,11 +64,12 @@ commands:
 global options:
   --root <dir>      project root (walks up from \$PWD otherwise)
   --goal <gid>      target this exact goal id (overrides session resolution)
-  --session <sid>   resolve via this session pointer (overrides CLAUDE_SESSION_ID)
+  --session <sid>   resolve via this session pointer (overrides session env vars)
   --json            machine-readable output
 
 env:
-  CLAUDE_SESSION_ID / GOAL_SESSION_ID   resolve which goal this session owns
+  CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID / GOAL_SESSION_ID
+                       resolve which goal this session owns
   GOAL_DISABLE_MIGRATION=1              skip v1→v2→v3 forward migration
 
 There is no \`mark-unmet\` / \`abandon\` route in v3 — a stuck goal parks to
@@ -125,12 +130,16 @@ resolve_root() {
 
 # session_id: pick the session id for resolution.
 #   1) --session flag (explicit override)
-#   2) CLAUDE_SESSION_ID env (set by Claude Code when launching MCP servers)
-#   3) GOAL_SESSION_ID env (test/explicit override)
+#   2) CLAUDE_CODE_SESSION_ID env (Claude Code v2.1.x)
+#   3) CLAUDE_SESSION_ID env (older/local harnesses)
+#   4) GOAL_SESSION_ID env (test/explicit override)
 # Empty if none — callers fall back to single-active resolution.
 session_id() {
     if [ -n "$SESSION_OVERRIDE" ]; then
         printf '%s' "$SESSION_OVERRIDE"; return
+    fi
+    if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+        printf '%s' "$CLAUDE_CODE_SESSION_ID"; return
     fi
     if [ -n "${CLAUDE_SESSION_ID:-}" ]; then
         printf '%s' "$CLAUDE_SESSION_ID"; return
@@ -149,7 +158,7 @@ valid_uuid() {
 # resolve_goal_record <root> — print the path of the goal record for this
 # call. Resolution order (matches mcp/goal-server.ts):
 #   1) --goal <gid>          explicit
-#   2) sessions/<sid> ptr    where sid comes from --session / CLAUDE_SESSION_ID / GOAL_SESSION_ID
+#   2) sessions/<sid> ptr    where sid comes from --session / CLAUDE_CODE_SESSION_ID / CLAUDE_SESSION_ID / GOAL_SESSION_ID
 #   3) single-active         if exactly one non-terminal goal exists in the project
 # Exits non-zero if nothing resolves and the command requires a target.
 resolve_goal_record() {
@@ -612,7 +621,7 @@ create|replace)
                 if [ -n "$SID" ]; then
                     die "this session already owns a $EXISTING_STATUS goal ($EXISTING_GID); use 'goalctl replace' to overwrite or 'clear' first"
                 else
-                    die "a $EXISTING_STATUS goal already exists ($EXISTING_GID) and no CLAUDE_SESSION_ID was provided to bind a different one; use 'goalctl replace' or pass --session"
+                    die "a $EXISTING_STATUS goal already exists ($EXISTING_GID) and no session id was provided to bind a different one; use 'goalctl replace' or pass --session"
                 fi
                 ;;
         esac
@@ -731,7 +740,7 @@ adopt)
     _TARGET="${ARGS[0]:-}"
     [ -n "$_TARGET" ] || die "adopt: goal_id required"
     valid_uuid "$_TARGET" || die "adopt: invalid goal_id: $_TARGET"
-    [ -n "$SID" ] || die "adopt: no session id (set CLAUDE_SESSION_ID, GOAL_SESSION_ID, or pass --session)"
+    [ -n "$SID" ] || die "adopt: no session id (set CLAUDE_CODE_SESSION_ID, CLAUDE_SESSION_ID, GOAL_SESSION_ID, or pass --session)"
     _RECORD="$ROOT/.goal/goals/$_TARGET.json"
     [ -f "$_RECORD" ] && [ ! -L "$_RECORD" ] || die "adopt: no record at $_RECORD"
     ensure_dir
@@ -811,18 +820,113 @@ status)
                 pursuing_seconds: ($g.pursuing_seconds // 0),
                 pursuing_since: ($g.pursuing_since // null),
                 tick_count: ($g.tick_count // 0),
+                audit_total: ($g.audit.checklist // [] | length),
+                audit_confirmed: ($g.audit.checklist // [] | map(select(.status == "passed" or .status == "confirmed")) | length),
+                current_task: (
+                  first(($g.audit.checklist // [])[]? | select((.status // "") != "passed" and (.status // "") != "confirmed")) // null
+                ),
                 last_action: ($g.history // [] | last | .action // null),
                 last_note: ($g.history // [] | last | .note // null)
               }
         ' "$FILE"
     else
         jq -r '
+          (.audit.checklist // []) as $cl
+          | (first($cl[]? | select((.status // "") != "passed" and (.status // "") != "confirmed")) // null) as $next
           "Goal: \(.objective[:80])\(if (.objective | length) > 80 then "..." else "" end)
 Status: \(.status)
 Set: \(.created_at)
 Tokens: \(.tokens_used)\(if .token_budget then " / \(.token_budget)" else " (no budget)" end)
-Ticks: \(.tick_count // 0)"
+Ticks: \(.tick_count // 0)
+Checks: \([$cl[] | select(.status == "passed" or .status == "confirmed")] | length)/\($cl | length)
+Current: \(if $next == null then "none" else "\($next.id): \($next.predicate)" end)
+Last: \((.history // [] | last | .action // "none")) — \((.history // [] | last | .note // ""))"
         ' "$FILE"
+    fi
+    ;;
+
+tasks)
+    ensure_exists
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        jq '{tasks:(.audit.checklist // [])}' "$FILE"
+    else
+        jq -r '
+          (.audit.checklist // []) as $cl
+          | if ($cl | length) == 0 then
+              "No task checkpoints recorded for this goal."
+            else
+              ($cl[] | (
+                if (.status == "passed" or .status == "confirmed") then "[x]"
+                elif (.status == "failed" or .status == "blocked") then "[!]"
+                elif (.status == "partial" or .status == "proxy-only" or .status == "unverified") then "[~]"
+                else "[ ]" end
+              ) + " \(.id): \(.predicate)" + (if .evidence then " — \(.evidence)" else "" end))
+            end
+        ' "$FILE"
+    fi
+    ;;
+
+next)
+    ensure_exists
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        jq '{current_task:(first((.audit.checklist // [])[]? | select((.status // "") != "passed" and (.status // "") != "confirmed")) // null)}' "$FILE"
+    else
+        jq -r '
+          (first((.audit.checklist // [])[]? | select((.status // "") != "passed" and (.status // "") != "confirmed")) // null) as $next
+          | if $next == null then
+              "next: no open task checkpoints"
+            else
+              "next: \($next.id): \($next.predicate)\(if $next.evidence then " — \($next.evidence)" else "" end)"
+            end
+        ' "$FILE"
+    fi
+    ;;
+
+audit)
+    ensure_exists
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        jq '
+          (.audit.checklist // []) as $cl
+          | {
+              total: ($cl | length),
+              confirmed: ([$cl[] | select(.status == "passed" or .status == "confirmed")] | length),
+              unresolved: [$cl[] | select((.status // "") != "passed" and (.status // "") != "confirmed")],
+              gate: (if ($cl | length) > 0 and ([$cl[] | select((.status // "") != "passed" and (.status // "") != "confirmed")] | length) == 0 then "ACHIEVED" else "CONTINUE" end)
+            }
+        ' "$FILE"
+    else
+        jq -r '
+          (.audit.checklist // []) as $cl
+          | ([$cl[] | select(.status == "passed" or .status == "confirmed")] | length) as $ok
+          | ([$cl[] | select((.status // "") != "passed" and (.status // "") != "confirmed")]) as $open
+          | "Audit readiness: \($ok)/\($cl | length) confirmed\n"
+            + (if ($open | length) == 0 and ($cl | length) > 0 then
+                "\nGate: ACHIEVED"
+              else
+                "\nunresolved:\n"
+                + ($open | map("  - \(.id): \(.status) — \(.predicate)\(if .evidence then " (\(.evidence))" else "" end)") | join("\n"))
+                + "\n\nGate: CONTINUE"
+              end)
+        ' "$FILE"
+    fi
+    ;;
+
+steer)
+    ensure_exists
+    NOTE="${ARGS[*]:-}"
+    [ -n "$NOTE" ] || die "steer: note required"
+    STEER_SESSION="${SID:-manual}"
+    STEER_FILE="$ROOT/.goal/steers/$STEER_SESSION.jsonl"
+    mkdir -p "$(dirname "$STEER_FILE")" 2>/dev/null || true
+    jq -nc --arg at "$NOW" --arg text "$NOTE" --arg session "$STEER_SESSION" \
+        '{at:$at,text:$text,session_id:$session,source:"goalctl"}' >> "$STEER_FILE" \
+        || die "steer: could not append steering note"
+    printf '{"ts":"%s","type":"goal.steer","goal_id":"%s","actor":"goalctl","session_id":"%s"}\n' \
+        "$NOW" "$GID" "$STEER_SESSION" >> "$ROOT/.goal/events.jsonl" 2>/dev/null || true
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        jq -n --arg file "$STEER_FILE" '{ok:true,file:$file}'
+    else
+        printf 'steering note queued\n'
     fi
     ;;
 

@@ -1,12 +1,12 @@
 ---
-description: Set or manage a persistent objective Claude pursues across turns
-argument-hint: [<objective> | status | pause | resume | clear | achieved | budget <tokens>]
-allowed-tools: Read, Write, Edit, Bash(mkdir:*), Bash(cat:*), Bash(ls:*), Bash(test:*), Bash(date:*), Bash(jq:*), Bash(uuidgen:*), Bash(find:*), Bash(rm -f:*), Bash(git status:*), Bash(git diff:*), Bash(git log:*)
+description: Set or manage a durable outcome with task-level verification
+argument-hint: [<objective> | status | tasks | next | audit | steer <note> | list | adopt <goal_id> | replace <objective> | pause | resume | clear | achieved | budget <tokens> | debrief]
+allowed-tools: Read, Write, Edit, Bash(mkdir:*), Bash(cat:*), Bash(ls:*), Bash(test:*), Bash(date:*), Bash(jq:*), Bash(uuidgen:*), Bash(find:*), Bash(rm -f:*), Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(goalctl:*), Bash(./bin/goalctl:*)
 ---
 
 # /goal — persistent objective
 
-You are handling `/goal`. A goal is a durable objective for this project that Claude keeps pursuing across turns until it is `achieved`, `paused`, `needs-input`, `budget-limited`, or cleared.
+You are handling `/goal`. A goal is a durable outcome plus a task-level verification plan. Claude keeps pursuing it across turns until it is `achieved`, `paused`, `needs-input`, `budget-limited`, or cleared. At all times, the command should help the user answer: current task, next task, evidence gathered, and what input would unblock the run.
 
 Your only authority over goal status is to mark a goal **`achieved`** — and only through the `overclaim` audit. `pause`, `resume`, `clear`, and `budget` are user-initiated. `budget-limited` is set by the system. `needs-input` is reached automatically when progress stalls; it is **not a failure state** — the goal stays open and resumable. There is no failed/unmet/abandoned status: only the user abandons a goal.
 
@@ -14,26 +14,30 @@ Your only authority over goal status is to mark a goal **`achieved`** — and on
 
 With the companion `Stop` hook installed (the default for this plugin), Claude **auto-continues** while status is `pursuing`. After each turn a deterministic dispatcher checks whether the last turn made observable progress — a tool call, or a change to the working tree. If it did, the hook returns `{"decision":"block"}` with a short continuation prompt and another turn runs. If two consecutive turns make no progress, the dispatcher parks the goal at `needs-input` and stops the loop cleanly.
 
-**No model evaluates completion.** The loop is a state machine; completion is your own audited `update_goal` call. Without the Stop hook, advance the loop manually by running `/goal` with no arguments.
+**No model evaluates completion.** The loop is a state machine; completion is your own audited `update_goal` call. Without the Stop hook, advance the loop manually by running `/goal:goal` with no arguments.
 
 ## MCP tools (preferred)
 
 If `mcp__goal__get_goal`, `mcp__goal__create_goal`, and `mcp__goal__update_goal` are in your tool list, use them — they enforce the schema, the session-ownership model, and the CAS invariants in one round-trip:
 
-- `get_goal()` — the current goal for this session; authoritative. Use it to read status and to self-orient at the start of a continuation turn.
-- `create_goal({objective, spec?, token_budget?})` — create a goal. Pass the `spec` from `goalframe`. Fails if an active/paused goal already exists.
-- `update_goal({status:"complete"})` — mark achieved. Valid only after the `overclaim` audit passes.
+- `get_goal({session_id?})` — the current goal for this session; authoritative. Use it to read status and to self-orient at the start of a continuation turn.
+- `create_goal({objective, spec?, token_budget?, session_id?})` — create a goal. Pass the `spec` from `goalframe`; if `SESSION_ID` below is non-empty, also pass it as `session_id`. Fails if an active/paused goal already exists.
+- `update_goal({status:"complete", session_id?})` — mark achieved. Valid only after the `overclaim` audit passes; pass `session_id` when known.
 
 `update_goal` is intentionally asymmetric — it can *only* mark complete. Pause / resume / clear / budget are direct edits to the goal record because they are user-initiated.
 
 ## Current goal on disk
 
-!`d="$PWD"; while [ "$d" != "/" ] && [ -n "$d" ]; do if [ -d "$d/.goal/goals" ]; then echo "GOAL_ROOT=$d"; for f in "$d"/.goal/goals/*.json; do [ -f "$f" ] || continue; echo "RECORD=$f"; jq -c '{goal_id,status,objective:(.objective[0:120]),updated_at}' "$f" 2>/dev/null; done; exit 0; fi; if [ -f "$d/.goal/state.json" ]; then echo "GOAL_ROOT=$d (legacy v2)"; echo "RECORD=$d/.goal/state.json"; jq -c '{goal_id,status,objective:(.objective[0:120])}' "$d/.goal/state.json" 2>/dev/null; exit 0; fi; d=$(dirname "$d"); done; echo NO_GOAL`
+!`d="$PWD"; while [ "$d" != "/" ] && [ -n "$d" ]; do if [ -d "$d/.goal/goals" ]; then echo "GOAL_ROOT=$d"; find "$d/.goal/goals" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | sort | while IFS= read -r f; do echo "RECORD=$f"; jq -c '{goal_id,status,objective:(.objective[0:120]),updated_at}' "$f" 2>/dev/null; done; exit 0; fi; if [ -f "$d/.goal/state.json" ]; then echo "GOAL_ROOT=$d (legacy v2)"; echo "RECORD=$d/.goal/state.json"; jq -c '{goal_id,status,objective:(.objective[0:120])}' "$d/.goal/state.json" 2>/dev/null; exit 0; fi; d=$(dirname "$d"); done; echo NO_GOAL`
 
 ## Fresh UUID / current UTC timestamp
 
 !`uuidgen 2>/dev/null | tr 'A-Z' 'a-z' || echo "fallback-$(date +%s)-$$"`
 !`date -u +%FT%TZ`
+
+## Current Claude session id
+
+!`sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-${GOAL_SESSION_ID:-}}}"; printf 'SESSION_ID=%s\n' "$sid"`
 
 ## User arguments
 
@@ -51,11 +55,19 @@ Trim `$ARGUMENTS`; lowercase the **first whitespace-separated token only** (so `
 | *(empty, `pursuing`)* | Show the one-line status. With the Stop hook installed, do **not** continue here — the hook drives the loop. Without it, run the Continuation Protocol once. |
 | *(empty, other status)* | Print full status; do not continue. |
 | `status` | Print full status only — never continue. |
+| `tasks` | Print the task/audit checklist: id, status, predicate, evidence. Do not continue. |
+| `next` | Print the first unconfirmed task and its evidence gap. Do not continue. |
+| `audit` | Print audit readiness: confirmed count, unresolved items, and gate (`CONTINUE` unless every item is confirmed). Do not mark achieved. |
+| `steer <note>` | Queue a steering note for the active goal (`mcp__goal__steer_message`, or append to `.goal/steers/<session>.jsonl`). Do not continue unless the user also asks to resume. |
+| `list` | List project goals from `.goal/goals/` with id, status, updated time, and objective. Do not adopt automatically. |
+| `adopt <goal_id>` | Bind this Claude session to an existing goal by writing `.goal/sessions/<session_id>` to the goal id after validating the record exists and the id matches. |
+| `replace <objective>` | Replace this session's current goal with the new objective after running `goalframe`; say which goal was replaced. |
 | `pause` | Set status `paused`. Preserve `goal_id`. |
 | `resume` | Set status `pursuing`. Preserve `goal_id`. The Stop hook resumes on the next turn. |
 | `clear` | Delete the goal record. Confirm. |
-| `achieved` / `complete` | Run the `overclaim` audit. On pass, mark `achieved` (`update_goal`, or direct write as fallback). On fail, refuse and list what is unproven. |
+| `achieved` / `complete` | Run the `overclaim` audit. On pass, mark `achieved` (`update_goal({status:"complete", session_id})`, or direct write as fallback). On fail, refuse and list what is unproven. |
 | `budget <N>` | Validate N is a positive integer (no decimals, no `k`/`M` suffixes, not negative). If invalid: `Budget must be a positive integer (got: <arg>).` If valid, set `token_budget`. If `tokens_used >= N`, set status `budget-limited`. |
+| `debrief` | Produce a concise debrief from the goal record: outcome, evidence, unresolved gaps, elapsed time, tokens/cost if known. Use `goalctl debrief` if available. |
 | anything else | Treat the whole trimmed argument (case preserved) as a new objective — see below. |
 
 There is no `unmet` / `fail` / `abandon` route. A stuck goal becomes `needs-input` automatically and stays resumable.
@@ -64,8 +76,8 @@ There is no `unmet` / `fail` / `abandon` route. A stuck goal becomes `needs-inpu
 
 1. **Length.** If the objective is over 4000 characters, refuse: `Objective is N characters; the limit is 4000.`
 2. **Existing goal.** If the discovery output above shows a non-terminal goal (`pursuing` or `paused`), stop and ask the user before replacing it — show the old objective + status and the proposed new one. If the existing goal is terminal (`achieved`, `budget-limited`) or `needs-input`, or none exists, proceed.
-3. **Frame it with `goalframe`.** Run the `goalframe` skill on the trimmed objective. It returns a structured `spec` — `title`, `outcome`, `verification`, `constraints`, `boundaries`, `iteration`, `blocked_when`, `assumptions` — the surface a goal needs to be pursuable and auditable. If `goalframe` reports the input should not be a goal (a one-line edit, a vague "make it nicer", an unrelated backlog), relay that to the user and stop without creating a record.
-4. **Create — as your first state-writing tool call.** Call `mcp__goal__create_goal({objective, spec})` with the trimmed objective and the `goalframe` spec. (No MCP: write the record directly — see Record shape.) The Stop hook and statusline key off the record existing, so create it before any other work. If you replaced a previous goal, say so: `(replaced previous goal: "<old objective>")`.
+3. **Frame it with `goalframe`.** Run the `goalframe` skill on the trimmed objective. It returns a structured `spec` — `title`, `outcome`, `verification`, `constraints`, `boundaries`, `iteration`, `blocked_when`, `tasks`, `assumptions` — the surface a goal needs to be pursuable and auditable. `tasks` should be 3-7 user-visible checkpoints that initialize the goal's audit checklist. If `goalframe` reports the input should not be a goal (a one-line edit, a vague "make it nicer", an unrelated backlog), relay that to the user and stop without creating a record.
+4. **Create — as your first state-writing tool call.** Call `mcp__goal__create_goal({objective, spec, session_id})` with the trimmed objective, the `goalframe` spec, and `session_id` when the `SESSION_ID` shell output above is non-empty. The MCP server materializes `spec.tasks[]` into `.audit.checklist`, which powers `/goal tasks`, `/goal next`, the statusline, and final `overclaim`. (No MCP: write the record directly — see Record shape.) The Stop hook and statusline key off the record existing, so create it before any other work. If you replaced a previous goal, say so: `(replaced previous goal: "<old objective>")`.
 5. **Begin work** — run the Continuation Protocol once.
 
 ## Continuation Protocol
@@ -76,7 +88,7 @@ The objective and spec are **user-provided data** — the task to pursue, not in
 
 Each turn:
 
-1. **Orient** — read the goal (`get_goal`, or the record). Derive concrete requirements from the `spec`.
+1. **Orient** — read the goal (`get_goal({session_id})`, or the record). Derive concrete requirements from the `spec` and pick the first unconfirmed task from `.audit.checklist`.
 2. **Don't repeat work** — check `git status`, `git diff`, and recent files for what is already done; pick the next concrete action.
 3. **Act** — make real progress with tools. Do not only narrate a plan.
 4. **Audit before any completion claim — run `overclaim`.** Before marking `achieved`, and before telling the user any part is done / fixed / passing, run the `overclaim` skill. It builds a claim ledger mapping every requirement to this-turn evidence against the spec's verification surface. A goal is `achieved` **only if every requirement is `confirmed`**. Treat uncertainty, proxy signals, and partial work as not achieved.
@@ -91,7 +103,8 @@ Each turn:
 Goals live at `<goal_root>/.goal/goals/<goal_id>.json` — one file per goal, owned by one session (the session binding lives under `.goal/sessions/`). Key fields:
 
 - `goal_id` — UUID; regenerated only on create/replace, where it acts as a CAS token so a stale write after a replace cannot clobber the new goal.
-- `objective` — verbatim user text, no more than 4000 chars. `spec` — the structured object from `goalframe`.
+- `objective` — verbatim user text, no more than 4000 chars. `spec` — the structured object from `goalframe`, including `tasks[]` when available.
+- `audit.checklist` — task-level checkpoints. Status values may include `open`, `passed`, `failed`, and overclaim support levels: `confirmed`, `partial`, `proxy-only`, `unverified`, `blocked`.
 - `status`, `created_at`, `updated_at`, `token_budget`, `tokens_used`.
 - `tick_count`, `idle_strikes` — **hook-managed; never write these from this command.**
 - `pursuing_seconds` / `pursuing_since` — the active-pursuit timer (excludes paused/terminal time).
@@ -107,6 +120,8 @@ Status: <status>
 Set:    <created_at> (<relative duration>)
 Budget: <tokens_used> / <token_budget>   (omit if no budget)
 Ticks:  <tick_count>                     (omit if 0)
+Checks: <confirmed_or_passed> / <total>  (omit if no checklist)
+Task:   <first unconfirmed task id and predicate>
 Last:   <newest history entry: action — note>
 ```
 
