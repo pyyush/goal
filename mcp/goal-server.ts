@@ -419,15 +419,20 @@ function logError(msg: string, extra?: Record<string, unknown>): void {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Goal-root discovery
+// Goal-root discovery — v3 session-scoped layout
 //
-// Order (mirrors hooks/goal-resolve.sh):
-//   1) $GOAL_ROOT env var
-//   2) Walk up from cwd looking for the nearest enclosing .claude/goal.json,
-//      stopping at $HOME (so user-scope ~/.claude is never the goal root).
-//   3) Session pointer at $HOME/.claude/goal-sessions/<session_id>.goal —
-//      its content is the absolute path to a goal.json.
-//   4) For create_goal, fall back to cwd. For other tools, caller decides.
+// A "goal root" is the directory containing the project's `.goal/`. The MCP
+// server resolves it once per tool call by:
+//   1) $GOAL_ROOT env var (test/override)
+//   2) Walk up from cwd looking for an existing .goal/ (v3), .goal/state.json
+//      (v2 legacy), or .claude/goal.json (v1 legacy). Stops at $HOME so the
+//      user-scope ~/.claude is never picked as a project root.
+//   3) For create_goal: fall back to cwd. For other tools: caller decides.
+//
+// The session that owns a given goal is identified by reading the v3 session
+// pointer at $GOAL_ROOT/.goal/sessions/<session_id>. Pointers are written by
+// `create_goal` (and by `/goal adopt` in the slash command) — never as a side
+// effect of a read.
 // ────────────────────────────────────────────────────────────────────────────
 
 export interface ResolveOptions {
@@ -438,16 +443,15 @@ export interface ResolveOptions {
 }
 
 export interface ResolvedRoot {
-  root: string;            // directory containing .claude/
-  source: "env" | "walk-up" | "session-pointer" | "cwd-fallback";
+  root: string;            // directory containing .goal/ (or, for create, cwd)
+  source: "env" | "walk-up" | "cwd-fallback";
 }
 
-/** Pure function for testing. Returns null when no existing goal is found. */
+/** Pure function for testing. Returns null when no existing goal root is found. */
 export function discoverExistingGoalRoot(opts: ResolveOptions = {}): ResolvedRoot | null {
   const env = opts.env ?? process.env;
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? env.HOME ?? homedir();
-  const sessionId = opts.sessionId ?? env.CLAUDE_SESSION_ID ?? env.GOAL_SESSION_ID;
 
   // 1) GOAL_ROOT env var — trust it if it exists and is a directory.
   const envRoot = env.GOAL_ROOT;
@@ -457,62 +461,34 @@ export function discoverExistingGoalRoot(opts: ResolveOptions = {}): ResolvedRoo
         return { root: resolve(envRoot), source: "env" };
       }
     } catch {
-      // fall through — env var pointed at something that doesn't exist;
-      // treat as opt-in even so, but only if used for create.
+      // Treat as opt-in: env var pointed at a yet-to-be-created dir. Callers
+      // that need to verify existence do so explicitly.
       return { root: resolve(envRoot), source: "env" };
     }
   }
 
-  // 2) Walk up from cwd to (but not including) $HOME or filesystem root.
-  //    Prefer v2 (.goal/state.json), fall back to v1 (.claude/goal.json).
+  // 2) Walk up from cwd until we hit /, $HOME, or run out of parents.
+  //    Recognise v3 (.goal/), v2 (.goal/state.json), or v1 (.claude/goal.json).
   let d = resolve(cwd);
-  const disableMigration = env.GOAL_DISABLE_MIGRATION === "1";
-  // Hard upper bound on traversal in pathological cases.
   for (let i = 0; i < 64; i++) {
     if (!d || d === "/" || d === home) break;
-    // v2 path (preferred unless migration disabled)
-    if (!disableMigration) {
-      const v2Candidate = join(d, ".goal", "state.json");
-      try {
-        const lst = lstatSync(v2Candidate);
-        if (lst.isFile() && !lst.isSymbolicLink()) {
-          return { root: d, source: "walk-up" };
-        }
-      } catch { /* not present */ }
-    }
-    // v1 path (always fallback)
-    const candidate = join(d, ".claude", "goal.json");
+    // v3: .goal/ directory exists (covers fresh v3, migrated v2, channel state, etc.)
     try {
-      // Symlinks are explicitly disallowed (matches bash: `! -L`). lstatSync
-      // returns metadata about the link itself, not its target.
-      const lst = lstatSync(candidate);
+      const lst = lstatSync(join(d, ".goal"));
+      if (lst.isDirectory() && !lst.isSymbolicLink()) {
+        return { root: d, source: "walk-up" };
+      }
+    } catch { /* not present */ }
+    // v1 legacy: still recognise .claude/goal.json so the migrator picks it up.
+    try {
+      const lst = lstatSync(join(d, ".claude", "goal.json"));
       if (lst.isFile() && !lst.isSymbolicLink()) {
         return { root: d, source: "walk-up" };
       }
-    } catch {
-      // not present, keep walking
-    }
+    } catch { /* keep walking */ }
     const parent = dirname(d);
     if (parent === d) break;
     d = parent;
-  }
-
-  // 3) Session pointer.
-  if (sessionId && home) {
-    const pointer = join(home, ".claude", "goal-sessions", `${sessionId}.goal`);
-    try {
-      if (statSync(pointer).isFile()) {
-        const target = readFileSync(pointer, "utf8").trim();
-        if (target.length > 0 && existsSync(target)) {
-          // pointer file content is an absolute path to goal.json.
-          // root = dirname(dirname(pointer-target)) → strips /.claude/goal.json
-          const root = dirname(dirname(target));
-          return { root, source: "session-pointer" };
-        }
-      }
-    } catch {
-      // ignore
-    }
   }
 
   return null;
@@ -525,17 +501,42 @@ export function resolveRootForCreate(opts: ResolveOptions = {}): ResolvedRoot {
   return { root: resolve(opts.cwd ?? process.cwd()), source: "cwd-fallback" };
 }
 
+/**
+ * Resolve the current session id for binding/owner lookups. Prefers
+ * CLAUDE_SESSION_ID (set by Claude Code when launching the MCP server) and
+ * falls back to GOAL_SESSION_ID for tests / explicit override. Returns null
+ * if no session is available — callers must handle the "unbound" case (the
+ * MCP can still write the goal record; the slash command writes the pointer
+ * as a fallback via bash).
+ *
+ * Hardening: refuse session ids that would escape the sessions/ directory or
+ * exceed a sane length cap.
+ */
+export function currentSessionId(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env.CLAUDE_SESSION_ID ?? env.GOAL_SESSION_ID ?? null;
+  if (!raw) return null;
+  const trimmed = String(raw).trim();
+  if (trimmed.length === 0 || trimmed.length > 256) return null;
+  if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("..") || trimmed.includes("\0")) return null;
+  return trimmed;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
-// File paths derived from root
+// File paths derived from root — v3 session-scoped layout
 // ────────────────────────────────────────────────────────────────────────────
 
 interface GoalPaths {
   root: string;
-  claudeDir: string;
-  goalDir: string;           // .goal/ — v2 state directory
-  goalFile: string;          // .goal/state.json (v2) or .claude/goal.json when migration disabled
-  v1GoalFile: string;        // always .claude/goal.json (migration source)
-  eventsFile: string;
+  claudeDir: string;         // .claude/         legacy (logs, baseline files, marker)
+  goalDir: string;           // .goal/
+  goalsDir: string;          // .goal/goals/     per-goal records (<gid>.json)
+  sessionsDir: string;       // .goal/sessions/  per-session pointer files (text: gid)
+  locksDir: string;          // .goal/locks/     per-goal lockfiles
+  cursorsDir: string;        // .goal/cursors/   dispatcher progress cursors
+  eventsFile: string;        // .goal/events.jsonl
+  pauseFile: string;         // .goal/pause      kill switch
+  v1GoalFile: string;        // .claude/goal.json  (migration source — legacy)
+  v2GoalFile: string;        // .goal/state.json   (migration source — legacy)
   baselineGlobPrefix: string;
   markerFile: string;        // .claude/MIGRATED_TO_GOAL
 }
@@ -543,17 +544,18 @@ interface GoalPaths {
 function pathsFor(root: string): GoalPaths {
   const claudeDir = join(root, ".claude");
   const goalDir = join(root, ".goal");
-  // Prefer v2 path for both fresh and migrated goals.
-  // When GOAL_DISABLE_MIGRATION is set, always use v1.
-  const disableMigration = process.env.GOAL_DISABLE_MIGRATION === "1";
-  const useV2 = !disableMigration;
   return {
     root,
     claudeDir,
     goalDir,
-    goalFile: useV2 ? join(goalDir, "state.json") : join(claudeDir, "goal.json"),
-    v1GoalFile: join(claudeDir, "goal.json"),
+    goalsDir: join(goalDir, "goals"),
+    sessionsDir: join(goalDir, "sessions"),
+    locksDir: join(goalDir, "locks"),
+    cursorsDir: join(goalDir, "cursors"),
     eventsFile: join(goalDir, "events.jsonl"),
+    pauseFile: join(goalDir, "pause"),
+    v1GoalFile: join(claudeDir, "goal.json"),
+    v2GoalFile: join(goalDir, "state.json"),
     baselineGlobPrefix: "goal-baseline-",
     markerFile: join(claudeDir, "MIGRATED_TO_GOAL"),
   };
@@ -563,60 +565,85 @@ function ensureClaudeDir(paths: GoalPaths): void {
   mkdirSync(paths.claudeDir, { recursive: true });
 }
 
-function ensureGoalStateDir(paths: GoalPaths): void {
-  const dir = dirname(paths.goalFile);
-  mkdirSync(dir, { recursive: true });
+/** Ensure all v3 subdirectories exist. Cheap; idempotent. */
+function ensureV3Dirs(paths: GoalPaths): void {
+  mkdirSync(paths.goalDir, { recursive: true });
+  mkdirSync(paths.goalsDir, { recursive: true });
+  mkdirSync(paths.sessionsDir, { recursive: true });
+  mkdirSync(paths.locksDir, { recursive: true });
+  mkdirSync(paths.cursorsDir, { recursive: true });
+}
+
+/** Per-goal record path: .goal/goals/<gid>.json */
+function goalRecordPath(paths: GoalPaths, gid: string): string {
+  return join(paths.goalsDir, `${gid}.json`);
+}
+
+/** Per-session pointer path: .goal/sessions/<sid> — content is the goal_id. */
+function sessionPointerPath(paths: GoalPaths, sid: string): string {
+  return join(paths.sessionsDir, sid);
+}
+
+/** Per-goal lockfile path: .goal/locks/<gid>.lock */
+function goalLockfilePath(paths: GoalPaths, gid: string): string {
+  return join(paths.locksDir, `${gid}.lock`);
+}
+
+/** Project-coordination lockfile (for cross-goal shared state: lanes, etc.). */
+function coordLockfilePath(paths: GoalPaths): string {
+  return join(paths.locksDir, "_coord.lock");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// v2 Migration
+// Migration: v1 (.claude/goal.json) → v2 (.goal/state.json) → v3 (.goal/goals/<gid>.json)
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Migrate from v1 (.claude/goal.json) to v2 (.goal/state.json) if needed.
+ * Forward-migrate any legacy state to the v3 layout. Idempotent; safe to run
+ * on every tool entry. The two stages:
  *
- * - No-op when GOAL_DISABLE_MIGRATION=1.
- * - No-op when .goal/ already exists.
- * - No-op when .claude/goal.json doesn't exist.
- * - Logs loudly to .claude/goal-hook.log on failure; never half-migrates.
- * - Called at the top of every tool handler.
+ *   v1 → v2:  .claude/goal.json     → .goal/state.json    (legacy, rare in practice)
+ *   v2 → v3:  .goal/state.json      → .goal/goals/<gid>.json
+ *
+ * v3 migration NEVER auto-binds the migrating record to the calling session
+ * (per RFC §5: "the next /goal or /goal adopt binds a session"). Terminal
+ * records (`achieved`, `budget-limited`) carry forward as-is and simply don't
+ * render in the statusline (no session owns them).
+ *
+ * Diagnostics go to .claude/goal-hook.log; failures throw `io_error`.
  */
 async function migrateIfNeeded(paths: GoalPaths): Promise<void> {
   if (process.env.GOAL_DISABLE_MIGRATION === "1") return;
-  if (existsSync(paths.goalDir)) return;
-  if (!existsSync(paths.v1GoalFile)) return;
 
+  // v1 → v2 (legacy path; almost no one is here anymore).
+  if (existsSync(paths.v1GoalFile) && !existsSync(paths.v2GoalFile) && !existsSync(paths.goalsDir)) {
+    await migrateV1ToV2(paths);
+  }
+
+  // v2 → v3 (the common case post-merge: every previously-merged install has v2 state.json).
+  if (existsSync(paths.v2GoalFile)) {
+    await migrateV2ToV3(paths);
+  }
+}
+
+async function migrateV1ToV2(paths: GoalPaths): Promise<void> {
   ensureClaudeDir(paths);
-
-  // We hold the lock on the v1 path while migrating.
-  // Use withGoalLock which already handles v1 vs v2 lock path selection.
-  // Since .goal/ doesn't exist yet, withGoalLock will use .claude/goal.lock.
-  let didMigrate = false;
   try {
-    await withGoalLock(paths, async () => {
-      // Double-check inside lock.
-      if (existsSync(paths.goalDir)) {
-        didMigrate = true; // another process beat us
-        return;
-      }
+    await withLegacyV1Lock(paths, async () => {
+      if (existsSync(paths.v2GoalFile) || existsSync(paths.goalsDir)) return; // another runner won
       if (!existsSync(paths.v1GoalFile)) return;
 
-      // Parse v1 state.
       let v1Raw: unknown;
       try {
         v1Raw = JSON.parse(readFileSync(paths.v1GoalFile, "utf8"));
       } catch (err) {
         const msg = (err as Error)?.message ?? String(err);
-        logError("migration: failed to parse v1 goal.json", { reason: msg });
-        appendMigrationLog(paths, "migration-parse-failed", msg);
+        appendMigrationLog(paths, "migration-v1-parse-failed", msg);
         throw new ToolError("io_error", `migration: cannot parse v1 goal.json: ${msg}`);
       }
-
       if (typeof v1Raw !== "object" || v1Raw === null) {
-        const msg = "v1 goal.json is not an object";
-        logError("migration:", { reason: msg });
-        appendMigrationLog(paths, "migration-invalid", msg);
-        throw new ToolError("io_error", `migration: ${msg}`);
+        appendMigrationLog(paths, "migration-v1-invalid", "not an object");
+        throw new ToolError("io_error", "migration: v1 goal.json is not an object");
       }
 
       const v1 = v1Raw as Record<string, unknown>;
@@ -652,63 +679,85 @@ async function migrateIfNeeded(paths: GoalPaths): Promise<void> {
         roles: { lead: null, build: null, review: null },
         current: { agent: null, session: null, since: null },
         budget: null,
-        lineage: [
-          {
-            agent: "claude-code",
-            model: "unknown",
-            started_at: v1Created,
-            ended_at: endedAt,
-            turns: v1Ticks,
-            tokens: v1Tokens,
-            summary: "migrated from v1",
-          },
-        ],
-        audit: null,
-        handoff_head: null,
-        queued_until: null,
+        lineage: [{
+          agent: "claude-code", model: "unknown", started_at: v1Created, ended_at: endedAt,
+          turns: v1Ticks, tokens: v1Tokens, summary: "migrated from v1",
+        }],
+        audit: null, handoff_head: null, queued_until: null,
       };
 
-      // Create .goal/ dir.
-      mkdirSync(paths.goalDir, { recursive: false });
-
-      // Write v2 state atomically.
+      mkdirSync(paths.goalDir, { recursive: true });
       try {
-        atomicWriteJson(paths.goalDir + "/state.json", v2State);
+        atomicWriteJson(paths.v2GoalFile, v2State);
       } catch (err) {
-        // Roll back: try to remove .goal/
         try { rmdirSync(paths.goalDir); } catch { /* best-effort */ }
         const msg = (err as Error)?.message ?? String(err);
-        logError("migration: failed to write v2 state", { reason: msg });
-        appendMigrationLog(paths, "migration-write-failed", msg);
+        appendMigrationLog(paths, "migration-v1-write-failed", msg);
         throw new ToolError("io_error", `migration: cannot write .goal/state.json: ${msg}`);
       }
-
-      // Lock path: after migration, `withGoalLock`'s finally block (the release())
-      // will attempt to remove `.claude/goal.lock` (the lock we acquired above).
-      // That cleanup will happen automatically. Future lock acquisitions will use
-      // `.goal/lock` (because pathsFor now sees .goal/ exists).
-      // We do NOT move/rename the lockdir here — proper-lockfile handles release.
-
-      // Write marker file.
-      try {
-        writeFileSync(paths.markerFile, nowIso() + "\n", { encoding: "utf8", mode: 0o644 });
-      } catch { /* best-effort */ }
-
-      appendMigrationLog(paths, "migration-done", "migrated v1→v2");
-      logDebug("migration complete", { root: paths.root });
-      didMigrate = true;
+      try { writeFileSync(paths.markerFile, nowIso() + "\n", { encoding: "utf8", mode: 0o644 }); } catch { /* best-effort */ }
+      appendMigrationLog(paths, "migration-v1-v2-done", "migrated v1→v2");
+      logDebug("migration v1→v2 complete", { root: paths.root });
     });
   } catch (err) {
     if (err instanceof ToolError) throw err;
-    logError("migration: unexpected error", { reason: (err as Error)?.message });
-    throw new ToolError("io_error", `migration failed: ${(err as Error)?.message}`);
+    throw new ToolError("io_error", `v1→v2 migration failed: ${(err as Error)?.message}`);
   }
+}
 
-  // If migration just completed, the pathsFor snapshot is stale (.goalFile still
-  // points to v1 path). Callers must call pathsFor again after migrateIfNeeded.
-  // We log a debug note here; the actual re-resolution is the caller's job.
-  if (didMigrate) {
-    logDebug("migration: done — caller should re-resolve paths");
+async function migrateV2ToV3(paths: GoalPaths): Promise<void> {
+  ensureV3Dirs(paths);
+  try {
+    // Take a project lock (not per-goal yet — we don't know the gid). The
+    // lockfile is in .goal/locks/, the same place v3 RMW takes per-goal locks,
+    // so we serialize cleanly against concurrent create_goal/get_goal callers.
+    await withProjectLock(paths, () => {
+      if (!existsSync(paths.v2GoalFile)) return; // another runner won
+      let v2Raw: unknown;
+      try {
+        v2Raw = JSON.parse(readFileSync(paths.v2GoalFile, "utf8"));
+      } catch (err) {
+        const msg = (err as Error)?.message ?? String(err);
+        appendMigrationLog(paths, "migration-v2-parse-failed", msg);
+        throw new ToolError("io_error", `migration v2→v3: cannot parse state.json: ${msg}`);
+      }
+      const state = validateGoalState(v2Raw);
+      const gid = state.goal_id;
+      if (!UUID_RE.test(gid)) {
+        appendMigrationLog(paths, "migration-v2-bad-gid", `goal_id=${gid}`);
+        throw new ToolError("io_error", `migration v2→v3: invalid goal_id "${gid}"`);
+      }
+      const target = goalRecordPath(paths, gid);
+      // Idempotency: if target already exists with the same gid, just remove
+      // the legacy file. If it exists with a different content, prefer the v3
+      // record (it is the post-migration source of truth).
+      if (existsSync(target)) {
+        try { unlinkSync(paths.v2GoalFile); } catch { /* best-effort */ }
+        appendMigrationLog(paths, "migration-v2-v3-skipped-target-exists", target);
+        return;
+      }
+      // Write v3 record, then unlink the v2 file (atomic enough: the record
+      // exists before we remove the old file).
+      atomicWriteJson(target, state);
+      try { unlinkSync(paths.v2GoalFile); } catch (err) {
+        appendMigrationLog(paths, "migration-v2-unlink-failed",
+          `wrote ${target} but failed to remove ${paths.v2GoalFile}: ${(err as Error)?.message}`);
+      }
+      // Do NOT auto-bind to current session (RFC §5). The next /goal create or
+      // /goal adopt writes the pointer.
+      appendMigrationLog(paths, "migration-v2-v3-done", `gid=${gid}`);
+      logDebug("migration v2→v3 complete", { root: paths.root, gid });
+      // Emit a one-line event so users can see this in events.jsonl.
+      appendEvent(paths, {
+        ts: nowIso(),
+        type: "goal.migrated",
+        goal_id: gid,
+        note: "v2 state.json → v3 goals/<gid>.json (unowned; bind via /goal adopt)",
+      });
+    });
+  } catch (err) {
+    if (err instanceof ToolError) throw err;
+    throw new ToolError("io_error", `v2→v3 migration failed: ${(err as Error)?.message}`);
   }
 }
 
@@ -762,28 +811,66 @@ function atomicWriteJson(targetPath: string, value: unknown): void {
 // Locked read-modify-write
 // ────────────────────────────────────────────────────────────────────────────
 
-async function withGoalLock<T>(paths: GoalPaths, fn: () => Promise<T> | T): Promise<T> {
+/**
+ * Per-goal RMW lock. Granularity: one lockfile per goal at .goal/locks/<gid>.lock.
+ *
+ * v3 lock model: a goal is owned by exactly one session, but the MCP server may
+ * be called concurrently for *different* goals in the same project (two Claude
+ * sessions, same folder). Locking per-goal means session A's slow RMW on goal A
+ * cannot starve session B's RMW on goal B. The bash Stop hook uses the same
+ * .goal/locks/<gid>.lock path (mkdir mutex), so the two writers serialize on
+ * the same file across runtimes.
+ *
+ * proper-lockfile's lockfilePath option points at a directory whose existence
+ * is the mutex. We point it at the same path the bash side uses (a directory),
+ * so both runtimes agree.
+ */
+async function withGoalLock<T>(
+  paths: GoalPaths,
+  gid: string,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  ensureV3Dirs(paths);
+  const lockfilePath = goalLockfilePath(paths, gid);
+  return acquireAndRun(paths, lockfilePath, fn);
+}
+
+/**
+ * Project-coordination lock — for tools that touch cross-goal shared state
+ * (lanes.json, channel debouncer, etc.). Granularity: one lockfile per project
+ * at .goal/locks/_coord.lock.
+ */
+async function withProjectLock<T>(
+  paths: GoalPaths,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  ensureV3Dirs(paths);
+  return acquireAndRun(paths, coordLockfilePath(paths), fn);
+}
+
+/**
+ * Lock the v1 legacy file during migration. The v1 path is .claude/goal.lock
+ * (proper-lockfile semantics, mkdir mutex). Only used by migrateIfNeeded so v1
+ * → v3 migration is single-shot across runners.
+ */
+async function withLegacyV1Lock<T>(
+  paths: GoalPaths,
+  fn: () => Promise<T> | T,
+): Promise<T> {
   ensureClaudeDir(paths);
-  // Lock path: post-migration (.goal/ exists) → .goal/lock; pre-migration → .claude/goal.lock.
-  // We lock on the state directory so the lock works even when state file doesn't yet exist.
-  let lockDir: string;
-  let lockfilePath: string;
-  let lockTarget: string;
-  try {
-    const goalDirStat = lstatSync(paths.goalDir);
-    if (goalDirStat.isDirectory()) {
-      lockDir = paths.goalDir;
-      lockfilePath = join(paths.goalDir, "lock");
-    } else {
-      lockDir = paths.claudeDir;
-      lockfilePath = join(paths.claudeDir, "goal.lock");
-    }
-  } catch {
-    // .goal/ doesn't exist — use legacy path.
-    lockDir = paths.claudeDir;
-    lockfilePath = join(paths.claudeDir, "goal.lock");
-  }
-  lockTarget = lockDir;
+  return acquireAndRun(paths, join(paths.claudeDir, "goal.lock"), fn);
+}
+
+async function acquireAndRun<T>(
+  _paths: GoalPaths,
+  lockfilePath: string,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  // proper-lockfile demands the lock TARGET exist. We use the lockfilePath
+  // directory's parent as the target — the parent (locks/ or .claude/) is
+  // guaranteed to exist by the ensure* call above.
+  const lockTarget = dirname(lockfilePath);
+  mkdirSync(lockTarget, { recursive: true });
 
   let release: (() => Promise<void>) | null = null;
   try {
@@ -796,6 +883,7 @@ async function withGoalLock<T>(paths: GoalPaths, fn: () => Promise<T> | T): Prom
   } catch (err) {
     throw new ToolError("file_lock_failed", "could not acquire goal lock", {
       reason: (err as Error)?.message,
+      lockfilePath,
     });
   }
   try {
@@ -804,7 +892,7 @@ async function withGoalLock<T>(paths: GoalPaths, fn: () => Promise<T> | T): Prom
     try {
       if (release) await release();
     } catch (err) {
-      logError("failed to release lock", { reason: (err as Error)?.message });
+      logError("failed to release lock", { reason: (err as Error)?.message, lockfilePath });
     }
   }
 }
@@ -813,18 +901,107 @@ async function withGoalLock<T>(paths: GoalPaths, fn: () => Promise<T> | T): Prom
 // Goal state read / view / event emission
 // ────────────────────────────────────────────────────────────────────────────
 
-function readGoalState(paths: GoalPaths): GoalState | null {
-  if (!existsSync(paths.goalFile)) return null;
+/**
+ * Read one goal record by id from .goal/goals/<gid>.json. Returns null if the
+ * file does not exist; throws if it exists but can't be read/parsed.
+ */
+function readGoalRecord(paths: GoalPaths, gid: string): GoalState | null {
+  const file = goalRecordPath(paths, gid);
+  if (!existsSync(file)) return null;
   try {
-    const raw = readFileSync(paths.goalFile, "utf8");
-    const parsed = JSON.parse(raw) as unknown;
-    return validateGoalState(parsed);
+    const lst = lstatSync(file);
+    if (!lst.isFile() || lst.isSymbolicLink()) return null;
+    const raw = readFileSync(file, "utf8");
+    return validateGoalState(JSON.parse(raw));
   } catch (err) {
-    throw new ToolError("io_error", "failed to read or parse goal.json", {
-      file: paths.goalFile,
+    throw new ToolError("io_error", `failed to read goal record ${gid}`, {
+      file,
       reason: (err as Error)?.message,
     });
   }
+}
+
+/**
+ * Read the goal_id this session owns from .goal/sessions/<sid>. Returns null
+ * if the pointer is absent, malformed, or names a goal_id that doesn't pass
+ * UUID validation. The pointer must agree with the record it names — that
+ * check is the caller's (read the record by the returned gid).
+ */
+function readSessionPointer(paths: GoalPaths, sid: string): string | null {
+  const ptr = sessionPointerPath(paths, sid);
+  try {
+    const lst = lstatSync(ptr);
+    if (!lst.isFile() || lst.isSymbolicLink()) return null;
+    const gid = readFileSync(ptr, "utf8").trim();
+    if (!UUID_RE.test(gid)) return null;
+    return gid;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * List every goal record in this project. Used by:
+ *   - resolveOwnedOrUniqueActive (for sessions without a pointer)
+ *   - the channel push manager (to find the pursuing goal to push for)
+ *   - /goal discover (slash command — via the bash helper, not this fn)
+ *
+ * Best-effort: unreadable records are silently skipped, never thrown.
+ */
+function listAllGoalRecords(paths: GoalPaths): GoalState[] {
+  if (!existsSync(paths.goalsDir)) return [];
+  let entries: string[];
+  try {
+    entries = readdirSync(paths.goalsDir);
+  } catch { return []; }
+  const goals: GoalState[] = [];
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    if (name.startsWith(".")) continue;
+    const gid = name.slice(0, -5); // strip ".json"
+    if (!UUID_RE.test(gid)) continue;
+    try {
+      const goal = readGoalRecord(paths, gid);
+      if (goal) goals.push(goal);
+    } catch { /* skip unreadable */ }
+  }
+  return goals;
+}
+
+/**
+ * Resolve a goal for a tool call that operates on an existing goal (get_goal,
+ * update_goal, P5 coordination tools). Resolution order:
+ *
+ *   1) Session pointer  — .goal/sessions/<CLAUDE_SESSION_ID> names the gid.
+ *      The record is loaded and the pointer/record gid-agreement is verified;
+ *      a dangling or disagreeing pointer falls through to (2).
+ *   2) Single-active fallback — if exactly one non-terminal goal exists in
+ *      the project, return it. This is intentionally narrow: it adopts only
+ *      when there is no ambiguity. With ≥2 active goals, callers must
+ *      disambiguate (e.g. /goal adopt) or error with no_active_goal.
+ *
+ * Returns null if no goal can be resolved. Read-only — never writes the
+ * session pointer as a side effect.
+ */
+function resolveGoalForSession(paths: GoalPaths): { state: GoalState; source: "pointer" | "single-active" } | null {
+  const sid = currentSessionId();
+  if (sid) {
+    const gid = readSessionPointer(paths, sid);
+    if (gid) {
+      try {
+        const state = readGoalRecord(paths, gid);
+        if (state && state.goal_id === gid) {
+          return { state, source: "pointer" };
+        }
+      } catch { /* dangling pointer; fall through */ }
+    }
+  }
+  const all = listAllGoalRecords(paths);
+  const active = all.filter((g) =>
+    g.status === "pursuing" || g.status === "paused" || g.status === "needs-input" || g.status === "relaying" || g.status === "queued",
+  );
+  if (active.length === 1) return { state: active[0], source: "single-active" };
+  return null;
 }
 
 // All 7 lifecycle statuses — v2 adds relaying and queued.
@@ -1136,25 +1313,47 @@ function validateUpdateGoalArgs(args: unknown): { status: "complete" } {
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Resolve paths for root, run migration if needed, then re-resolve so paths
- * reflect the post-migration state (.goal/ dir now exists).
+ * Resolve v3 paths for root and run any pending forward migration (v1→v2,
+ * v2→v3). pathsFor is deterministic in v3 (no per-state branching), so
+ * re-resolving after migration is a no-op — but we keep the function shape so
+ * every tool entry has one place to anchor "I've migrated, here are my paths."
  */
 async function resolvePathsWithMigration(root: string): Promise<GoalPaths> {
-  const initial = pathsFor(root);
-  await migrateIfNeeded(initial);
-  // Re-resolve: after migration .goal/ now exists, so pathsFor will pick v2 path.
-  return pathsFor(root);
+  const paths = pathsFor(root);
+  await migrateIfNeeded(paths);
+  return paths;
 }
 
 /**
- * Wrap a v2 state write: run validateStateV2 before atomicWriteJson.
+ * Wrap a v2/v3 state write: validate, then atomically write to
+ * .goal/goals/<gid>.json. The record SHAPE is unchanged from v2 (the wire
+ * schema is still schema_version=2); only the on-disk layout differs in v3.
  */
-function atomicWriteStateV2(goalFile: string, state: GoalState): void {
-  // Only validate v2 shape when schema_version is 2.
+function atomicWriteGoalRecord(paths: GoalPaths, state: GoalState): void {
   if (state.schema_version === 2) {
     validateStateV2(state);
   }
-  atomicWriteJson(goalFile, state);
+  atomicWriteJson(goalRecordPath(paths, state.goal_id), state);
+}
+
+/**
+ * Atomic write of a small text file (e.g. a session pointer). Same fs
+ * (tmp-in-same-dir → rename) so the result is atomic on POSIX/APFS.
+ */
+function atomicWriteText(targetPath: string, contents: string): void {
+  const dir = dirname(targetPath);
+  mkdirSync(dir, { recursive: true });
+  const tmpDir = mkdtempSync(join(dir, ".text-write-"));
+  const tmpFile = join(tmpDir, "out.tmp");
+  try {
+    writeFileSync(tmpFile, contents, { encoding: "utf8", mode: 0o644 });
+    const fd = openSync(tmpFile, "r");
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(tmpFile, targetPath);
+  } finally {
+    try { if (existsSync(tmpFile)) unlinkSync(tmpFile); } catch { /* best-effort */ }
+    try { rmdirSync(tmpDir); } catch { /* best-effort */ }
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1164,71 +1363,77 @@ function atomicWriteStateV2(goalFile: string, state: GoalState): void {
 async function toolCreateGoal(args: unknown): Promise<GoalView> {
   const { objective, token_budget, spec } = validateCreateGoalArgs(args);
   const resolved = resolveRootForCreate();
-  // Run migration first, then re-resolve so paths reflect the post-migration state.
   const paths = await resolvePathsWithMigration(resolved.root);
-  logDebug("create_goal: resolved root", { root: paths.root, source: resolved.source });
+  const sid = currentSessionId();
+  logDebug("create_goal: resolved root", { root: paths.root, source: resolved.source, session: sid ?? "(none)" });
 
-  // Ensure the state directory exists before acquiring the lock.
-  ensureGoalStateDir(paths);
+  ensureV3Dirs(paths);
 
-  return await withGoalLock(paths, () => {
-    const existing = readGoalState(paths);
-    if (existing && (existing.status === "pursuing" || existing.status === "paused")) {
-      throw new ToolError("goal_exists_and_active", `a ${existing.status} goal already exists; the user must clear or replace it first`, {
-        existing_goal_id: existing.goal_id,
-        existing_status: existing.status,
-      });
+  // Use the project-coordination lock: we don't have a per-goal lockfile path
+  // until we've minted the new gid, and we want create_goal to serialize
+  // against other create_goal calls in the same project.
+  return await withProjectLock(paths, () => {
+    // Pre-flight: a session can own only one non-terminal goal at a time.
+    if (sid) {
+      const ownedGid = readSessionPointer(paths, sid);
+      if (ownedGid) {
+        const existing = readGoalRecord(paths, ownedGid);
+        if (existing && (existing.status === "pursuing" || existing.status === "paused")) {
+          throw new ToolError("goal_exists_and_active",
+            `this session already owns a ${existing.status} goal; clear or replace it via /goal first`,
+            { existing_goal_id: existing.goal_id, existing_status: existing.status, owner_session_id: sid });
+        }
+        // Stale pointer to a terminal goal: drop it so we can rebind below.
+        try { unlinkSync(sessionPointerPath(paths, sid)); } catch { /* best-effort */ }
+      }
+    } else {
+      // No session id available — fall back to project-wide single-goal check
+      // so we don't silently create a second active goal nothing can resolve.
+      const projectActive = listAllGoalRecords(paths).filter((g) => g.status === "pursuing" || g.status === "paused");
+      if (projectActive.length > 0) {
+        throw new ToolError("goal_exists_and_active",
+          "an active goal already exists in this project; no CLAUDE_SESSION_ID was provided to bind to a different one",
+          { existing_goal_id: projectActive[0].goal_id, existing_status: projectActive[0].status });
+      }
     }
 
     const newId = randomUUID();
     const ts = nowIso();
-    const action = existing ? "replace" : "create";
-    // Determine if we're writing a v2 file.
-    const isV2 = paths.goalFile.endsWith("state.json");
-      const state: GoalState = {
-        ...(isV2 ? { schema_version: 2 as const } : {}),
-        goal_id: newId,
-        objective,
-        ...(spec ? { spec } : {}),
-        status: "pursuing",
-        created_at: ts,
-        updated_at: ts,
-        ...(isV2 ? {
-          time_used_seconds: 0,
-          observed_at: ts,
-          active_turn_started_at: ts,
-          tokens_used_observed_at: ts,
-          time_used_seconds_final: null,
-          tokens_used_final: null,
-        } : {}),
-        token_budget,
-        tokens_used: 0,
+    const state: GoalState = {
+      schema_version: 2,
+      goal_id: newId,
+      objective,
+      ...(spec ? { spec } : {}),
+      status: "pursuing",
+      created_at: ts,
+      updated_at: ts,
+      time_used_seconds: 0,
+      observed_at: ts,
+      active_turn_started_at: ts,
+      tokens_used_observed_at: ts,
+      time_used_seconds_final: null,
+      tokens_used_final: null,
+      token_budget,
+      tokens_used: 0,
       tick_count: 0,
       pursuing_seconds: 0,
       pursuing_since: ts,
-      history: [
-        {
-          ts,
-          action,
-          note: "via mcp__goal__create_goal",
-        },
-      ],
-      ...(isV2 ? {
-        compat: ["claude-code"],
-        roles: { lead: null, build: null, review: null },
-        current: { agent: null, session: null, since: null },
-        budget: null,
-        lineage: [],
-        audit: null,
-        handoff_head: null,
-        queued_until: null,
-      } : {}),
+      history: [{ ts, action: "create", note: "via mcp__goal__create_goal" }],
+      compat: ["claude-code"],
+      roles: { lead: null, build: null, review: null },
+      current: { agent: null, session: sid ?? null, since: sid ? ts : null },
+      budget: null,
+      lineage: [],
+      audit: null,
+      handoff_head: null,
+      queued_until: null,
     };
 
-    // Clean up orphan baselines from any previous goal_id BEFORE writing the
-    // new state, so a baseline-write race after our write doesn't sweep us.
     cleanupOrphanBaselines(paths, null);
-    atomicWriteStateV2(paths.goalFile, state);
+    atomicWriteGoalRecord(paths, state);
+    if (sid) {
+      atomicWriteText(sessionPointerPath(paths, sid), newId);
+    }
 
     appendEvent(paths, {
       ts,
@@ -1236,6 +1441,7 @@ async function toolCreateGoal(args: unknown): Promise<GoalView> {
       goal_id: newId,
       objective,
       actor: "model",
+      owner_session_id: sid,
       token_budget,
     });
 
@@ -1247,33 +1453,31 @@ async function toolUpdateGoal(args: unknown): Promise<GoalView & { final_report:
   validateUpdateGoalArgs(args);
   const discovered = discoverExistingGoalRoot();
   if (!discovered) {
-    throw new ToolError("no_active_goal", "no active goal found (no goal state discovered from cwd)");
+    throw new ToolError("no_active_goal", "no active goal found (no .goal/ discovered from cwd)");
   }
-  // Run migration, then re-resolve.
   const paths = await resolvePathsWithMigration(discovered.root);
+  const resolved = resolveGoalForSession(paths);
+  if (!resolved) {
+    throw new ToolError("no_active_goal", "this session owns no goal, and the project does not have a single unambiguous active goal");
+  }
+  const gid = resolved.state.goal_id;
 
-  return await withGoalLock(paths, () => {
-    const state = readGoalState(paths);
-    if (!state) {
-      throw new ToolError("no_active_goal", "no active goal found");
+  return await withGoalLock(paths, gid, () => {
+    const fresh = readGoalRecord(paths, gid);
+    if (!fresh) {
+      throw new ToolError("no_active_goal", `goal record ${gid} disappeared under us`);
     }
-    if (state.status !== "pursuing" && state.status !== "paused") {
-      throw new ToolError("no_active_goal", `goal is in terminal state "${state.status}"; cannot mark complete`);
+    if (fresh.status !== "pursuing" && fresh.status !== "paused") {
+      throw new ToolError("no_active_goal", `goal is in terminal state "${fresh.status}"; cannot mark complete`);
     }
-    const capturedId = state.goal_id;
-
-    // CAS: re-read after we hold the lock to ensure goal_id hasn't shifted.
-    // (Under proper-lockfile this is paranoid but cheap; harmless and matches spec.)
-    const fresh = readGoalState(paths);
-    if (!fresh || fresh.goal_id !== capturedId) {
+    // CAS: a second open of the file under the lock catches any pointer-vs-record drift.
+    if (fresh.goal_id !== gid) {
       throw new ToolError("goal_id_mismatch", "goal_id changed under us; aborting", {
-        expected: capturedId,
-        actual: fresh?.goal_id ?? null,
+        expected: gid, actual: fresh.goal_id,
       });
     }
 
     const ts = nowIso();
-    // Accumulate pursuit time if we're transitioning out of pursuing.
     let newPursuingSeconds = fresh.pursuing_seconds;
     if (fresh.status === "pursuing" && fresh.pursuing_since !== null) {
       const sinceMs = Date.parse(fresh.pursuing_since);
@@ -1298,7 +1502,7 @@ async function toolUpdateGoal(args: unknown): Promise<GoalView & { final_report:
         { ts, action: "mark-achieved", note: "via mcp__goal__update_goal" },
       ],
     };
-    atomicWriteStateV2(paths.goalFile, updated);
+    atomicWriteGoalRecord(paths, updated);
 
     const view = makeView(updated);
     appendEvent(paths, {
@@ -1324,16 +1528,17 @@ async function toolUpdateGoal(args: unknown): Promise<GoalView & { final_report:
 async function toolGetGoal(): Promise<GoalView> {
   const discovered = discoverExistingGoalRoot();
   if (!discovered) {
-    throw new ToolError("no_active_goal", "no active goal found (no goal state discovered from cwd)");
+    throw new ToolError("no_active_goal", "no active goal found (no .goal/ discovered from cwd)");
   }
-  // Run migration, then re-resolve.
   const paths = await resolvePathsWithMigration(discovered.root);
+  const resolved = resolveGoalForSession(paths);
+  if (!resolved) {
+    throw new ToolError("no_active_goal", "this session owns no goal, and the project does not have a single unambiguous active goal");
+  }
   // Reads still take the lock to avoid tearing a concurrent write.
-  return await withGoalLock(paths, () => {
-    const state = readGoalState(paths);
-    if (!state) {
-      throw new ToolError("no_active_goal", "no active goal found");
-    }
+  return await withGoalLock(paths, resolved.state.goal_id, () => {
+    const state = readGoalRecord(paths, resolved.state.goal_id);
+    if (!state) throw new ToolError("no_active_goal", "goal record vanished mid-read");
     return makeView(state);
   });
 }
@@ -1344,12 +1549,59 @@ async function toolGetGoal(): Promise<GoalView> {
 // model still cannot pause/resume/budget/mark-needs-input (existing 3 tools).
 // ────────────────────────────────────────────────────────────────────────────
 
-/** Resolve the .goal/ directory for P5 tools. */
+/** Resolve the .goal/ directory for tools that don't need a goal record. */
 async function resolveGoalDir(): Promise<string> {
   const discovered = discoverExistingGoalRoot();
   if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
   const paths = await resolvePathsWithMigration(discovered.root);
   return paths.goalDir;
+}
+
+/**
+ * Resolve (paths, the goal this session owns or the unique active goal) under
+ * the goal's per-goal lock, then run `fn`. Used by every tool that does RMW on
+ * a specific goal record. Throws no_active_goal if nothing can be resolved.
+ */
+async function withSessionGoalLock<T>(
+  fn: (paths: GoalPaths, state: GoalState, gid: string) => Promise<T> | T,
+): Promise<T> {
+  const discovered = discoverExistingGoalRoot();
+  if (!discovered) throw new ToolError("no_active_goal", "no .goal/ discovered from cwd");
+  const paths = await resolvePathsWithMigration(discovered.root);
+  const resolved = resolveGoalForSession(paths);
+  if (!resolved) {
+    throw new ToolError("no_active_goal", "this session owns no goal, and the project does not have a single unambiguous active goal");
+  }
+  const gid = resolved.state.goal_id;
+  return withGoalLock(paths, gid, async () => {
+    const fresh = readGoalRecord(paths, gid);
+    if (!fresh) throw new ToolError("no_active_goal", `goal record ${gid} vanished mid-call`);
+    return await fn(paths, fresh, gid);
+  });
+}
+
+/**
+ * Like withSessionGoalLock, but takes the *project-coordination* lock instead.
+ * Used by tools that touch shared cross-goal state (lanes.json, handoff seq,
+ * breadcrumbs, escalations) — the goal record is still resolved for context,
+ * but the lock is project-wide so concurrent goals don't race on shared files.
+ */
+async function withSessionGoalProjectLock<T>(
+  fn: (paths: GoalPaths, state: GoalState, gid: string) => Promise<T> | T,
+): Promise<T> {
+  const discovered = discoverExistingGoalRoot();
+  if (!discovered) throw new ToolError("no_active_goal", "no .goal/ discovered from cwd");
+  const paths = await resolvePathsWithMigration(discovered.root);
+  const resolved = resolveGoalForSession(paths);
+  if (!resolved) {
+    throw new ToolError("no_active_goal", "this session owns no goal, and the project does not have a single unambiguous active goal");
+  }
+  const gid = resolved.state.goal_id;
+  return withProjectLock(paths, async () => {
+    const fresh = readGoalRecord(paths, gid);
+    if (!fresh) throw new ToolError("no_active_goal", `goal record ${gid} vanished mid-call`);
+    return await fn(paths, fresh, gid);
+  });
 }
 
 // ── claim_lane ────────────────────────────────────────────────────────────────
@@ -1377,28 +1629,15 @@ function validateClaimLaneArgs(args: unknown): ClaimLaneArgs {
 
 async function toolClaimLane(args: unknown): Promise<ClaimLaneResult> {
   const { glob, ttl_seconds, reason } = validateClaimLaneArgs(args);
-  const goalDir = await resolveGoalDir();
-  const paths = pathsFor(discoverExistingGoalRoot()!.root);
-
-  return await withGoalLock(paths, () => {
-    // Resolve current agent from state.json (current.agent or cwd-derived).
-    let holder = "unknown-agent";
-    let goalId: string | undefined;
-    try {
-      const state = readGoalState(paths);
-      if (state?.current?.agent) holder = state.current.agent;
-      if (state?.goal_id) goalId = state.goal_id;
-    } catch (_) { /* use fallback */ }
-
-    const result = claimLaneInner(goalDir, holder, glob, ttl_seconds, reason);
+  return await withSessionGoalProjectLock((paths, state, gid) => {
+    const holder = state.current?.agent ?? "unknown-agent";
+    const result = claimLaneInner(paths.goalDir, holder, glob, ttl_seconds, reason);
     if (result.ok === false) {
-      // P6 OTEL: emit goal.lane.conflict so the exporter increments the counter.
       appendEvent(paths, {
         ts: nowIso(),
         type: "goal.lane.conflict",
-        goal_id: goalId ?? "unknown",
-        glob,
-        holder,
+        goal_id: gid,
+        glob, holder,
         conflict_with: result.conflict_with,
       });
     }
@@ -1419,11 +1658,8 @@ function validateReleaseLaneArgs(args: unknown): { lease_id: string } {
 
 async function toolReleaseLane(args: unknown): Promise<{ ok: boolean }> {
   const { lease_id } = validateReleaseLaneArgs(args);
-  const goalDir = await resolveGoalDir();
-
-  return await withGoalLock(pathsFor(discoverExistingGoalRoot()!.root), () => {
-    const ok = releaseLaneInner(goalDir, lease_id);
-    return { ok };
+  return await withSessionGoalProjectLock((paths) => {
+    return { ok: releaseLaneInner(paths.goalDir, lease_id) };
   });
 }
 
@@ -1466,21 +1702,10 @@ function validateWriteHandoffArgs(args: unknown): WriteHandoffMcpArgs {
 
 async function toolWriteHandoff(args: unknown): Promise<{ seq: string; path: string }> {
   const wArgs = validateWriteHandoffArgs(args);
-  const discovered = discoverExistingGoalRoot();
-  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
-  const paths = await resolvePathsWithMigration(discovered.root);
-  const goalDir = paths.goalDir;
-  const handoffDir = join(goalDir, "handoff");
-
-  return await withGoalLock(paths, () => {
-    const state = readGoalState(paths);
-    if (!state) throw new ToolError("no_active_goal", "no active goal found");
-
-    // Compute from: current agent or "unknown".
+  return await withSessionGoalProjectLock((paths, state, gid) => {
+    const handoffDir = join(paths.goalDir, "handoff");
     const from = state.current?.agent ?? "unknown";
-    const goalId = state.goal_id;
 
-    // Compute next seq inside lock.
     mkdirSync(handoffDir, { recursive: true });
     let max = 0;
     try {
@@ -1492,7 +1717,6 @@ async function toolWriteHandoff(args: unknown): Promise<{ seq: string; path: str
     const ts = nowIso();
     const handoffPath = join(handoffDir, `${seqStr}.md`);
 
-    // Format bullets.
     const fmt = (bullets: string[]) =>
       bullets.length === 0 ? "- (none)" : bullets.map((b) => (b.startsWith("- ") ? b : `- ${b}`)).join("\n");
 
@@ -1503,30 +1727,24 @@ async function toolWriteHandoff(args: unknown): Promise<{ seq: string; path: str
       `to: ${wArgs.to}`,
       `at: ${ts}`,
       `reason: planned`,
-      `goal_id: ${goalId}`,
+      `goal_id: ${gid}`,
       "---",
       "",
-      "## Did",
-      fmt(wArgs.did),
+      "## Did", fmt(wArgs.did),
       "",
-      "## Did not",
-      fmt(wArgs.did_not),
+      "## Did not", fmt(wArgs.did_not),
       "",
-      "## Next",
-      fmt(wArgs.next),
+      "## Next", fmt(wArgs.next),
       "",
-      "## Do not redo",
-      fmt(wArgs.do_not_redo),
+      "## Do not redo", fmt(wArgs.do_not_redo),
       "",
       "## Open audit items",
-      "- See state.json .audit.checklist",
+      `- See .goal/goals/${gid}.json .audit.checklist`,
       "",
-      "## Evidence",
-      fmt(wArgs.evidence),
+      "## Evidence", fmt(wArgs.evidence),
       "",
     ].join("\n");
 
-    // Atomic write.
     const tmpDir = mkdtempSync(join(handoffDir, ".tmp-handoff-"));
     const tmp = join(tmpDir, "handoff.md");
     try {
@@ -1539,10 +1757,9 @@ async function toolWriteHandoff(args: unknown): Promise<{ seq: string; path: str
     }
     try { rmdirSync(tmpDir); } catch (_) { /* best-effort */ }
 
-    // Update handoff_head in state.
     try {
       const updated = { ...state, handoff_head: seqStr, updated_at: nowIso() };
-      atomicWriteStateV2(paths.goalFile, updated);
+      atomicWriteGoalRecord(paths, updated);
     } catch (_) { /* non-fatal — handoff is written */ }
 
     return { seq: seqStr, path: handoffPath };
@@ -1559,14 +1776,9 @@ interface PeerStatus {
 }
 
 async function toolPeerStatus(): Promise<PeerStatus> {
-  const discovered = discoverExistingGoalRoot();
-  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
-  const paths = await resolvePathsWithMigration(discovered.root);
-  const goalDir = paths.goalDir;
-
-  return await withGoalLock(paths, () => {
-    const state = readGoalState(paths);
-    const currentAgent = state?.current?.agent ?? null;
+  return await withSessionGoalLock((paths, state) => {
+    const goalDir = paths.goalDir;
+    const currentAgent = state.current?.agent ?? null;
 
     // Read quota.json for headroom.
     let headroom = "high";
@@ -1638,22 +1850,20 @@ function validateRelayNowArgs(args: unknown): { reason: string } {
 async function toolRelayNow(args: unknown): Promise<{ ok: boolean; handoff_seq: string | null }> {
   const { reason } = validateRelayNowArgs(args);
   const discovered = discoverExistingGoalRoot();
-  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
+  if (!discovered) throw new ToolError("no_active_goal", "no .goal/ discovered from cwd");
   const paths = await resolvePathsWithMigration(discovered.root);
-  const goalDir = paths.goalDir;
-
-  // Write a fault file that the running bridge can detect.
-  // relay_now only works when a bridge is running for the current agent.
-  const state = await withGoalLock(paths, () => readGoalState(paths));
-  if (!state) throw new ToolError("no_active_goal", "no active goal found");
-
+  const resolved = resolveGoalForSession(paths);
+  if (!resolved) {
+    throw new ToolError("no_active_goal", "this session owns no goal");
+  }
+  const state = resolved.state;
+  const gid = state.goal_id;
   const currentAgent = state.current?.agent;
   if (!currentAgent) {
     throw new ToolError("no_active_goal", "no current.agent set — is a bridge running?");
   }
 
-  // Write a .fault file for the bridge to detect and act on.
-  const faultFile = join(goalDir, "agents", `${currentAgent}.fault`);
+  const faultFile = join(paths.goalDir, "agents", `${currentAgent}.fault`);
   const faultData = JSON.stringify({
     kind: reason === "rate_limit" ? "rate_limit" : "other",
     reason,
@@ -1677,13 +1887,13 @@ async function toolRelayNow(args: unknown): Promise<{ ok: boolean; handoff_seq: 
     throw new ToolError("io_error", `relay_now: could not write fault file: ${(e as Error).message}`);
   }
 
-  // Poll for bridge to pick it up (up to 5s).
+  // Poll the goal record for the bridge to pick it up (up to 5s).
   const deadline = Date.now() + 5000;
   let handoffSeq: string | null = null;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 100));
     try {
-      const fresh = readGoalState(paths);
+      const fresh = readGoalRecord(paths, gid);
       if (fresh && (fresh.status === "relaying" || fresh.status === "pursuing") && fresh.handoff_head) {
         handoffSeq = fresh.handoff_head;
         break;
@@ -1779,21 +1989,16 @@ function validateProgressArgs(args: unknown): { audit_item_id: string; status: "
 
 async function toolReportProgress(args: unknown): Promise<{ ok: true }> {
   const p = validateProgressArgs(args);
-  const discovered = discoverExistingGoalRoot();
-  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
-  const paths = await resolvePathsWithMigration(discovered.root);
-  return await withGoalLock(paths, () => {
-    const s = readGoalState(paths);
-    if (!s) throw new ToolError("no_active_goal", "no active goal found");
+  return await withSessionGoalLock((paths, s) => {
     const checklist = s.audit?.checklist ?? [];
     const next = checklist.some((i) => i.id === p.audit_item_id)
       ? checklist.map((i) => i.id === p.audit_item_id ? { ...i, status: p.status, evidence: p.evidence_ref } : i)
       : [...checklist, { id: p.audit_item_id, predicate: p.evidence_ref, status: p.status, evidence: p.evidence_ref }];
     const updated = { ...s, audit: { checklist: next }, updated_at: nowIso() };
-    atomicWriteStateV2(paths.goalFile, updated);
+    atomicWriteGoalRecord(paths, updated);
     appendEvent(paths, { ts: nowIso(), type: `goal.audit.${p.status}`, goal_id: s.goal_id, audit_item_id: p.audit_item_id, evidence_ref: p.evidence_ref });
     composePreamble(paths, updated);
-    return { ok: true };
+    return { ok: true as const };
   });
 }
 
@@ -1802,12 +2007,7 @@ async function toolRecordBreadcrumb(args: unknown): Promise<{ ok: true; seq: num
   for (const k of ["audit_item", "approach", "outcome", "evidence_ref"] as const) {
     if (typeof obj[k] !== "string" || !(obj[k] as string).trim()) throw new ToolError("invalid_input", `${k} is required`);
   }
-  const discovered = discoverExistingGoalRoot();
-  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
-  const paths = await resolvePathsWithMigration(discovered.root);
-  return await withGoalLock(paths, () => {
-    const s = readGoalState(paths);
-    if (!s) throw new ToolError("no_active_goal", "no active goal found");
+  return await withSessionGoalProjectLock((paths, s) => {
     const seq = appendBreadcrumb(paths.goalDir, { agent: s.current?.agent ?? "model", audit_item: obj.audit_item, approach: obj.approach, outcome: obj.outcome, evidence_ref: obj.evidence_ref });
     let note = "";
     try {
@@ -1818,7 +2018,7 @@ async function toolRecordBreadcrumb(args: unknown): Promise<{ ok: true; seq: num
       }
     } catch (_) { /* best effort */ }
     composePreamble(paths, s, note);
-    return { ok: true, seq };
+    return { ok: true as const, seq };
   });
 }
 
@@ -1827,19 +2027,14 @@ async function toolReportStuck(args: unknown): Promise<{ ok: true; escalation: s
   if (typeof obj.audit_item_id !== "string" || !obj.audit_item_id) throw new ToolError("invalid_input", "audit_item_id is required");
   if (typeof obj.reason !== "string" || !obj.reason) throw new ToolError("invalid_input", "reason is required");
   const attempts = typeof obj.attempts === "number" ? obj.attempts : parseInt(String(obj.attempts ?? "1"), 10);
-  const discovered = discoverExistingGoalRoot();
-  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
-  const paths = await resolvePathsWithMigration(discovered.root);
-  return await withGoalLock(paths, () => {
-    const s = readGoalState(paths);
-    if (!s) throw new ToolError("no_active_goal", "no active goal found");
+  return await withSessionGoalProjectLock((paths, s) => {
     appendFileSync(join(paths.goalDir, "escalations.md"), `\n## ${nowIso()} ${obj.audit_item_id}\n${obj.reason}\nattempts=${attempts}\n`, "utf8");
     const escalation = attempts >= 5 ? "paused" : "try_peer";
     const updated = attempts >= 5 ? { ...s, status: "paused" as GoalStatus, updated_at: nowIso(), active_turn_started_at: null } : { ...s, updated_at: nowIso() };
-    atomicWriteStateV2(paths.goalFile, updated);
+    atomicWriteGoalRecord(paths, updated);
     appendEvent(paths, { ts: nowIso(), type: "goal.audit.stuck", goal_id: s.goal_id, audit_item_id: obj.audit_item_id, attempts, escalation });
     composePreamble(paths, updated);
-    return { ok: true, escalation };
+    return { ok: true as const, escalation };
   });
 }
 
@@ -1864,10 +2059,10 @@ async function toolQueueMessage(args: unknown): Promise<{ ok: true; position: nu
 async function toolSteerMessage(args: unknown): Promise<{ ok: true; accepted: boolean }> {
   const m = validateMessageArgs(args);
   const discovered = discoverExistingGoalRoot();
-  if (!discovered) throw new ToolError("no_active_goal", "no active goal found");
+  if (!discovered) throw new ToolError("no_active_goal", "no .goal/ discovered from cwd");
   const paths = await resolvePathsWithMigration(discovered.root);
-  const s = readGoalState(paths);
-  const accepted = s?.status === "pursuing" || s?.status === "relaying";
+  const resolved = resolveGoalForSession(paths);
+  const accepted = resolved !== null && (resolved.state.status === "pursuing" || resolved.state.status === "relaying");
   const dir = accepted ? "steers" : "rejected_steers";
   const file = join(paths.goalDir, dir, `${m.session_id}.jsonl`);
   mkdirSync(dirname(file), { recursive: true });
@@ -2269,23 +2464,17 @@ class ChannelPushManager {
     if (!this.currentRoot) return;
     const paths = pathsFor(this.currentRoot);
     try {
-      // Ensure dirs exist so fs.watch doesn't ENOENT. Fresh v2/v3 goals use
-      // .goal/state.json, so create .goal before the first goal exists.
-      ensureClaudeDir(paths);
-      ensureGoalStateDir(paths);
+      ensureV3Dirs(paths);
     } catch (err) {
-      logError("channel: failed to ensure .claude dir", { reason: (err as Error)?.message });
+      logError("channel: failed to ensure .goal dirs", { reason: (err as Error)?.message });
       return;
     }
-    // Watch the canonical state dir: .goal/ if v2, else .claude/.
-    const watchDir = paths.goalFile.includes("/.goal/") ? paths.goalDir : paths.claudeDir;
+    // v3: watch .goal/goals/ for per-goal record changes, plus .goal/ itself for the
+    // pause kill switch. Per-file watch breaks on atomic-rename writes (inode changes),
+    // so we watch the directories.
     try {
-      // Watch the directory rather than the file itself: file-level watch breaks
-      // on atomic-rename writes (the inode changes), which is exactly what our
-      // own atomicWriteJson does.
-      this.watcher = watch(watchDir, { persistent: false }, (_eventType, filename) => {
-        // We only care about state file changes (state.json for v2, goal.json for v1).
-        if (filename && filename !== "goal.json" && filename !== "state.json" && filename !== "goal.pause" && filename !== "pause") return;
+      this.watcher = watch(paths.goalsDir, { persistent: false }, (_eventType, filename) => {
+        if (filename && !filename.endsWith(".json")) return;
         this.coalesceAndEvaluate("filewatch");
       });
       this.watcher.on("error", (err: Error) => {
@@ -2293,7 +2482,7 @@ class ChannelPushManager {
         try { this.watcher?.close(); } catch { /* best-effort */ }
         this.watcher = null;
       });
-      logDebug("channel: watcher installed", { dir: watchDir });
+      logDebug("channel: watcher installed", { dir: paths.goalsDir });
     } catch (err) {
       logError("channel: watch() failed; filewatch trigger disabled", { reason: (err as Error)?.message });
     }
@@ -2305,13 +2494,14 @@ class ChannelPushManager {
       if (!this.currentRoot) return;
       const paths = pathsFor(this.currentRoot);
       try {
-        const mtime = statSync(paths.goalFile).mtimeMs;
+        // Cheap fingerprint: directory mtime changes when any record is rewritten or added.
+        const mtime = statSync(paths.goalsDir).mtimeMs;
         if (mtime !== this.lastStateMtimeMs) {
           this.lastStateMtimeMs = mtime;
           this.coalesceAndEvaluate("filewatch");
         }
       } catch {
-        // State file may not exist yet.
+        // .goal/goals/ may not exist yet — that's fine.
       }
     }, 500);
     this.pollTimer.unref?.();
@@ -2387,9 +2577,18 @@ class ChannelPushManager {
 
     const paths = pathsFor(resolved.root);
 
+    // Find the goal this push refers to (session-owned, or the single active one).
+    // We can't take the per-goal lock without a gid, so we resolve first, then lock.
+    const owned = resolveGoalForSession(paths);
+    if (!owned) {
+      this.logEvent({ trigger, outcome: "skipped_no_goal", goal_id: "" });
+      return;
+    }
+    const goalId = owned.state.goal_id;
+
     let decision: { kind: "send"; goalId: string } | { kind: "skip"; outcome: PushOutcome; goalId: string };
     try {
-      decision = await withGoalLock(paths, () => this.decideUnderLock(paths, trigger));
+      decision = await withGoalLock(paths, goalId, () => this.decideUnderLock(paths, goalId, trigger));
     } catch (err) {
       logError("channel: lock acquisition failed; skipping push", { reason: (err as Error)?.message });
       return;
@@ -2427,23 +2626,23 @@ class ChannelPushManager {
 
   private decideUnderLock(
     paths: GoalPaths,
+    gid: string,
     trigger: PushTrigger,
   ): { kind: "send"; goalId: string } | { kind: "skip"; outcome: PushOutcome; goalId: string } {
     // Pause file: hardest kill switch.
-    const pauseFile = join(paths.goalDir, "pause");
-    if (existsSync(pauseFile)) {
-      return { kind: "skip", outcome: "skipped_paused", goalId: this.peekGoalId(paths) };
+    if (existsSync(paths.pauseFile)) {
+      return { kind: "skip", outcome: "skipped_paused", goalId: gid };
     }
 
     let state: GoalState | null;
     try {
-      state = readGoalState(paths);
+      state = readGoalRecord(paths, gid);
     } catch (err) {
-      logError("channel: failed to read goal state", { reason: (err as Error)?.message });
-      return { kind: "skip", outcome: "skipped_no_goal", goalId: "" };
+      logError("channel: failed to read goal record", { reason: (err as Error)?.message, gid });
+      return { kind: "skip", outcome: "skipped_no_goal", goalId: gid };
     }
     if (!state) {
-      return { kind: "skip", outcome: "skipped_no_goal", goalId: "" };
+      return { kind: "skip", outcome: "skipped_no_goal", goalId: gid };
     }
 
     if (state.status !== "pursuing") {
@@ -2485,16 +2684,6 @@ class ChannelPushManager {
     // Record tick_count snapshot for future debounce comparisons.
     this.lastTickCount = state.tick_count;
     return { kind: "send", goalId: state.goal_id };
-  }
-
-  /** Best-effort goal_id read for events when we've decided to skip. */
-  private peekGoalId(paths: GoalPaths): string {
-    try {
-      const s = readGoalState(paths);
-      return s?.goal_id ?? "";
-    } catch {
-      return "";
-    }
   }
 
   private logEvent(partial: { trigger: PushTrigger; outcome: PushOutcome; goal_id: string; [k: string]: unknown }): void {
@@ -2617,7 +2806,10 @@ if (invokedAsScript) {
 // Exports for testing
 export const __test = {
   pathsFor,
-  readGoalState,
+  readGoalRecord,
+  readSessionPointer,
+  resolveGoalForSession,
+  listAllGoalRecords,
   validateGoalState,
   makeView,
   validateCreateGoalArgs,
