@@ -18,6 +18,7 @@ import {
   existsSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
   unlinkSync,
   utimesSync,
@@ -115,11 +116,22 @@ function readPushEvents() {
 }
 
 function bumpGoalMtime() {
-  // Touch state.json's mtime so fs.watch fires without changing the content.
-  // Use a future timestamp to be safe against same-second resolution.
-  const file = join(goalRoot, ".goal", "state.json");
+  // Touch the most-recent v3 goal record's mtime so fs.watch fires without
+  // changing the content. Use a future timestamp to be safe against same-second
+  // resolution. v3 records live at .goal/goals/<gid>.json — we don't know the
+  // gid here, so we pick the newest .json file under goals/.
+  const goalsDir = join(goalRoot, ".goal", "goals");
+  let candidates;
+  try {
+    candidates = readdirSync(goalsDir).filter((n) => n.endsWith(".json")).map((n) => join(goalsDir, n));
+  } catch {
+    throw new Error(`bumpGoalMtime: ${goalsDir} not found — create_goal must run first`);
+  }
+  if (candidates.length === 0) throw new Error(`bumpGoalMtime: no goal records in ${goalsDir}`);
+  // Pick the one with the largest mtime.
+  const target = candidates.sort()[candidates.length - 1];
   const t = new Date(Date.now() + 1_000);
-  utimesSync(file, t, t);
+  utimesSync(target, t, t);
 }
 
 async function run() {

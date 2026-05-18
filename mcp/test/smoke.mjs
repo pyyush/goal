@@ -1,5 +1,12 @@
 // Smoke test: spawn the compiled server, send JSON-RPC over stdio, assert tool
-// list and create_goal behaviour. Runs in a tmpdir injected via $GOAL_ROOT.
+// list and create_goal behaviour against the **v3 on-disk layout** —
+// .goal/goals/<gid>.json + .goal/sessions/<sid> pointers.
+//
+// This file would have caught the v3 PR's bug (MCP shipped writing v2
+// state.json while the hooks read v3 paths) if it had been written for v3
+// before that PR shipped. v3-handshake.mjs is the second half of the
+// regression net: it does an end-to-end MCP-write → bash-resolver-read round
+// trip and exits non-zero if either side drifts from the other.
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, readdirSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,10 +22,17 @@ if (!existsSync(serverPath)) {
 }
 
 const goalRoot = mkdtempSync(join(tmpdir(), "goal-mcp-smoke-"));
+const sessionId = "smoke-sess-" + Math.random().toString(36).slice(2, 10);
 console.error(`smoke: GOAL_ROOT=${goalRoot}`);
+console.error(`smoke: CLAUDE_SESSION_ID=${sessionId}`);
 
 const child = spawn(process.execPath, [serverPath], {
-  env: { ...process.env, GOAL_ROOT: goalRoot, GOAL_MCP_DEBUG: "1" },
+  env: {
+    ...process.env,
+    GOAL_ROOT: goalRoot,
+    GOAL_MCP_DEBUG: "1",
+    CLAUDE_SESSION_ID: sessionId,
+  },
   stdio: ["pipe", "pipe", "pipe"],
 });
 
@@ -135,18 +149,44 @@ async function run() {
   expect(createdObj.pursuing_since === createdObj.created_at,
          `create_goal: pursuing_since should equal created_at on fresh goal (${createdObj.pursuing_since} vs ${createdObj.created_at})`);
 
-  // 5) verify state.json was atomically written into GOAL_ROOT/.goal/
-  const goalFile = join(goalRoot, ".goal", "state.json");
-  expect(existsSync(goalFile), `state.json should exist at ${goalFile}`);
+  // 5) v3 on-disk layout assertions
+  //
+  // v2 wrote one .goal/state.json per project. v3 writes one file per goal at
+  // .goal/goals/<gid>.json, plus a session pointer at .goal/sessions/<sid>
+  // whose content is the gid. Both must agree for the bash resolver to find
+  // the goal.
+  const goalFile = join(goalRoot, ".goal", "goals", createdObj.goal_id + ".json");
+  expect(existsSync(goalFile), `v3 goal record should exist at ${goalFile}`);
   const onDisk = JSON.parse(readFileSync(goalFile, "utf8"));
   expect(onDisk.goal_id === createdObj.goal_id, "on-disk goal_id mismatch");
-  expect(onDisk.schema_version === 2, "on-disk schema_version should be 2");
-  expect(typeof onDisk.time_used_seconds === "number", "on-disk v3 time_used_seconds missing");
-  expect(typeof onDisk.observed_at === "string", "on-disk v3 observed_at missing");
-  // No leftover tmp files
-  const dirEntries = readdirSync(join(goalRoot, ".goal"));
-  const stray = dirEntries.filter((n) => n.startsWith(".goal-write-") || n.endsWith(".tmp"));
-  expect(stray.length === 0, `stray tmp files in .goal/: ${stray.join(",")}`);
+  expect(onDisk.schema_version === 2, "on-disk schema_version should be 2 (wire schema)");
+  expect(typeof onDisk.time_used_seconds === "number", "on-disk time_used_seconds missing");
+  expect(typeof onDisk.observed_at === "string", "on-disk observed_at missing");
+
+  // v2 path must NOT exist (regression guard for the bug we just fixed).
+  const legacy = join(goalRoot, ".goal", "state.json");
+  expect(!existsSync(legacy), `v2 state.json should NOT exist after v3 create_goal (found: ${legacy})`);
+
+  // Session pointer must exist and name the gid.
+  const ptr = join(goalRoot, ".goal", "sessions", sessionId);
+  expect(existsSync(ptr), `session pointer should exist at ${ptr}`);
+  const ptrContent = readFileSync(ptr, "utf8").trim();
+  expect(ptrContent === createdObj.goal_id, `session pointer content (${ptrContent}) should equal goal_id (${createdObj.goal_id})`);
+
+  // No leftover tmp files anywhere in .goal/
+  const stray = [];
+  const walk = (d) => {
+    let entries; try { entries = readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) { if (!e.name.startsWith(".")) walk(p); continue; }
+      if (e.name.startsWith(".goal-write-") || e.name.startsWith(".text-write-") || e.name.endsWith(".tmp")) {
+        stray.push(p);
+      }
+    }
+  };
+  walk(join(goalRoot, ".goal"));
+  expect(stray.length === 0, `stray tmp files: ${stray.join(",")}`);
 
   // 6) verify events.jsonl has goal.created line
   const eventsFile = join(goalRoot, ".goal", "events.jsonl");
