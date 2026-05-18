@@ -114,15 +114,111 @@ Resolution is read-only: the bash resolver and MCP both look up `sessions/<sid>`
 
 Writes are atomic (`mktemp` + `rename(2)`) and CAS-guarded by `goal_id`. The MCP server's per-goal lock and the bash hooks' per-goal `mkdir` mutex use the same lockfile path, so both runtimes serialize against each other.
 
-<p align="center">
-  <img src="docs/architecture.png" alt="goal architecture — session-owned records with per-goal locks" width="100%">
-</p>
+```mermaid
+flowchart LR
+    subgraph CC["Claude Code session  (CLAUDE_SESSION_ID = sid)"]
+        SC["/goal<br/>slash command"]
+        HOOKS["Stop / prompt / notify<br/>bash hooks"]
+        MCP["mcp__goal__*<br/>MCP server"]
+    end
+    subgraph EXT["External callers"]
+        CTL["goalctl"]
+        HTTP["goal-http-server<br/>(loopback)"]
+        BR["goal-bridge<br/>(cowork daemon)"]
+    end
+    subgraph FS[".goal/ — session-scoped layout"]
+        G["goals/&lt;gid&gt;.json<br/>per-goal record"]
+        SES["sessions/&lt;sid&gt;<br/>pointer (text = gid)"]
+        LOCK["locks/&lt;gid&gt;.lock<br/>per-goal mkdir mutex"]
+        CLOCK["locks/_coord.lock<br/>cross-goal lock"]
+        EVT["events.jsonl<br/>append-only"]
+    end
 
-### System map
+    SC --> MCP
+    MCP -- writes --> G
+    MCP -- writes --> SES
+    MCP -- takes --> LOCK
+    HOOKS -- resolves via --> SES
+    HOOKS -- writes --> G
+    HOOKS -- takes --> LOCK
+    CTL -- resolves via --> SES
+    CTL -- writes --> G
+    CTL -- takes --> LOCK
+    HTTP -- resolves via --> SES
+    HTTP -- writes --> G
+    BR -- watches --> G
+    BR -- takes --> LOCK
+    BR -- takes --> CLOCK
+    G -. appends .-> EVT
 
-<p align="center">
-  <img src="docs/system-map.png" alt="goal system map — durable project state, Claude Code hooks, MCP tools, Codex bridge relay, headless control surfaces, observability, and release gates" width="100%">
-</p>
+    classDef rt fill:#eef6ff,stroke:#6b8bb8,color:#0b2a4a
+    classDef ext fill:#fff5e6,stroke:#c08a2f,color:#3a2400
+    classDef fs fill:#f3f3f3,stroke:#888,color:#222
+    class SC,HOOKS,MCP rt
+    class CTL,HTTP,BR ext
+    class G,SES,LOCK,CLOCK,EVT fs
+```
+
+### Lifecycle
+
+The model can reach `achieved` only through the `overclaim` audit. `paused`, `clear`, and budget changes are user/system actions — the model can never write a failure state.
+
+```mermaid
+stateDiagram-v2
+    [*] --> pursuing : /goal &lt;objective&gt;
+
+    pursuing --> pursuing : Stop hook tick<br/>(progress observed)
+    pursuing --> needs_input : 2 no-progress turns<br/>(dispatcher auto-park)
+    pursuing --> paused : /goal pause<br/>or notify hook (429/5xx, solo)
+    pursuing --> achieved : overclaim audit passes<br/>+ update_goal complete
+    pursuing --> budget_limited : tokens_used &ge; token_budget
+
+    paused --> pursuing : /goal resume
+    needs_input --> pursuing : /goal resume
+
+    pursuing --> relaying : 429/5xx<br/>(cowork bridge)
+    relaying --> pursuing : peer turn completes
+    relaying --> queued : no peer has headroom
+    queued --> pursuing : retry timer +<br/>quota recovered
+
+    achieved --> [*]
+    budget_limited --> [*]
+
+    note right of needs_input
+        not a failure state —
+        fully resumable
+    end note
+    note right of achieved
+        only the model can write this,
+        only via overclaim audit
+    end note
+```
+
+### Cowork relay (opt-in)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CC as Claude Code<br/>(Stop hook)
+    participant G as goals/&lt;gid&gt;.json
+    participant L as locks/_coord.lock
+    participant H as handoff/NNNN.md
+    participant BR as goal-bridge<br/>(codex)
+    participant CX as Codex CLI
+
+    CC->>G: status=pursuing<br/>current.agent=claude-code-...
+    Note over CC,CX: rate-limit hit (429)
+    CC->>L: acquire coord lock
+    CC->>H: write handoff envelope<br/>(seq=NNNN, from=cc, to=codex)
+    CC->>G: status=relaying<br/>current.agent=codex-...<br/>handoff_head=NNNN
+    CC->>L: release
+    BR-->>G: watcher fires (fs.watch on goals/)
+    BR->>G: resolveMyGoal()<br/>current.agent matches AGENT_ID
+    BR->>H: read handoff body
+    BR->>CX: spawn turn with handoff context
+    CX-->>BR: turn.completed
+    BR->>G: status=pursuing<br/>(peer picked up)
+```
 
 ## Cowork and rate-limit relay
 
@@ -159,7 +255,16 @@ goalctl pr --json
 goalctl sync push / sync pull
 ```
 
-The HTTP shim binds `127.0.0.1` only and exposes `GET /goal`, `POST /goal`, `PATCH /goal`, `DELETE /goal`, and `GET /events?since=<iso>`.
+The HTTP shim binds `127.0.0.1` only and exposes:
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/goal[?goal=<gid>]` | Returns the resolved goal record. Resolution: `?goal=<gid>` → `X-Claude-Session-Id` header → single-active fallback. |
+| `POST` | `/goal` | Create a new goal. Pass `X-Claude-Session-Id` to bind a per-session goal; otherwise refuses if any active goal already exists. |
+| `PATCH` | `/goal[?goal=<gid>]` | `{"action":"pause"\|"resume"\|"clear"\|"set-budget"\|"mark-needs-input"}`. `clear` returns 204. |
+| `GET` | `/goals` | List every goal in the project. |
+| `GET` | `/events?since=<iso>` | NDJSON event stream from `.goal/events.jsonl`. |
+| `GET` | `/healthz` | `ok`. |
 
 ## MCP tools
 
@@ -206,15 +311,19 @@ The live timer uses `statusLine.refreshInterval` — no background daemon, no wr
 
 | Var | Default | What |
 |---|---|---|
-| `GOAL_MAX_TICKS` | `0` | Continuation cycle cap. `0` means unlimited. |
-| `GOAL_MAX_SECONDS` | `0` | Wall-clock cap. Useful for API-billed runs. |
-| `GOAL_AUTOPAUSE_ON_PROMPT` | `0` | Pause on user prompt when set to `1`. |
+| `GOAL_AUTOPAUSE_ON_PROMPT` | `0` | When `1`, the prompt hook pauses the active goal on every user prompt that isn't `/goal …`. |
+| `GOAL_STRIKE_LIMIT` | `2` | Consecutive no-progress turns before the dispatcher parks the goal to `needs-input`. |
+| `GOAL_REFRESH_EVERY` | `25` | Tick interval for full-spec refresh in the dispatcher's continuation prompt (short prompt by default). |
 | `GOAL_PUSH_INTERVAL_SECONDS` | unset | Optional MCP channel timer push. |
 | `GOAL_CHANNEL_DISABLE` | `0` | Disable only the push channel. |
+| `GOAL_CHANNEL_DEBOUNCE_MS` | `5000` | Debounce window between channel pushes vs Stop-hook ticks. |
 | `GOAL_LOCK_TIMEOUT_MS` | `5000` | Shared mutex acquire timeout. |
 | `GOAL_LOCK_STALE_MS` | `30000` | Stale lock takeover threshold. |
 | `GOAL_RELAY_LIMIT_PER_HOUR` | `3` | Automatic relay guardrail. |
+| `GOAL_HEARTBEAT_TTL_MS` | `15000` | Stale heartbeat threshold for cowork agents. |
 | `GOAL_OTEL_ENDPOINT` | unset | OTLP HTTP endpoint for `goal-otel-exporter`. |
+| `GOAL_DISABLE_MIGRATION` | `0` | Skip the v1 → v2 → v3 forward migration on first touch. |
+| `CLAUDE_SESSION_ID` / `GOAL_SESSION_ID` | set by Claude Code | Used by the MCP server, `goalctl`, and the HTTP shim to resolve which goal this session owns. |
 
 ## Troubleshooting
 

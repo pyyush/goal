@@ -8,9 +8,9 @@ Cowork lets Claude Code and Codex pursue the same goal sequentially, handing off
 
 ## Mental model
 
-A `/goal` objective lives in `.goal/state.json`. Any agent that can read that file and write atomically to `.goal/` is a valid runner. When one agent stops (rate limited, budget exhausted, user-directed), it writes a handoff envelope describing what it did and what comes next. The next agent reads the envelope and continues from exactly that point.
+A `/goal` objective lives at `.goal/goals/<goal_id>.json` and is **owned by exactly one session** via `.goal/sessions/<session_id>` (a pointer file whose content is the goal_id). Any agent that can read its record and write atomically under `.goal/` is a valid runner. When one agent stops (rate limited, budget exhausted, user-directed), it writes a handoff envelope describing what it did and what comes next. The next agent reads the envelope and continues from exactly that point.
 
-This is different from orchestration frameworks that pipeline agents through a coordinator. There is no coordinator here. The goal file is the coordinator. Agents are stateless with respect to each other — they share nothing except the `.goal/` directory.
+This is different from orchestration frameworks that pipeline agents through a coordinator. There is no coordinator here. The goal record is the coordinator. Agents are stateless with respect to each other — they share nothing except the `.goal/` directory.
 
 ---
 
@@ -20,23 +20,30 @@ All cowork state lives under `.goal/` in your project root.
 
 ```
 .goal/
-  state.json          single source of truth
+  goals/<goal_id>.json    per-goal record (was state.json in v2)
+  sessions/<session_id>   pointer file (text = goal_id) — session ownership
+  locks/<goal_id>.lock    per-goal mkdir mutex (MCP / hooks / bridge agree)
+  locks/_coord.lock       cross-goal coordination lock (handoff seq, lanes)
+  cursors/<goal_id>       dispatcher progress cursor (tool-call count + wt hash)
   handoff/
-    0001.md           handoff envelopes, monotonic seq
+    0001.md               handoff envelopes, monotonic seq (project-wide)
     0002.md
   agents/
-    <agent_id>.json   per-agent heartbeat (updated every 5s)
-  quota.json          per-provider rate-limit headroom
-  cowork.yml          opt-in role contract
-  lanes.json          path-glob leases
-  pause               touch to halt all agents immediately
+    <agent_id>.json       per-agent heartbeat (updated every 5s)
+  quota.json              per-provider rate-limit headroom
+  cowork.yml              opt-in role contract
+  lanes.json              path-glob leases
+  events.jsonl            append-only diagnostics
+  pause                   touch to halt all agents immediately
 ```
 
-`state.json` is the authoritative source for current status, current agent, handoff head, and audit checklist. Every write is atomic (`mktemp` + `rename(2)`) and CAS-guarded by `goal_id`. No two writers can interleave updates.
+Each `goals/<goal_id>.json` is the authoritative source for that goal's status, current agent, handoff head, and audit checklist. Every write is atomic (`mktemp` + `rename(2)`) and CAS-guarded by `goal_id`. Per-goal RMW serializes on `.goal/locks/<goal_id>.lock` — the **same lockfile path** the MCP server (proper-lockfile), the bash hooks (inline mkdir mutex), and `goalctl` all use, so no two writers across runtimes can interleave updates on the same goal.
 
 `quota.json` tracks provider headroom independently of the user's token budget. The bridge maintains this file; `goalctl quota` shows the current state.
 
 `agents/<agent_id>.json` is a heartbeat file. Each running bridge writes to it every 5 seconds. The statusline reads these files to show which agents are active vs. idle.
+
+The handoff seq is project-wide (one monotonic counter under `handoff/` across all goals); minting the next seq takes the project-coordination lock at `.goal/locks/_coord.lock`.
 
 ---
 
@@ -46,11 +53,11 @@ The bridge (`bin/goal-bridge`) is the runtime daemon for Codex and other non-Cla
 
 One bridge per agent session. The bridge:
 
-- Watches `.goal/state.json` for changes (debounced 500ms).
+- Watches `.goal/goals/` for record changes (debounced 500ms). On each fire, re-resolves which goal it is currently driving by scanning the directory for the record whose `current.agent === AGENT_ID`. The bridge's "goal of interest" can change over time — a peer's relay flow can hand it a new goal mid-life.
 - Writes a heartbeat to `.goal/agents/<id>.json` every 5s.
 - For ndjson runners (Codex): spawns a fresh process each turn, feeds it a continuation prompt, reads the NDJSON event stream.
 - Detects rate-limit (429) and server-error (5xx) patterns in runner output.
-- On fault: writes a handoff envelope and transitions state to `relaying`.
+- On fault: writes a handoff envelope (under the project-coord lock) and transitions the resolved goal record to `relaying` (under that goal's lock).
 - Honors `.goal/pause` — stops within one tick.
 
 Start the bridge with `goalctl`:
@@ -108,7 +115,7 @@ When an agent hits a rate limit:
 
 2. The bridge writes a handoff envelope to `.goal/handoff/NNNN.md` with `reason: rate_limit`. Sequence numbers are zero-padded to 4 digits and monotonic. The file is written atomically.
 
-3. `state.json` is updated atomically: `status: relaying`, `current.agent: <peer>`, `handoff_head: NNNN`.
+3. The goal record (`.goal/goals/<goal_id>.json`) is updated atomically under its per-goal lock: `status: relaying`, `current.agent: <peer>`, `handoff_head: NNNN`.
 
 4. The peer bridge detects the state change (its file watcher fires), reads the handoff envelope, and injects its content into the next continuation prompt.
 
@@ -260,7 +267,7 @@ Users may add profiles for additional agents. The bridge is configured through `
 ## Single-agent behavior
 
 - The `/goal` slash command is unchanged.
-- State still lives at `.goal/state.json` (migrated from `.claude/goal.json` on first run — see migration path in `CHANGELOG.md`).
+- State lives at `.goal/goals/<goal_id>.json`, one record per goal, owned by exactly one session via `.goal/sessions/<session_id>`. Legacy `.goal/state.json` (v2) and `.claude/goal.json` (v1) installs are forward-migrated on first touch by whichever entry point runs first (MCP server, `goalctl`, `goal-bridge`, or `goal-http-server`).
 - The same five lifecycle states work without `cowork.yml`.
 - The statusline shows the normal single-agent labels when `current.agent` is null and `cowork.yml` is absent.
 - No new dependencies are required for solo use.
@@ -296,7 +303,7 @@ With `GOAL_OTEL_ENDPOINT` set, `goal-otel-exporter` ships these as OpenTelemetry
 
 ## Troubleshooting
 
-**Handoff not picked up by peer.** Check `.claude/goal-hook.log` and `.goal/agents/<runner>.log` for `relay-pickup` and `ndjson-loop-start` events from the peer bridge. Verify the peer bridge is running by checking `.goal/agents/<runner>.pid` or restarting it with `goalctl bridge start codex`, and confirm the state file shows `current.agent` equal to the peer's agent_id.
+**Handoff not picked up by peer.** Check `.claude/goal-hook.log` and `.goal/agents/<runner>.log` for `relay-pickup` and `ndjson-loop-start` events from the peer bridge. Verify the peer bridge is running by checking `.goal/agents/<runner>.pid` or restarting it with `goalctl bridge start codex`, and confirm the goal record (`.goal/goals/<goal_id>.json`) shows `current.agent` equal to the peer's agent_id.
 
 **State stuck in `relaying`.** The peer bridge is not running or crashed. Restart it: `goalctl bridge start codex`. If state is inconsistent, run `goalctl status --json` to inspect, then `/goal resume` to force back to `pursuing`.
 

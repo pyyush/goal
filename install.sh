@@ -193,6 +193,6 @@ Try it:
   /goal status
   /goal pause | resume | clear
 
-See README.md for configuration (GOAL_MAX_TICKS, GOAL_AUTOPAUSE_ON_PROMPT,
-etc.) and the threat model.
+See README.md for configuration (GOAL_AUTOPAUSE_ON_PROMPT, GOAL_STRIKE_LIMIT,
+GOAL_RELAY_LIMIT_PER_HOUR, etc.) and the threat model.
 NOTE
