@@ -12,7 +12,7 @@
 // --root    Project root (directory containing .goal/). Defaults to $PWD.
 //
 // Responsibilities (spec §7):
-//   B1. Watch .goal/state.json mtime via fs.watch, debounce 500ms.
+//   B1. Watch .goal/goals/ for per-goal record changes via fs.watch, debounce 500ms.
 //   B2. When status=pursuing AND current.agent === this bridge's agent_id:
 //       - For ndjson runners: spawn-per-turn (spec §18 Q2 resolution — Codex
 //         is MCP-client-only, no push channel; continuation = new spawn).
@@ -28,7 +28,7 @@
 // Relay protocol (spec §8):
 //   1. Fault detected (turn.failed with 429 payload, or 3+ consecutive_429).
 //   2. Bridge acquires .goal/lock, writes handoff envelope to
-//      .goal/handoff/NNNN.md (mktemp + rename), updates state.json atomically:
+//      .goal/handoff/NNNN.md (mktemp + rename), updates the goal record atomically:
 //      status=relaying, current.agent=<peer>, handoff_head=NNNN.
 //   3. Peer bridge detects state change (its B1 watcher fires), reads handoff,
 //      injects content into first post-handoff continuation prompt.
@@ -127,9 +127,27 @@ const RUNNER_FORMAT = runnerConfig.format || 'line';
 const RUNNER_PROVIDER = runnerConfig.provider || 'unknown';
 
 // ---- paths ------------------------------------------------------------------
+//
+// v3 on-disk layout (per RFC):
+//   .goal/goals/<gid>.json     per-goal records (was .goal/state.json)
+//   .goal/sessions/<sid>       pointer files (text: gid)
+//   .goal/locks/<gid>.lock     per-goal mkdir mutex (was .goal/lock)
+//   .goal/locks/_coord.lock    project-coordination lock
+//   .goal/cursors/<gid>        dispatcher progress cursor
+//   .goal/handoff/NNNN.md      handoff envelopes (unchanged)
+//   .goal/agents/<id>.json     heartbeats (unchanged)
+//   .goal/events.jsonl         events (unchanged)
+//   .goal/quota.json           provider quota (unchanged)
+//   .goal/pause                kill switch (unchanged)
+//
+// The bridge resolves "its" goal by scanning goals/ for current.agent === AGENT_ID.
 
 const GOAL_DIR      = join(ROOT, '.goal');
-const STATE_FILE    = join(GOAL_DIR, 'state.json');
+const GOALS_DIR     = join(GOAL_DIR, 'goals');
+const SESSIONS_DIR  = join(GOAL_DIR, 'sessions');
+const LOCKS_DIR     = join(GOAL_DIR, 'locks');
+const CURSORS_DIR   = join(GOAL_DIR, 'cursors');
+const LEGACY_STATE_FILE = join(GOAL_DIR, 'state.json');  // pre-v3 path; auto-migrated
 const AGENTS_DIR    = join(GOAL_DIR, 'agents');
 const HANDOFF_DIR   = join(GOAL_DIR, 'handoff');
 const QUOTA_FILE    = join(GOAL_DIR, 'quota.json');
@@ -138,6 +156,20 @@ const COWORK_FILE    = join(GOAL_DIR, 'cowork.yml');
 const PAUSE_FILE    = join(GOAL_DIR, 'pause');
 const LOG_FILE      = join(ROOT, '.claude', 'goal-hook.log');
 const EVENTS_FILE   = join(GOAL_DIR, 'events.jsonl');
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function ensureV3Dirs() {
+  mkdirSync(GOAL_DIR, { recursive: true });
+  mkdirSync(GOALS_DIR, { recursive: true });
+  mkdirSync(SESSIONS_DIR, { recursive: true });
+  mkdirSync(LOCKS_DIR, { recursive: true });
+  mkdirSync(CURSORS_DIR, { recursive: true });
+}
+
+function goalRecordPath(gid) { return join(GOALS_DIR, `${gid}.json`); }
+function goalLockDir(gid)    { return join(LOCKS_DIR, `${gid}.lock`); }
+const COORD_LOCK_DIR         = join(LOCKS_DIR, '_coord.lock');
 
 // Agent ID: <runner>-<host>-<pid> per spec §5.7
 const AGENT_ID      = `${RUNNER}-${hostname().replace(/[^a-zA-Z0-9-]/g, '-')}-${process.pid}`;
@@ -220,13 +252,67 @@ function appendEvent(event) {
   } catch (_) {}
 }
 
-function readState() {
+// readGoalRecord(gid) — read one v3 goal record. Returns null on miss/parse-fail.
+function readGoalRecord(gid) {
+  if (!gid) return null;
   try {
-    return JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+    return JSON.parse(readFileSync(goalRecordPath(gid), 'utf8'));
   } catch (_) {
     return null;
   }
 }
+
+// resolveMyGoal() — scan .goal/goals/ for the record where current.agent
+// matches this bridge's AGENT_ID. Returns the gid, or null if no goal is
+// assigned to us. v3 replaces the v2 model of "one state.json per project."
+//
+// If multiple goals name AGENT_ID, the bridge picks the most-recently-updated
+// one and logs a warning — cowork is sequential, not parallel, so this
+// shouldn't normally happen.
+function resolveMyGoal() {
+  if (!existsSync(GOALS_DIR)) return null;
+  let entries = [];
+  try { entries = readdirSync(GOALS_DIR).filter(n => n.endsWith('.json') && !n.startsWith('.')); }
+  catch (_) { return null; }
+  const matches = [];
+  for (const name of entries) {
+    const gid = name.slice(0, -5);
+    if (!UUID_RE.test(gid)) continue;
+    const s = readGoalRecord(gid);
+    if (s && s.current && s.current.agent === AGENT_ID) {
+      matches.push({ gid, state: s, updatedAt: Date.parse(s.updated_at || s.created_at || 0) || 0 });
+    }
+  }
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    matches.sort((a, b) => b.updatedAt - a.updatedAt);
+    bridgeLog('multi-match', `${matches.length} goals name ${AGENT_ID}; driving most recent (${matches[0].gid})`);
+  }
+  return matches[0].gid;
+}
+
+// readState() — back-compat shorthand: read the goal record this bridge is
+// currently driving. Returns null if nothing resolves. Most callers use this
+// in read-only context where they don't care which gid they got. Writers must
+// use atomicUpdateGoalRecord with an explicit gid.
+function readState() {
+  // Fast path: the bridge tracks its currently-driven gid as session state.
+  if (currentGid) {
+    const s = readGoalRecord(currentGid);
+    if (s) return s;
+  }
+  // Resolve anew (e.g. on first call or after a goal switch).
+  const gid = resolveMyGoal();
+  if (gid) {
+    currentGid = gid;
+    return readGoalRecord(gid);
+  }
+  return null;
+}
+
+// State tracked across the bridge process lifetime. currentGid is the goal
+// this bridge is actively driving right now — re-resolved on state change.
+let currentGid = null;
 
 function readQuota() {
   try {
@@ -236,38 +322,38 @@ function readQuota() {
   }
 }
 
-// ---- mkdir-based lock (shared with hooks/goal-lock.sh + MCP server) --------
+// ---- mkdir-based locks (per-goal + project-coord) --------------------------
 //
-// The mutex is the directory at .goal/lock. mkdir is atomic on POSIX, so the
-// first writer to mkdir wins. proper-lockfile (used by mcp/goal-server.ts via
-// `lockfile.lock(.goal, { lockfilePath: .goal/lock })`) creates the same dir
-// internally, so the bridge's raw mkdirSync interoperates correctly. The bash
-// hooks (hooks/goal-lock.sh) also `mkdir .goal/lock` directly. All three
-// converge on the same lockdir per spec §13.
+// v3 lock model:
+//   * Per-goal RMW       .goal/locks/<gid>.lock     — bridge writes goal record
+//   * Project coordination .goal/locks/_coord.lock  — handoff seq, lanes, etc.
 //
-// The bridge holds this lock only for the brief handoff write + state.json
-// transition window; it never holds it across runner spawns or NDJSON reads.
+// Both share the same mkdir-mutex semantics with the MCP server (proper-lockfile
+// targeting the same path) and the bash hooks (hooks/goal-lock.sh, also raw
+// mkdir). All three converge per spec §13 / RFC v3 §3.5.
+//
+// The bridge holds these locks only for brief RMW windows; never across runner
+// spawns or NDJSON reads.
 
-const BRIDGE_LOCK_DIR = join(GOAL_DIR, 'lock');
 const BRIDGE_LOCK_TIMEOUT = 5000;
 
-function acquireBridgeLock() {
+function _acquireLockDir(lockDir) {
   const deadline = Date.now() + BRIDGE_LOCK_TIMEOUT;
   let delay = 50;
   while (Date.now() < deadline) {
     try {
-      mkdirSync(BRIDGE_LOCK_DIR, { recursive: false });
+      mkdirSync(dirname(lockDir), { recursive: true });
+      mkdirSync(lockDir, { recursive: false });
       return true;
     } catch (e) {
       if (e.code !== 'EEXIST') return false;
       // Check for stale lock (> 30s old).
       try {
-        const s = statSync(BRIDGE_LOCK_DIR);
+        const s = statSync(lockDir);
         if (Date.now() - s.mtimeMs > 30_000) {
-          try { rmdirSync(BRIDGE_LOCK_DIR); } catch (_) {}
+          try { rmdirSync(lockDir); } catch (_) {}
         }
       } catch (_) {}
-      // Spin with backoff up to 200ms.
       const sleep = Math.min(delay, 200);
       const start = Date.now();
       while (Date.now() - start < sleep) { /* busy spin — short */ }
@@ -276,10 +362,36 @@ function acquireBridgeLock() {
   }
   return false;
 }
-
-function releaseBridgeLock() {
-  try { rmdirSync(BRIDGE_LOCK_DIR); } catch (_) {}
+function _releaseLockDir(lockDir) {
+  try { rmdirSync(lockDir); } catch (_) {}
 }
+
+// Per-goal RMW lock — coordinates with the MCP server and bash Stop/prompt/
+// notify hooks on .goal/locks/<gid>.lock. Caller passes the gid; without one,
+// resolves to the currently-driven goal.
+function acquireGoalLock(gid = currentGid) {
+  if (!gid) return false;
+  return _acquireLockDir(goalLockDir(gid));
+}
+function releaseGoalLock(gid = currentGid) {
+  if (!gid) return;
+  _releaseLockDir(goalLockDir(gid));
+}
+
+// Project-coordination lock — for cross-goal shared state (handoff seq,
+// lanes.json, etc.) The relay path (handoff seq mint + state transition)
+// takes this; per-goal record writes inside it use acquireGoalLock too.
+function acquireCoordLock() { return _acquireLockDir(COORD_LOCK_DIR); }
+function releaseCoordLock() { _releaseLockDir(COORD_LOCK_DIR); }
+
+// Back-compat aliases: pre-v3 code used acquireBridgeLock()/releaseBridgeLock()
+// for both per-goal record writes AND project-coord operations. We keep those
+// names for the old call sites and route them to the right lock by context:
+// when a relay flow is in progress (writing a handoff envelope), use the
+// project-coord lock — handoff seq is project-wide. Per-goal record RMW that
+// happens INSIDE relay still takes the goal lock too.
+function acquireBridgeLock() { return acquireCoordLock(); }
+function releaseBridgeLock() { releaseCoordLock(); }
 
 // ---- B3: heartbeat write ----------------------------------------------------
 
@@ -609,10 +721,10 @@ function writeHandoffEnvelope({ seq, from, to, reason, goalId, state }) {
     `- Agent ${from} was pursuing goal: ${objective.slice(0, 200)}`,
     `- Stopped due to: ${reason}`,
   ].join('\n');
-  const didNotBullets   = '- (see open audit items in state.json)';
+  const didNotBullets   = `- (see open audit items in .goal/goals/${goalId}.json)`;
   const nextBullets     = `- Continue pursuing: ${objective.slice(0, 200)}`;
-  const doNotRedoBullets = '- (check lineage in state.json for work already completed)';
-  const openAuditBullets = '- See state.json .audit.checklist';
+  const doNotRedoBullets = `- (check lineage in .goal/goals/${goalId}.json for work already completed)`;
+  const openAuditBullets = `- See .goal/goals/${goalId}.json .audit.checklist`;
   const evidenceBullets  = `- Handoff triggered by: ${reason} from ${from}`;
 
   let content;
@@ -690,27 +802,49 @@ function writeHandoffEnvelope({ seq, from, to, reason, goalId, state }) {
 
 // ---- state transition helpers -----------------------------------------------
 
-function atomicUpdateState(updateFn) {
-  // Read-modify-write with CAS on goal_id.
-  const state = readState();
-  if (!state) return null;
-  const goalId = state.goal_id;
-  const updated = updateFn(state);
-  if (!updated) return null;
-  updated.updated_at = now();
-  // CAS: re-read to verify goal_id hasn't changed.
-  const fresh = readState();
-  if (!fresh || fresh.goal_id !== goalId) {
-    bridgeLog('cas-mismatch', `goal_id changed: expected ${goalId}`);
+// atomicUpdateGoalRecord(gid, updateFn) — read-modify-write with CAS on
+// goal_id, scoped to a specific v3 goal record. Acquires the per-goal lock
+// internally so callers don't have to coordinate with the MCP server / bash
+// hooks separately — the v3 lock model says one writer at a time on
+// .goal/locks/<gid>.lock, and this is the only path the bridge mutates a goal
+// record through.
+//
+// Returns the new state or null on lock timeout / CAS-mismatch / write fail.
+function atomicUpdateGoalRecord(gid, updateFn) {
+  if (!gid) return null;
+  if (!acquireGoalLock(gid)) {
+    bridgeLog('goal-lock-timeout', gid);
     return null;
   }
   try {
-    atomicWrite(STATE_FILE, JSON.stringify(updated, null, 2) + '\n');
-    return updated;
-  } catch (e) {
-    bridgeLog('state-write-failed', e.message);
-    return null;
+    const state = readGoalRecord(gid);
+    if (!state) return null;
+    const expectedGid = state.goal_id;
+    const updated = updateFn(state);
+    if (!updated) return null;
+    updated.updated_at = now();
+    const fresh = readGoalRecord(gid);
+    if (!fresh || fresh.goal_id !== expectedGid) {
+      bridgeLog('cas-mismatch', `goal_id changed for ${gid}: expected ${expectedGid}`);
+      return null;
+    }
+    try {
+      atomicWrite(goalRecordPath(gid), JSON.stringify(updated, null, 2) + '\n');
+      return updated;
+    } catch (e) {
+      bridgeLog('state-write-failed', `${gid}: ${e.message}`);
+      return null;
+    }
+  } finally {
+    releaseGoalLock(gid);
   }
+}
+
+// atomicUpdateState(updateFn) — back-compat shorthand for writers that update
+// the goal this bridge is currently driving. Equivalent to
+// atomicUpdateGoalRecord(currentGid, updateFn).
+function atomicUpdateState(updateFn) {
+  return atomicUpdateGoalRecord(currentGid, updateFn);
 }
 
 // ---- relay initiation -------------------------------------------------------
@@ -1104,7 +1238,7 @@ async function runNdjsonTurn(continuationPrompt) {
           lastEventWasCompleted = true;
           const outputTokens = event.usage?.output_tokens || 0;
           if (outputTokens > 0) {
-            // Accumulate tokens into state.json (CAS-guarded).
+            // Accumulate tokens into the goal record (CAS-guarded).
             if (acquireBridgeLock()) {
               try {
                 atomicUpdateState(s => ({
@@ -1354,18 +1488,25 @@ function completeLineRelayPickup(state) {
   }
 }
 
-// ---- B1: watch .goal/ for state.json changes --------------------------------
+// ---- B1: watch .goal/goals/ for per-goal record changes ---------------------
 
 let debounceTimer = null;
 
 function onStateChange() {
   if (exiting) return;
-  const state = readState();
+  // Re-resolve which goal is "ours" right now — current.agent assignment can
+  // shift across goals/ records via the relay protocol or a /goal adopt.
+  const newGid = resolveMyGoal();
+  if (newGid !== currentGid) {
+    bridgeLog('goal-switch', `${currentGid || '(none)'} → ${newGid || '(none)'}`);
+    currentGid = newGid;
+  }
+  const state = currentGid ? readGoalRecord(currentGid) : null;
   if (!state) {
-    bridgeLog('state-read-failed', 'state.json missing or unparseable on change');
+    bridgeLog('state-read-failed', `no goal record assigned to ${AGENT_ID}`);
     return;
   }
-  bridgeLog('state-changed', `status=${state.status} agent=${state.current?.agent}`);
+  bridgeLog('state-changed', `gid=${currentGid} status=${state.status} agent=${state.current?.agent}`);
 
   if (RUNNER_FORMAT === 'ndjson') {
     // For ndjson runners: when state switches to pursuing with us as agent,
@@ -1411,26 +1552,28 @@ function scheduleStateCheck() {
 
 let watcherInstance = null;
 let pollerInstance = null;
-let lastStateMtimeMs = 0;
+let lastGoalsDirMtimeMs = 0;
 
-function pollStateFile() {
+function pollGoalsDir() {
   if (exiting) return;
   try {
-    const mtimeMs = statSync(STATE_FILE).mtimeMs;
-    if (mtimeMs !== lastStateMtimeMs) {
-      lastStateMtimeMs = mtimeMs;
+    // Watch the goals/ directory mtime — it changes on any record add / rename /
+    // atomic-write replace. Cheap probe; falls back to per-poll resolve.
+    const mtimeMs = statSync(GOALS_DIR).mtimeMs;
+    if (mtimeMs !== lastGoalsDirMtimeMs) {
+      lastGoalsDirMtimeMs = mtimeMs;
       scheduleStateCheck();
     }
   } catch (_) {
-    // State may not exist yet; bridge startup is allowed before goal create.
+    // .goal/goals/ may not exist yet; bridge startup is allowed pre-create.
   }
 }
 
 function startPollingFallback() {
   if (pollerInstance) return;
-  pollStateFile();
-  pollerInstance = setInterval(pollStateFile, 500);
-  bridgeLog('watcher-polling-started', STATE_FILE);
+  pollGoalsDir();
+  pollerInstance = setInterval(pollGoalsDir, 500);
+  bridgeLog('watcher-polling-started', GOALS_DIR);
 }
 
 function startWatcher() {
@@ -1440,9 +1583,13 @@ function startWatcher() {
     setTimeout(startWatcher, 2000);
     return;
   }
+  // Ensure goals/ exists so fs.watch can attach to it on first start.
+  try { mkdirSync(GOALS_DIR, { recursive: true }); } catch (_) {}
   try {
-    watcherInstance = watch(GOAL_DIR, { persistent: true }, (eventType, filename) => {
-      if (filename === 'state.json') {
+    // v3: watch .goal/goals/ for any per-goal record change. Bridge resolves
+    // which gid to act on via resolveMyGoal() (current.agent === AGENT_ID).
+    watcherInstance = watch(GOALS_DIR, { persistent: true }, (eventType, filename) => {
+      if (filename && filename.endsWith('.json') && !filename.startsWith('.')) {
         scheduleStateCheck();
       }
     });
@@ -1452,7 +1599,7 @@ function startWatcher() {
       watcherInstance = null;
       startPollingFallback();
     });
-    bridgeLog('watcher-started', GOAL_DIR);
+    bridgeLog('watcher-started', GOALS_DIR);
     startPollingFallback();
   } catch (e) {
     bridgeLog('watcher-start-failed', e.message);
@@ -1582,6 +1729,49 @@ process.on('SIGINT',  () => { bridgeLog('signal', 'SIGINT');  exitCleanly('stopp
 
 mkdirSync(AGENTS_DIR, { recursive: true });
 mkdirSync(join(ROOT, '.claude'), { recursive: true });
+ensureV3Dirs();
+
+// v2 → v3 forward migration: if a legacy .goal/state.json exists and no v3
+// record corresponds to its gid, atomic-rename it into place. Matches the
+// MCP server's migrateV2ToV3 byte-for-byte (RFC §5: migrated record stays
+// unowned; the next /goal create or /goal adopt binds a session). Honors
+// GOAL_DISABLE_MIGRATION=1.
+function migrateV2ToV3() {
+  if (process.env.GOAL_DISABLE_MIGRATION === '1') return;
+  if (!existsSync(LEGACY_STATE_FILE)) return;
+  let raw;
+  try { raw = JSON.parse(readFileSync(LEGACY_STATE_FILE, 'utf8')); }
+  catch (e) { bridgeLog('migration-v2-parse-failed', e.message); return; }
+  const gid = raw && typeof raw.goal_id === 'string' ? raw.goal_id : '';
+  if (!UUID_RE.test(gid)) {
+    bridgeLog('migration-v2-bad-gid', `goal_id=${gid}`);
+    return;
+  }
+  if (!acquireCoordLock()) {
+    bridgeLog('migration-v2-lock-failed', 'could not acquire coord lock; skipping');
+    return;
+  }
+  try {
+    if (!existsSync(LEGACY_STATE_FILE)) return;
+    const target = goalRecordPath(gid);
+    if (existsSync(target)) {
+      // Another writer (MCP / goalctl) already migrated; drop the legacy file.
+      try { unlinkSync(LEGACY_STATE_FILE); } catch (_) {}
+      bridgeLog('migration-v2-v3-skipped', `target exists: ${target}`);
+      return;
+    }
+    try { renameSync(LEGACY_STATE_FILE, target); }
+    catch (e) { bridgeLog('migration-v2-rename-failed', e.message); return; }
+    appendEvent({
+      ts: now(), type: 'goal.migrated', goal_id: gid,
+      note: 'v2 state.json → v3 goals/<gid>.json (unowned; bind via /goal adopt)',
+    });
+    bridgeLog('migration-v2-v3-done', gid);
+  } finally {
+    releaseCoordLock();
+  }
+}
+migrateV2ToV3();
 
 bridgeLog('start', `runner=${RUNNER} format=${RUNNER_FORMAT} agent_id=${AGENT_ID}`);
 
@@ -1601,14 +1791,14 @@ heartbeatInterval = setInterval(() => { if (!exiting) writeHeartbeat(); }, 5000)
 startWatcher();
 
 // B4: for line runners, spawn the runner child. For ndjson, the loop starts
-// when state.json shows us as current.agent.
+// when a goal record shows us as current.agent.
 if (RUNNER_FORMAT === 'line') {
   spawnLineRunner();
 } else {
-  // Check state immediately — we may already be the current agent.
-  const initState = readState();
-  if (initState && (initState.status === 'pursuing' || initState.status === 'relaying') &&
-      initState.current?.agent === AGENT_ID) {
+  // v3: resolve the goal that names us as current.agent and check its state.
+  currentGid = resolveMyGoal();
+  const initState = currentGid ? readGoalRecord(currentGid) : null;
+  if (initState && (initState.status === 'pursuing' || initState.status === 'relaying')) {
     if (initState.status === 'relaying' && initState.handoff_head) {
       try {
         const hp = join(HANDOFF_DIR, `${initState.handoff_head}.md`);
