@@ -1,5 +1,93 @@
 # Changelog
 
+## v0.2.3 — cowork relay + HTTP shim join v3
+
+The last two v2 holdouts — `bin/goal-bridge` (the cowork relay daemon) and
+`bin/goal-http-server.ts` (the loopback HTTP shim) — are now on the v3
+session-scoped layout. Multi-agent flows (Claude Code ↔ Codex) and IDE
+plugins / external dashboards reading goal state over HTTP all drive the
+same per-goal records, per-goal locks, and session pointers the MCP /
+hooks / goalctl already do.
+
+### `bin/goal-bridge`
+- **v3 layout**: reads per-goal records at `.goal/goals/<gid>.json`, takes
+  per-goal locks at `.goal/locks/<gid>.lock` for record RMW, and the
+  project-coordination lock at `.goal/locks/_coord.lock` for handoff seq
+  mint / relay-state transitions. Same paths the MCP and bash hooks use —
+  three runtimes serialize against each other correctly.
+- **Goal resolution by agent_id**: the bridge tracks its currently-driven
+  gid as session state and re-resolves on every state change. Scans
+  `.goal/goals/` for a record whose `current.agent === AGENT_ID` (matches
+  v2 semantics; v3 just looks in many records instead of one). Logs a
+  `multi-match` warning + picks the most-recently-updated record if more
+  than one names the agent (cowork is sequential by design; this
+  shouldn't normally happen).
+- **Watcher** now targets `.goal/goals/` directory instead of the single
+  `state.json` file. fs.watch debouncing + 500ms polling fallback
+  unchanged. Same trick the MCP server uses for the channel push manager.
+- **v2 → v3 forward migration** at bridge startup: atomic-renames
+  `.goal/state.json` → `.goal/goals/<gid>.json`, emits `goal.migrated` to
+  events.jsonl, leaves the record unowned (RFC §5). Coordinated with the
+  MCP / goalctl migrators via the project-coord lock so concurrent
+  startups don't race.
+- **Handoff envelope writer** stamps the gid in the frontmatter
+  (`goal_id:` line) from `state.goal_id`; the fallback bullets now point
+  at `.goal/goals/<gid>.json` instead of `state.json`.
+
+### `bin/goal-http-server.ts`
+- **Per-goal resolution per request**: the goal a request operates on is
+  picked via a 3-tier lookup that mirrors the MCP server's
+  `resolveGoalForSession`:
+  1. `?goal=<gid>` query param
+  2. `X-Claude-Session-Id` (or `X-Goal-Session-Id`) header → session pointer
+  3. Single non-terminal goal in the project (single-active)
+  Ambiguity (two active goals, no flag/header) returns `409 goal_ambiguous`.
+- **`POST /goal`** with `X-Claude-Session-Id` writes both the record AND
+  the session pointer. Without a session header, falls back to refusing
+  if any active goal already exists (so a non-session caller can't create
+  a duplicate it'd never resolve).
+- **`PATCH /goal`** + **`GET /goal`** resolve via the 3-tier lookup.
+  `PATCH .../clear` removes the record, the matching session pointers,
+  and the per-goal lock dir.
+- **New `GET /goals`** — list all goals in the project (returns
+  `{goals: [{goal_id, status, objective, updated_at}, ...]}`). Counterpart
+  of `goalctl list`.
+- **Locks**: `PATCH` takes the per-goal lock at `.goal/locks/<gid>.lock`;
+  `POST /goal` takes the project-coord lock at `.goal/locks/_coord.lock`.
+  Both via proper-lockfile on the same paths the MCP server uses.
+- **v1 → v2 → v3 forward migration** at server boot (idempotent, matches
+  the MCP / goalctl byte-for-byte).
+
+### Live-verified
+- HTTP server end-to-end: GET/POST/PATCH `/goal` and `GET /goals` against
+  v3 records, session-pointer resolution, duplicate detection (409),
+  pause/resume/clear, 404 post-clear. All routes return the expected
+  status codes.
+- Bridge startup: agent_id derivation correct, watcher attaches to
+  `.goal/goals/`, polling fallback installs, heartbeat written, "no goal
+  assigned to me" path logs cleanly.
+- Existing v3 test suites (`mcp/test/{smoke,v3-handshake,channel-smoke}.mjs`,
+  `scripts/smoke-concurrency.sh`) — all still pass after these changes.
+
+### Notes
+- The bridge's existing event surface (`goal.relayed`,
+  `goal.relay.guardrail_tripped`, `goal.queued`,
+  `goal.handoff.peer_picked_up`, `goal.relay.recovery_seconds`,
+  `goal.relay.resumed_from_queue`) is preserved verbatim. v3 only changes
+  on-disk locations, not the event schema.
+- The HTTP server's existing event surface (`goal.created`, `goal.paused`,
+  `goal.resumed`, `goal.budget_changed`, `goal.cleared`,
+  `goal.needs_input`) is preserved; `goal.created` now also includes
+  `owner_session_id` when a session header was sent.
+- **All known v2 → v3 migration paths in the repo are now wired.** The
+  five entry points that touch goal state — MCP, hooks (Stop/prompt/notify),
+  slash command, `goalctl`, `goal-bridge`, `goal-http-server.ts` — read
+  and write the same `.goal/goals/<gid>.json` records under the same
+  per-goal locks. A v2 `.goal/state.json` left by an earlier install is
+  forward-migrated on first touch by whichever entry point runs first.
+
+---
+
 ## v0.2.2 — goalctl, goal-lock, and the concurrency smoke join v3
 
 The previous release left three holdouts on the v2 on-disk shape: `bin/goalctl`,
