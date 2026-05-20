@@ -16,6 +16,10 @@
   goal binds to `.goal/sessions/<sid>` and appears in the statusline immediately.
 
 ### Tests
+- Cowork bridge tests now write v3 `.goal/goals/<goal_id>.json` fixtures
+  directly, including atomic rename writes so the polling fallback sees changes.
+- Verified the supported Claude Code ↔ Codex cowork path with the local relay
+  suite and the account-backed live E2E.
 - Added `scripts/test-goal-md-preamble.sh` to execute the embedded slash-command
   preambles under zsh.
 - Added `hooks/test-stop-quiet.sh` to cover accounting-only mode and compact
@@ -23,6 +27,11 @@
 - Extended `mcp/test/v3-handshake.mjs` to verify explicit `session_id`
   creation still resolves and renders in the statusline when the MCP server env
   has no session id.
+
+### Docs
+- Pruned stale v3 planning notes, profile cards, and mockup artifacts from the
+  public docs set; the README now points only at the maintained protocol,
+  schema, MCP, and generated asset docs.
 
 ## v0.2.3 — cowork relay + HTTP shim join v3
 
@@ -285,7 +294,6 @@ Verified against Claude Code 2.1.143 and the open-source Codex implementation.
 ### UX
 - New cockpit status line: state-driven glyph + colour, evidence meter, live
   timer. Renders only for the owning session; terminal states do not stick.
-  Interactive mockup: `docs/goal-statusline-cockpit.html`.
 
 ### Added earlier in this line
 - `goalframe` skill — structures a raw objective into a verifiable spec.

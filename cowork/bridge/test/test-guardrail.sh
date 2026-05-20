@@ -40,8 +40,8 @@ fail() {
     if [ -n "${TMP:-}" ]; then
         printf '\n--- bridge-a log (last 40 lines) ---\n'
         tail -40 "$TMP/.claude/goal-hook.log" 2>/dev/null || true
-        printf '\n--- state.json ---\n'
-        cat "$TMP/.goal/state.json" 2>/dev/null || echo "(not found)"
+        printf '\n--- goal record ---\n'
+        cat "${STATE_FILE:-}" 2>/dev/null || echo "(not found)"
         printf '\n--- relay-log.jsonl ---\n'
         cat "$TMP/.goal/relay-log.jsonl" 2>/dev/null || echo "(not found)"
     fi
@@ -60,10 +60,11 @@ say "node $(node --version) · jq $(jq --version) ✓"
 # ---- temp workspace ---------------------------------------------------------
 
 TMP=$(mktemp -d -t goal-guardrail-test-XXXXXX)
-mkdir -p "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
+mkdir -p "$TMP/.goal/goals" "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
 
 NOW=$(date -u +%FT%TZ)
 GOAL_UUID="cccccccc-dddd-eeee-ffff-000000000000"
+STATE_FILE="$TMP/.goal/goals/$GOAL_UUID.json"
 
 # ---- patterns.json with single ndjson runner --------------------------------
 
@@ -124,11 +125,11 @@ done
 [ -n "$AGENT_A" ] || fail "bridge-a heartbeat not found within 5s"
 say "agent-a id: $AGENT_A ✓"
 
-# ---- write initial state.json -----------------------------------------------
+# ---- write initial goal record ----------------------------------------------
 
-step "4. Write state.json — current.agent = agent-a, status = pursuing"
+step "4. Write v3 goal record — current.agent = agent-a, status = pursuing"
 
-cat > "$TMP/.goal/state.json" <<EOF
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
   "goal_id": "$GOAL_UUID",
@@ -152,7 +153,8 @@ cat > "$TMP/.goal/state.json" <<EOF
   "history": []
 }
 EOF
-say "state.json written: status=pursuing, current.agent=$AGENT_A ✓"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+say "goal record written: status=pursuing, current.agent=$AGENT_A ✓"
 
 # ---- wait for state.status = paused (guardrail trips on 4th relay attempt) -
 
@@ -161,20 +163,20 @@ step "5. Wait for state.status = paused (guardrail trips within 10s)"
 FOUND_PAUSED=0
 for i in $(seq 1 100); do
     sleep 0.1
-    STATUS=$(jq -r '.status // ""' "$TMP/.goal/state.json" 2>/dev/null) || continue
+    STATUS=$(jq -r '.status // ""' "$STATE_FILE" 2>/dev/null) || continue
     if [ "$STATUS" = "paused" ]; then
         FOUND_PAUSED=1
         break
     fi
 done
 [ "$FOUND_PAUSED" -eq 1 ] || {
-    FINAL=$(jq -r '.status' "$TMP/.goal/state.json" 2>/dev/null || echo "unknown")
+    FINAL=$(jq -r '.status' "$STATE_FILE" 2>/dev/null || echo "unknown")
     fail "state.status never became paused within 10s (final: $FINAL) — guardrail may not have tripped"
 }
 say "state.status = paused ✓ (guardrail tripped)"
 
 # Verify it was the guardrail, not something else.
-HISTORY_NOTE=$(jq -r '.history[-1].note // ""' "$TMP/.goal/state.json" 2>/dev/null)
+HISTORY_NOTE=$(jq -r '.history[-1].note // ""' "$STATE_FILE" 2>/dev/null)
 echo "$HISTORY_NOTE" | grep -qi "relay guardrail" || \
     fail "last history note doesn't mention relay guardrail (got: $HISTORY_NOTE)"
 say "history note confirms relay guardrail: $HISTORY_NOTE ✓"
@@ -213,7 +215,7 @@ step "8. Confirm paused state stays paused (no auto-resume)"
 
 for i in $(seq 1 30); do
     sleep 0.1
-    STATUS=$(jq -r '.status // ""' "$TMP/.goal/state.json" 2>/dev/null) || continue
+    STATUS=$(jq -r '.status // ""' "$STATE_FILE" 2>/dev/null) || continue
     if [ "$STATUS" != "paused" ]; then
         fail "paused goal auto-resumed to $STATUS — spec §6 violated"
     fi

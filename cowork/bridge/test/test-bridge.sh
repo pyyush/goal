@@ -7,7 +7,7 @@
 # Tests:
 #   1. Bridge starts and writes heartbeat within 5s (§5.7 shape).
 #   2. Heartbeat mtime updates over the next 5s (B3 alive).
-#   3. state.json touch → .continue line appears within 2s (B1+B2, 1s p95 on
+#   3. goal record touch → .continue line appears within 2s (B1+B2, 1s p95 on
 #      macOS fs.watch; extra 1s margin for macOS coalescing latency).
 #   4. 429 stderr line → .fault file appears with kind=rate_limit (B4).
 #   5. .goal/pause touch → bridge exits 0 within 3s (B5).
@@ -78,14 +78,16 @@ cleanup() {
 }
 
 # Create .goal/ structure.
-mkdir -p "$TMP/.goal/agents" "$TMP/.claude"
+mkdir -p "$TMP/.goal/goals" "$TMP/.goal/agents" "$TMP/.claude"
 
-# Write a minimal state.json (pursuing, current.agent = null initially).
+# Write a minimal v3 goal record (pursuing, current.agent = null initially).
 NOW=$(date -u +%FT%TZ)
-cat > "$TMP/.goal/state.json" <<EOF
+GOAL_UUID="11111111-2222-3333-4444-555555555555"
+STATE_FILE="$TMP/.goal/goals/$GOAL_UUID.json"
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
-  "goal_id": "test-goal-id-bridge",
+  "goal_id": "$GOAL_UUID",
   "objective": "bridge integration test",
   "status": "pursuing",
   "created_at": "$NOW",
@@ -100,6 +102,7 @@ cat > "$TMP/.goal/state.json" <<EOF
   "queued_until": null
 }
 EOF
+mv "$STATE_FILE.tmp" "$STATE_FILE"
 
 # Custom patterns config that uses the mock runner.
 PATTERNS_JSON="$TMP/patterns.json"
@@ -176,18 +179,18 @@ done
 [ "$MTIME2" != "$MTIME1" ] || fail "heartbeat mtime did not update within 8s (B3 interval)"
 say "mtime updated: $MTIME1 → $MTIME2 ✓"
 
-# ---- step 3: state.json touch → .continue line within 2s (B1+B2) -----------
+# ---- step 3: goal record touch → .continue line within 2s (B1+B2) ----------
 
-step "3. Touch state.json with matching agent → .continue line within 2s"
+step "3. Touch v3 goal record with matching agent → .continue line within 2s"
 
 CONTINUE_FILE="$TMP/.goal/agents/${AGENT_ID}.continue"
 
-# Update state.json so current.agent matches this bridge's agent_id.
+# Update the goal record so current.agent matches this bridge's agent_id.
 NOW2=$(date -u +%FT%TZ)
-cat > "$TMP/.goal/state.json" <<EOF
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
-  "goal_id": "test-goal-id-bridge",
+  "goal_id": "$GOAL_UUID",
   "objective": "bridge integration test",
   "status": "pursuing",
   "created_at": "$NOW",
@@ -202,7 +205,8 @@ cat > "$TMP/.goal/state.json" <<EOF
   "queued_until": null
 }
 EOF
-say "state.json updated: current.agent=$AGENT_ID"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+say "goal record updated: current.agent=$AGENT_ID"
 
 # Wait up to 2s for .continue to appear.
 FOUND_CONTINUE=0
@@ -214,7 +218,7 @@ for i in $(seq 1 20); do
     fi
 done
 
-[ "$FOUND_CONTINUE" -eq 1 ] || fail ".continue file not created within 2s after state.json change"
+[ "$FOUND_CONTINUE" -eq 1 ] || fail ".continue file not created within 2s after goal record change"
 CONTINUE_LINE=$(tail -1 "$CONTINUE_FILE")
 printf '%s' "$CONTINUE_LINE" | jq empty || fail ".continue line is not valid JSON"
 CONTINUE_TRIGGER=$(printf '%s' "$CONTINUE_LINE" | jq -r '.trigger // ""')
@@ -304,7 +308,7 @@ step "6. Audit item a5 evidence summary"
 say "✓ builds: pure Node 18 ESM, no deps, no build step required"
 say "✓ runs: bridge started PID=$BRIDGE_PID (since exited)"
 say "✓ writes heartbeat: §5.7 shape verified (agent_id, runner, pid, started_at, heartbeat_at)"
-say "✓ detects state changes: .continue appeared within 2s of state.json write"
+say "✓ detects state changes: .continue appeared within 2s of goal record write"
 say "  (macOS fs.watch + 500ms debounce; p95 within 1s on warm FS; 2s test window)"
 say "✓ fault detection: .fault appeared with kind=rate_limit on 429 stderr"
 say "✓ pause kill switch: exited 0 within 3s of .goal/pause"

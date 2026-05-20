@@ -5,7 +5,7 @@
 # session owns. Composed by a host statusLine script (see settings.json.example)
 # alongside model/context/cost segments.
 #
-# Design (see docs/goal-statusline-cockpit.html):
+# Design:
 #   * Session-OWNED — resolves via goal_resolve_owned, so a fresh shell in a
 #     directory with old goals renders NOTHING. Structural fix for the bug
 #     where every session inherited a stale "Goal achieved".

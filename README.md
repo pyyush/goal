@@ -119,7 +119,7 @@ The result is a goal system that treats "done" as an evidence-backed state, not 
 
 ![Cowork relay diagram](docs/assets/diagrams/cowork-relay.png)
 
-Cowork is opt-in. Add `.goal/cowork.yml`, start a peer bridge, and Claude Code and Codex can continue the same objective through handoff envelopes.
+Cowork is opt-in. Add `.goal/cowork.yml`, start a peer bridge, and Claude Code and Codex can continue the same objective through handoff envelopes. The supported Claude Code ↔ Codex path is verified by local relay tests and the account-backed live E2E.
 
 ```bash
 goalctl cowork init
@@ -172,8 +172,7 @@ The MCP server exposes model-side tools for goal creation, state reads, completi
 
 - [Cowork protocol](docs/cowork.md)
 - [MCP server](mcp/README.md)
-- [Statusline cockpit mockup](docs/goal-statusline-cockpit.html)
-- [V3 design notes](docs/GOAL-V3-RFC.md)
+- [Goal record schema](docs/schema/state.v2.json)
 - [Generated README assets](docs/assets/README.md)
 
 ## License

@@ -77,13 +77,15 @@ cleanup() {
     rm -rf "$TMP"
 }
 
-mkdir -p "$TMP/.goal/agents" "$TMP/.claude"
+mkdir -p "$TMP/.goal/goals" "$TMP/.goal/agents" "$TMP/.claude"
 
 NOW=$(date -u +%FT%TZ)
-cat > "$TMP/.goal/state.json" <<EOF
+GOAL_UUID="11111111-2222-3333-4444-666666666666"
+STATE_FILE="$TMP/.goal/goals/$GOAL_UUID.json"
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
-  "goal_id": "test-goal-killswitch",
+  "goal_id": "$GOAL_UUID",
   "objective": "kill switch T9 test",
   "status": "pursuing",
   "created_at": "$NOW",
@@ -98,6 +100,7 @@ cat > "$TMP/.goal/state.json" <<EOF
   "queued_until": null
 }
 EOF
+mv "$STATE_FILE.tmp" "$STATE_FILE"
 
 # Custom patterns config with two runner keys (a=mock-a, b=mock-b).
 # Both map to the same mock runner binary so we can run two bridges in the
@@ -258,13 +261,15 @@ cleanup2() {
     rm -rf "${TMP2:-}" "${TMP:-}"
 }
 
-mkdir -p "$TMP2/.goal/agents" "$TMP2/.claude"
+mkdir -p "$TMP2/.goal/goals" "$TMP2/.goal/agents" "$TMP2/.claude"
 
 NOW2=$(date -u +%FT%TZ)
-cat > "$TMP2/.goal/state.json" <<EOF
+GOAL_UUID2="11111111-2222-3333-4444-777777777777"
+STATE_FILE2="$TMP2/.goal/goals/$GOAL_UUID2.json"
+cat > "$STATE_FILE2.tmp" <<EOF
 {
   "schema_version": 2,
-  "goal_id": "test-solo-pause",
+  "goal_id": "$GOAL_UUID2",
   "objective": "solo pause test",
   "status": "pursuing",
   "created_at": "$NOW2",
@@ -279,6 +284,7 @@ cat > "$TMP2/.goal/state.json" <<EOF
   "queued_until": null
 }
 EOF
+mv "$STATE_FILE2.tmp" "$STATE_FILE2"
 
 MOCK_EXIT_AFTER=60 MOCK_429_AFTER=0 \
   GOAL_BRIDGE_PATTERNS="$PATTERNS_JSON" \

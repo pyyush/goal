@@ -15,7 +15,7 @@ step() { printf '\n[%s] %s\n' "$(date -u +%H:%M:%S)" "$1"; }
 fail() {
   red "FAIL [bidirectional-e2e]: $*"
   [ -n "${TMP:-}" ] && {
-    printf '\n--- state ---\n'; cat "$TMP/.goal/state.json" 2>/dev/null || true
+    printf '\n--- goal record ---\n'; cat "${STATE_FILE:-}" 2>/dev/null || true
     printf '\n--- from log ---\n'; tail -50 "$TMP/from.log" 2>/dev/null || true
     printf '\n--- to log ---\n'; tail -50 "$TMP/to.log" 2>/dev/null || true
   }
@@ -77,7 +77,9 @@ write_state() {
   local now goal_id
   now=$(date -u +%FT%TZ)
   goal_id="$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z' || printf 'cccccccc-dddd-eeee-ffff-000000000000')"
-  cat > "$root/.goal/state.json" <<EOF
+  mkdir -p "$root/.goal/goals"
+  STATE_FILE="$root/.goal/goals/$goal_id.json"
+  cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
   "goal_id": "$goal_id",
@@ -101,12 +103,13 @@ write_state() {
   "history": []
 }
 EOF
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
 }
 
 run_line_to_ndjson() {
   step "1. Claude-style line runner relays to Codex-style NDJSON runner"
   TMP=$(mktemp -d -t goal-e2e-line-to-ndjson-XXXXXX)
-  mkdir -p "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
+  mkdir -p "$TMP/.goal/goals" "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
   write_patterns "$TMP/patterns.json"
   write_cowork "$TMP"
 
@@ -128,10 +131,10 @@ run_line_to_ndjson() {
 
   for _ in $(seq 1 120); do
     sleep 0.1
-    [ -f "$TMP/.goal/handoff/0001.md" ] && [ "$(jq -r '.status' "$TMP/.goal/state.json")" = "pursuing" ] && break
+    [ -f "$TMP/.goal/handoff/0001.md" ] && [ "$(jq -r '.status' "$STATE_FILE")" = "pursuing" ] && break
   done
   [ -f "$TMP/.goal/handoff/0001.md" ] || fail "line->ndjson handoff missing"
-  [ "$(jq -r '.current.agent' "$TMP/.goal/state.json")" = "$to_id" ] || fail "line->ndjson did not switch to codex peer"
+  [ "$(jq -r '.current.agent' "$STATE_FILE")" = "$to_id" ] || fail "line->ndjson did not switch to codex peer"
   grep -q '^from: claude-mock-' "$TMP/.goal/handoff/0001.md" || fail "line->ndjson handoff from mismatch"
   grep -q '^to: codex-mock-' "$TMP/.goal/handoff/0001.md" || fail "line->ndjson handoff to mismatch"
 
@@ -143,7 +146,7 @@ run_line_to_ndjson() {
 run_ndjson_to_line() {
   step "2. Codex-style NDJSON runner relays to Claude-style line runner"
   TMP=$(mktemp -d -t goal-e2e-ndjson-to-line-XXXXXX)
-  mkdir -p "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
+  mkdir -p "$TMP/.goal/goals" "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
   write_patterns "$TMP/patterns.json"
   write_cowork "$TMP"
 
@@ -165,11 +168,11 @@ run_ndjson_to_line() {
 
   for _ in $(seq 1 120); do
     sleep 0.1
-    [ -f "$TMP/.goal/handoff/0001.md" ] && [ -s "$TMP/.goal/agents/${to_id}.continue" ] && [ "$(jq -r '.status' "$TMP/.goal/state.json")" = "pursuing" ] && break
+    [ -f "$TMP/.goal/handoff/0001.md" ] && [ -s "$TMP/.goal/agents/${to_id}.continue" ] && [ "$(jq -r '.status' "$STATE_FILE")" = "pursuing" ] && break
   done
   [ -f "$TMP/.goal/handoff/0001.md" ] || fail "ndjson->line handoff missing"
   [ -s "$TMP/.goal/agents/${to_id}.continue" ] || fail "line peer did not receive continuation"
-  [ "$(jq -r '.current.agent' "$TMP/.goal/state.json")" = "$to_id" ] || fail "ndjson->line did not switch to claude peer"
+  [ "$(jq -r '.current.agent' "$STATE_FILE")" = "$to_id" ] || fail "ndjson->line did not switch to claude peer"
   grep -q '"relay-pickup-line"' "$TMP/to.log" || fail "line bridge did not log relay-pickup-line"
 
   cleanup

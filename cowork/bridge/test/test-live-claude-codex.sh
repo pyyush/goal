@@ -28,7 +28,7 @@ fail() {
   if [ -n "${TMP:-}" ] && [ -d "$TMP" ]; then
     printf '\n--- root ---\n%s\n' "$TMP"
     printf '\n--- artifact ---\n'; cat "$TMP/LIVE_E2E.md" 2>/dev/null || true
-    printf '\n--- state ---\n'; jq '.' "$TMP/.goal/state.json" 2>/dev/null || cat "$TMP/.goal/state.json" 2>/dev/null || true
+    printf '\n--- goal record ---\n'; jq '.' "${STATE_FILE:-}" 2>/dev/null || cat "${STATE_FILE:-}" 2>/dev/null || true
     printf '\n--- events ---\n'; tail -50 "$TMP/.goal/events.jsonl" 2>/dev/null || true
     printf '\n--- logs ---\n'
     for f in "$TMP"/logs/*.log "$TMP"/.goal/agents/*.log; do
@@ -131,6 +131,8 @@ write_state() {
   local root="$1" current="$2" objective="$3" now goal_id
   now="$(date -u +%FT%TZ)"
   goal_id="$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z' || printf '11111111-2222-3333-4444-555555555555')"
+  mkdir -p "$root/.goal/goals"
+  STATE_FILE="$root/.goal/goals/$goal_id.json"
   jq -n --arg gid "$goal_id" --arg obj "$objective" --arg ts "$now" --arg current "$current" '{
     schema_version: 2,
     goal_id: $gid,
@@ -161,7 +163,8 @@ write_state() {
     pursuing_seconds: 0,
     pursuing_since: $ts,
     history: [{ts: $ts, action: "create", note: "live e2e"}]
-  }' > "$root/.goal/state.json"
+  }' > "$STATE_FILE.tmp"
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
 }
 
 start_bridge() {
@@ -187,7 +190,7 @@ reset_tmp() {
   cleanup
   PIDS=()
   TMP="$(mktemp -d -t goal-live-e2e-XXXXXX)"
-  mkdir -p "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude" "$TMP/logs"
+  mkdir -p "$TMP/.goal/goals" "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude" "$TMP/logs"
   git -C "$TMP" init -q
   printf '# /goal live E2E\n' > "$TMP/LIVE_E2E.md"
   write_cowork "$TMP"
@@ -201,8 +204,10 @@ has_line() {
 
 state_is() {
   local root="$1" status="$2" agent="$3"
-  [ "$(jq -r '.status' "$root/.goal/state.json")" = "$status" ] &&
-    [ "$(jq -r '.current.agent' "$root/.goal/state.json")" = "$agent" ]
+  local state_file="${STATE_FILE:-}"
+  [ -f "$state_file" ] || state_file="$(find "$root/.goal/goals" -maxdepth 1 -type f -name '*.json' | head -1)"
+  [ "$(jq -r '.status' "$state_file")" = "$status" ] &&
+    [ "$(jq -r '.current.agent' "$state_file")" = "$agent" ]
 }
 
 run_claude_to_codex() {

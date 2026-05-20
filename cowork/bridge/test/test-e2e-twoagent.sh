@@ -10,7 +10,7 @@
 #   2. mock-a completes one turn (NDJSON turn.completed event).
 #   3. Bridge-a writes a handoff (relay), state transitions to relaying with
 #      mock-b as current agent.  [OR we skip relay and just assert turn+achieved]
-#   4. A simulated "achieved" transition is written to state.json (mimicking
+#   4. A simulated "achieved" transition is written to the goal record (mimicking
 #      what goalctl mark-achieved or the MCP mark_achieved tool would do).
 #   5. Assert: state.status = achieved.
 #   6. Assert: both bridges detect the achieved status and stop their ndjson
@@ -58,8 +58,8 @@ trap cleanup EXIT
 fail() {
     red "FAIL [T7-e2e-twoagent]: $*"
     if [ -n "${TMP:-}" ]; then
-        printf '\n--- state.json ---\n'
-        cat "$TMP/.goal/state.json" 2>/dev/null || echo "(not found)"
+        printf '\n--- goal record ---\n'
+        cat "${STATE_FILE:-}" 2>/dev/null || echo "(not found)"
         printf '\n--- bridge-a log (last 30 lines) ---\n'
         tail -30 "$TMP/.claude/goal-hook.log" 2>/dev/null || true
         printf '\n--- bridge-b log ---\n'
@@ -80,10 +80,11 @@ say "node $(node --version) · jq $(jq --version) ✓"
 # ---- setup ------------------------------------------------------------------
 
 TMP=$(mktemp -d -t goal-e2e-twoagent-XXXXXX)
-mkdir -p "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
+mkdir -p "$TMP/.goal/goals" "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
 
 NOW=$(date -u +%FT%TZ)
 GOAL_UUID="e2e00000-0000-0000-0000-000000000001"
+STATE_FILE="$TMP/.goal/goals/$GOAL_UUID.json"
 
 # patterns.json with two ndjson mock runners ("Codex" style).
 MOCK_ESC=$(printf '%s' "$MOCK_RUNNER" | sed 's/\\/\\\\/g; s/"/\\"/g')
@@ -112,8 +113,8 @@ cat > "$PATTERNS_JSON" <<EOF
 EOF
 say "patterns.json written ✓"
 
-# Initial state.json (no current agent yet; bridges will detect agent=null).
-cat > "$TMP/.goal/state.json" <<EOF
+# Initial v3 goal record (no current agent yet; bridges will detect agent=null).
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
   "goal_id": "$GOAL_UUID",
@@ -137,7 +138,8 @@ cat > "$TMP/.goal/state.json" <<EOF
   "history": []
 }
 EOF
-say "state.json written (status=pursuing, agent=null) ✓"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+say "goal record written (status=pursuing, agent=null) ✓"
 
 # ---- step 1: Start both bridges, detect agent IDs ---------------------------
 
@@ -192,7 +194,7 @@ say "Distinct agent IDs ✓"
 step "2. Assign mock-a as current.agent → bridge-a starts ndjson turn"
 
 NOW2=$(date -u +%FT%TZ)
-cat > "$TMP/.goal/state.json" <<EOF
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
   "goal_id": "$GOAL_UUID",
@@ -216,7 +218,8 @@ cat > "$TMP/.goal/state.json" <<EOF
   "history": []
 }
 EOF
-say "state.json updated: current.agent=$AGENT_A ✓"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+say "goal record updated: current.agent=$AGENT_A ✓"
 
 # ---- step 3: Wait for bridge-a to complete at least one turn ----------------
 
@@ -247,12 +250,12 @@ step "4. Write achieved state (simulating mark_achieved / goalctl mark-achieved)
 NOW3=$(date -u +%FT%TZ)
 
 # Read current token counts from state if available.
-TOKENS_USED=$(jq -r '.tokens_used // 0' "$TMP/.goal/state.json" 2>/dev/null || echo 0)
+TOKENS_USED=$(jq -r '.tokens_used // 0' "$STATE_FILE" 2>/dev/null || echo 0)
 
 # Build lineage array with both agents.
 LINEAGE="[\"$AGENT_A\", \"$AGENT_B\"]"
 
-cat > "$TMP/.goal/state.json" <<EOF
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
   "goal_id": "$GOAL_UUID",
@@ -280,25 +283,26 @@ cat > "$TMP/.goal/state.json" <<EOF
   "history": []
 }
 EOF
-say "state.json written: status=achieved, lineage=$LINEAGE ✓"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+say "goal record written: status=achieved, lineage=$LINEAGE ✓"
 
 # ---- step 5: Assert state.status = achieved ---------------------------------
 
 step "5. Assert state.status = achieved"
 
-STATE_STATUS=$(jq -r '.status' "$TMP/.goal/state.json")
+STATE_STATUS=$(jq -r '.status' "$STATE_FILE")
 [ "$STATE_STATUS" = "achieved" ] || fail "state.status = $STATE_STATUS (expected achieved)"
 say "state.status = achieved ✓"
 
-LINEAGE_A=$(jq -r '.lineage[0]' "$TMP/.goal/state.json")
-LINEAGE_B=$(jq -r '.lineage[1]' "$TMP/.goal/state.json")
+LINEAGE_A=$(jq -r '.lineage[0]' "$STATE_FILE")
+LINEAGE_B=$(jq -r '.lineage[1]' "$STATE_FILE")
 say "lineage[0] = $LINEAGE_A"
 say "lineage[1] = $LINEAGE_B"
 [ "$LINEAGE_A" = "$AGENT_A" ] || fail "lineage[0] expected $AGENT_A, got $LINEAGE_A"
 [ "$LINEAGE_B" = "$AGENT_B" ] || fail "lineage[1] expected $AGENT_B, got $LINEAGE_B"
 say "lineage records both agents ✓"
 
-AUDIT_AT=$(jq -r '.audit.achieved_at // ""' "$TMP/.goal/state.json")
+AUDIT_AT=$(jq -r '.audit.achieved_at // ""' "$STATE_FILE")
 [ -n "$AUDIT_AT" ] || fail "audit.achieved_at missing"
 say "audit.achieved_at = $AUDIT_AT ✓"
 
@@ -306,7 +310,7 @@ say "audit.achieved_at = $AUDIT_AT ✓"
 
 step "6. Both bridges detect achieved status and stop ndjson loops within 5s"
 
-# The bridges watch state.json via fs.watch (500ms debounce). When they see
+# The bridges watch .goal/goals/ via fs.watch (500ms debounce). When they see
 # status != pursuing/relaying they break the ndjson loop (bridge L1167).
 # We check: no new turn events appear in the log after ~3s.
 
@@ -378,7 +382,7 @@ say "a18: bridge opened no LISTEN sockets ✓"
 step "Summary — audit item a9 evidence"
 say "✓ T7-1: Two bridges started (mock-a/lead, mock-b/build) with distinct agent IDs"
 say "✓ T7-2: Bridge-a (mocked Codex) completed at least one ndjson turn"
-say "✓ T7-3: state.json transitioned to status=achieved"
+say "✓ T7-3: goal record transitioned to status=achieved"
 say "✓ T7-4: Both agents in lineage: $AGENT_A, $AGENT_B"
 say "✓ T7-5: audit.achieved_at recorded"
 say "✓ T7-6: Bridges quiesced after achieved state (no new turn loops)"

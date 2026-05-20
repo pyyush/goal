@@ -41,8 +41,8 @@ fail() {
     if [ -n "${TMP:-}" ]; then
         printf '\n--- bridge-a log (last 40 lines) ---\n'
         tail -40 "$TMP/.claude/goal-hook.log" 2>/dev/null || true
-        printf '\n--- state.json ---\n'
-        cat "$TMP/.goal/state.json" 2>/dev/null || echo "(not found)"
+        printf '\n--- goal record ---\n'
+        cat "${STATE_FILE:-}" 2>/dev/null || echo "(not found)"
         printf '\n--- quota.json ---\n'
         cat "$TMP/.goal/quota.json" 2>/dev/null || echo "(not found)"
     fi
@@ -61,10 +61,11 @@ say "node $(node --version) · jq $(jq --version) ✓"
 # ---- temp workspace ---------------------------------------------------------
 
 TMP=$(mktemp -d -t goal-queued-test-XXXXXX)
-mkdir -p "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
+mkdir -p "$TMP/.goal/goals" "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
 
 NOW=$(date -u +%FT%TZ)
 GOAL_UUID="bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+STATE_FILE="$TMP/.goal/goals/$GOAL_UUID.json"
 
 # ---- patterns.json with ndjson mock-a only (no peer) -----------------------
 
@@ -135,11 +136,11 @@ done
 [ -n "$AGENT_A" ] || fail "bridge-a heartbeat not found within 5s"
 say "agent-a id: $AGENT_A ✓"
 
-# ---- write initial state.json with agent-a as current ----------------------
+# ---- write initial goal record with agent-a as current ---------------------
 
-step "4. Write state.json — current.agent = agent-a"
+step "4. Write v3 goal record — current.agent = agent-a"
 
-cat > "$TMP/.goal/state.json" <<EOF
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
   "goal_id": "$GOAL_UUID",
@@ -163,7 +164,8 @@ cat > "$TMP/.goal/state.json" <<EOF
   "history": []
 }
 EOF
-say "state.json written: current.agent=$AGENT_A ✓"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+say "goal record written: current.agent=$AGENT_A ✓"
 
 # ---- wait for state.status = queued (within 10s after 429) -----------------
 
@@ -172,19 +174,19 @@ step "5. Wait for state.status = queued (within 10s)"
 FOUND_QUEUED=0
 for i in $(seq 1 100); do
     sleep 0.1
-    STATUS=$(jq -r '.status // ""' "$TMP/.goal/state.json" 2>/dev/null) || continue
+    STATUS=$(jq -r '.status // ""' "$STATE_FILE" 2>/dev/null) || continue
     if [ "$STATUS" = "queued" ]; then
         FOUND_QUEUED=1
         break
     fi
 done
 [ "$FOUND_QUEUED" -eq 1 ] || {
-    FINAL=$(jq -r '.status' "$TMP/.goal/state.json" 2>/dev/null || echo "unknown")
+    FINAL=$(jq -r '.status' "$STATE_FILE" 2>/dev/null || echo "unknown")
     fail "state.status never became queued within 10s (final: $FINAL)"
 }
 say "state.status = queued ✓"
 
-QUEUED_UNTIL=$(jq -r '.queued_until // ""' "$TMP/.goal/state.json" 2>/dev/null)
+QUEUED_UNTIL=$(jq -r '.queued_until // ""' "$STATE_FILE" 2>/dev/null)
 [ -n "$QUEUED_UNTIL" ] || fail "queued_until not set"
 say "queued_until = $QUEUED_UNTIL ✓"
 
@@ -217,8 +219,8 @@ EOF
 
 # Also patch state.queued_until to be in the past so the poll triggers.
 jq --arg past "$PAST_RESET" '.queued_until = $past' \
-    "$TMP/.goal/state.json" > "$TMP/.goal/state.json.tmp" 2>/dev/null \
-    && mv "$TMP/.goal/state.json.tmp" "$TMP/.goal/state.json"
+    "$STATE_FILE" > "$STATE_FILE.tmp" 2>/dev/null \
+    && mv "$STATE_FILE.tmp" "$STATE_FILE"
 
 say "quota.json patched (headroom=medium), queued_until set to past ✓"
 
@@ -229,19 +231,19 @@ step "7. Wait for state.status = pursuing (within 45s — poll backoff)"
 FOUND_PURSUING=0
 for i in $(seq 1 450); do
     sleep 0.1
-    STATUS=$(jq -r '.status // ""' "$TMP/.goal/state.json" 2>/dev/null) || continue
+    STATUS=$(jq -r '.status // ""' "$STATE_FILE" 2>/dev/null) || continue
     if [ "$STATUS" = "pursuing" ]; then
         FOUND_PURSUING=1
         break
     fi
 done
 [ "$FOUND_PURSUING" -eq 1 ] || {
-    FINAL=$(jq -r '.status' "$TMP/.goal/state.json" 2>/dev/null || echo "unknown")
+    FINAL=$(jq -r '.status' "$STATE_FILE" 2>/dev/null || echo "unknown")
     fail "state.status never returned to pursuing within 45s (final: $FINAL)"
 }
 say "state.status = pursuing (auto-resumed from queued) ✓"
 
-QUEUED_UNTIL_AFTER=$(jq -r '.queued_until // "null"' "$TMP/.goal/state.json" 2>/dev/null)
+QUEUED_UNTIL_AFTER=$(jq -r '.queued_until // "null"' "$STATE_FILE" 2>/dev/null)
 [ "$QUEUED_UNTIL_AFTER" = "null" ] || fail "queued_until not cleared after resume (got: $QUEUED_UNTIL_AFTER)"
 say "queued_until cleared ✓"
 

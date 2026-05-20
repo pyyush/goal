@@ -30,14 +30,15 @@ red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 say()   { printf '  %s\n' "$*"; }
 step()  { printf '\n[%s] %s\n' "$(date -u +%H:%M:%S)" "$1"; }
 
-step "1. Set up v2 goal fixture (current.agent = agent-A)"
+step "1. Set up v3 goal fixture (current.agent = agent-A)"
 
-mkdir -p "$TMP/.goal" "$TMP/.claude"
+mkdir -p "$TMP/.goal/goals" "$TMP/.claude"
 GOAL_ID="$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z' || printf 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')"
+STATE_FILE="$TMP/.goal/goals/$GOAL_ID.json"
 NOW="$(date -u +%FT%TZ)"
 write_state() {
     local agent="$1"
-    cat > "$TMP/.goal/state.json" <<STATE
+    cat > "$STATE_FILE.tmp" <<STATE
 {
   "schema_version": 2,
   "goal_id": "$GOAL_ID",
@@ -59,6 +60,7 @@ write_state() {
   "pursuing_since": "$NOW"
 }
 STATE
+    mv "$STATE_FILE.tmp" "$STATE_FILE"
 }
 write_state "agent-A"
 say "fixture written ✓"

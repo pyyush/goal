@@ -15,7 +15,7 @@ step() { printf '\n[%s] %s\n' "$(date -u +%H:%M:%S)" "$1"; }
 fail() {
   red "FAIL [forced-relay]: $*"
   [ -n "${TMP:-}" ] && {
-    printf '\n--- state ---\n'; cat "$TMP/.goal/state.json" 2>/dev/null || true
+    printf '\n--- goal record ---\n'; cat "${STATE_FILE:-}" 2>/dev/null || true
     printf '\n--- bridge-a ---\n'; tail -40 "$TMP/bridge-a.log" 2>/dev/null || true
     printf '\n--- bridge-b ---\n'; tail -40 "$TMP/bridge-b.log" 2>/dev/null || true
   }
@@ -42,9 +42,10 @@ command -v jq >/dev/null || fail "jq not installed"
 [ -x "$MOCK_RUNNER" ] || fail "$MOCK_RUNNER not executable"
 
 TMP=$(mktemp -d -t goal-forced-relay-XXXXXX)
-mkdir -p "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
+mkdir -p "$TMP/.goal/goals" "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
 NOW=$(date -u +%FT%TZ)
 GOAL_UUID="bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+STATE_FILE="$TMP/.goal/goals/$GOAL_UUID.json"
 
 MOCK_ESC=$(printf '%s' "$MOCK_RUNNER" | sed 's/\\/\\\\/g; s/"/\\"/g')
 PATTERNS_JSON="$TMP/patterns.json"
@@ -92,7 +93,7 @@ done
 [ -n "$AGENT_B" ] || fail "agent B heartbeat missing"
 
 step "2. Assign agent A and request relay via goalctl"
-cat > "$TMP/.goal/state.json" <<EOF
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
   "goal_id": "$GOAL_UUID",
@@ -116,6 +117,7 @@ cat > "$TMP/.goal/state.json" <<EOF
   "history": []
 }
 EOF
+mv "$STATE_FILE.tmp" "$STATE_FILE"
 "$GOALCTL" --root "$TMP" relay --json >/tmp/goal-forced-relay.json
 jq -e '.ok == true' /tmp/goal-forced-relay.json >/dev/null || fail "goalctl relay did not return ok"
 
@@ -131,10 +133,10 @@ grep -q '"external-fault-consumed"' "$TMP/bridge-a.log" || fail "bridge did not 
 step "4. Peer resumes"
 for _ in $(seq 1 120); do
   sleep 0.1
-  STATUS=$(jq -r '.status' "$TMP/.goal/state.json" 2>/dev/null || echo "")
+  STATUS=$(jq -r '.status' "$STATE_FILE" 2>/dev/null || echo "")
   [ "$STATUS" = "pursuing" ] && break
 done
-[ "$(jq -r '.status' "$TMP/.goal/state.json")" = "pursuing" ] || fail "state did not return to pursuing"
-[ "$(jq -r '.current.agent' "$TMP/.goal/state.json")" = "$AGENT_B" ] || fail "current agent is not peer"
+[ "$(jq -r '.status' "$STATE_FILE")" = "pursuing" ] || fail "state did not return to pursuing"
+[ "$(jq -r '.current.agent' "$STATE_FILE")" = "$AGENT_B" ] || fail "current agent is not peer"
 
 green "ALL FORCED RELAY TESTS PASSED"

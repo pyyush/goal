@@ -209,7 +209,7 @@ else
   "include": ["${REPO_ROOT}/cowork/handoff/parse.ts"]
 }
 TSEOF
-        "$TSC" --project "$TSCONFIG_TMP" 2>/dev/null || true
+        "$TSC" --project "$TSCONFIG_TMP" >/dev/null 2>"$TMP/tsc-parse.log" || true
         COMPILED_JS="$TMP/tsc-out/parse.js"
 
         if [ -f "$COMPILED_JS" ]; then

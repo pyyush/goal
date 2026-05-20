@@ -131,4 +131,4 @@ Last:   <newest history entry: action — note>
 
 - Kill switch: `touch .goal/pause` from any terminal — the Stop hook exits cleanly on the next turn.
 - Hook diagnostics go to `.goal/events.jsonl` (one JSON line per fire), never to your chat.
-- The statusline helper (`hooks/goal-statusline.sh`) renders the active goal as a two-line cockpit — see `README.md`.
+- The statusline helper (`hooks/goal-statusline.sh`) renders the active goal as a compact cockpit segment.

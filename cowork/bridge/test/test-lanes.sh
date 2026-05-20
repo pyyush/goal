@@ -46,14 +46,16 @@ say "node $(node --version) · jq $(jq --version) ✓"
 TMP=$(mktemp -d -t goal-lanes-test-XXXXXX)
 GOAL_DIR="$TMP/.goal"
 AGENTS_DIR="$GOAL_DIR/agents"
-mkdir -p "$GOAL_DIR/handoff" "$AGENTS_DIR"
+mkdir -p "$GOAL_DIR/goals" "$GOAL_DIR/handoff" "$AGENTS_DIR"
 
-# Write a minimal state.json so goalctl resolves root.
+# Write a minimal v3 goal record so goalctl resolves root.
 NOW=$(date -u +%FT%TZ)
-cat > "$GOAL_DIR/state.json" <<EOF
+GOAL_UUID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+STATE_FILE="$GOAL_DIR/goals/$GOAL_UUID.json"
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
-  "goal_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "goal_id": "$GOAL_UUID",
   "objective": "lane test",
   "status": "pursuing",
   "created_at": "$NOW",
@@ -74,6 +76,7 @@ cat > "$GOAL_DIR/state.json" <<EOF
   "history": []
 }
 EOF
+mv "$STATE_FILE.tmp" "$STATE_FILE"
 
 # Node claim script (shared with concurrency test).
 CLAIM_SCRIPT="$TMP/claim-lane.mjs"

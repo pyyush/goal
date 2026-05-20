@@ -50,12 +50,13 @@ say "node $(node --version) · jq $(jq --version) ✓"
 TMP=$(mktemp -d -t goal-concurrency-test-XXXXXX)
 GOAL_DIR="$TMP/.goal"
 AGENTS_DIR="$GOAL_DIR/agents"
-mkdir -p "$GOAL_DIR/handoff" "$AGENTS_DIR"
+mkdir -p "$GOAL_DIR/goals" "$GOAL_DIR/handoff" "$AGENTS_DIR"
 
-# Write a minimal state.json.
+# Write a minimal v3 goal record.
 NOW=$(date -u +%FT%TZ)
 GOAL_UUID="cccccccc-dddd-eeee-ffff-aaaaaaaaaaaa"
-cat > "$GOAL_DIR/state.json" <<EOF
+STATE_FILE="$GOAL_DIR/goals/$GOAL_UUID.json"
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
   "goal_id": "$GOAL_UUID",
@@ -79,6 +80,7 @@ cat > "$GOAL_DIR/state.json" <<EOF
   "history": []
 }
 EOF
+mv "$STATE_FILE.tmp" "$STATE_FILE"
 
 # Initialize lanes.json.
 printf '{"leases":[]}\n' > "$GOAL_DIR/lanes.json"
@@ -298,7 +300,7 @@ LEASE_TO_RELEASE=$(printf '%s' "$CLAIM_RESULT" | jq -r '.lease_id')
 say "Claimed lease: $LEASE_TO_RELEASE"
 
 # Release via goalctl lanes release.
-# First make sure there's a state file at ROOT (goalctl needs it for root resolution).
+# First make sure there's a goal record at ROOT (goalctl needs it for root resolution).
 RELEASE_OUT=$("$GOALCTL" --root "$TMP" lanes release "$LEASE_TO_RELEASE" --json 2>/dev/null) || \
     RELEASE_OUT="{\"ok\":false}"
 RELEASE_OK=$(printf '%s' "$RELEASE_OUT" | jq -r '.ok // "false"') || RELEASE_OK="false"

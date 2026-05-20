@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:goal:schema:state:v2",
-  "title": "goal state.json v2",
-  "description": "Schema for .goal/state.json — the single source of truth for an active /goal session. Validated on every write in the MCP server (hand-rolled; this file is documentation + future tooling reference).",
+  "title": "goal record schema v2",
+  "description": "Schema for .goal/goals/<goal_id>.json — the per-goal source of truth for a durable /goal session. Validated on every write in the MCP server (hand-rolled); this file documents the record contract for future tooling.",
   "type": "object",
   "required": [
     "schema_version",

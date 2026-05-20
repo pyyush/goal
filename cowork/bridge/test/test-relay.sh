@@ -48,8 +48,8 @@ fail() {
     if [ -n "${TMP:-}" ]; then
         printf '\n--- bridge-a log (last 30 lines) ---\n'
         tail -30 "$TMP/.claude/goal-hook.log" 2>/dev/null || true
-        printf '\n--- state.json ---\n'
-        cat "$TMP/.goal/state.json" 2>/dev/null || echo "(not found)"
+        printf '\n--- goal record ---\n'
+        cat "${STATE_FILE:-}" 2>/dev/null || echo "(not found)"
         printf '\n--- handoff dir ---\n'
         ls -la "$TMP/.goal/handoff/" 2>/dev/null || echo "(not found)"
     fi
@@ -68,10 +68,11 @@ say "node $(node --version) · jq $(jq --version) ✓"
 # ---- temp workspace ---------------------------------------------------------
 
 TMP=$(mktemp -d -t goal-relay-test-XXXXXX)
-mkdir -p "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
+mkdir -p "$TMP/.goal/goals" "$TMP/.goal/agents" "$TMP/.goal/handoff" "$TMP/.claude"
 
 NOW=$(date -u +%FT%TZ)
 GOAL_UUID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+STATE_FILE="$TMP/.goal/goals/$GOAL_UUID.json"
 
 # ---- build patterns.json with two ndjson mock runners ----------------------
 
@@ -147,11 +148,11 @@ done
 [ -n "$AGENT_B" ] || fail "bridge-b heartbeat not found within 5s"
 say "agent-b id: $AGENT_B ✓"
 
-# ---- write initial state.json with agent-a as current ----------------------
+# ---- write initial goal record with agent-a as current ---------------------
 
-step "4. Write state.json — current.agent = agent-a"
+step "4. Write v3 goal record — current.agent = agent-a"
 
-cat > "$TMP/.goal/state.json" <<EOF
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "schema_version": 2,
   "goal_id": "$GOAL_UUID",
@@ -175,7 +176,8 @@ cat > "$TMP/.goal/state.json" <<EOF
   "history": []
 }
 EOF
-say "state.json written: current.agent=$AGENT_A ✓"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+say "goal record written: current.agent=$AGENT_A ✓"
 
 # Set bridge-b's peer env so it can pick agent-a as peer (reverse relay test).
 # Also set bridge-a's peer to agent-b.
@@ -204,12 +206,12 @@ say "handoff frontmatter valid ✓"
 # ---- assert state = relaying -----------------------------------------------
 
 step "6. Assert state.status = relaying"
-STATE_STATUS=$(jq -r '.status' "$TMP/.goal/state.json" 2>/dev/null) || fail "cannot read state.json"
+STATE_STATUS=$(jq -r '.status' "$STATE_FILE" 2>/dev/null) || fail "cannot read goal record"
 [ "$STATE_STATUS" = "relaying" ] || fail "state.status = $STATE_STATUS (expected relaying)"
 say "state.status = relaying ✓"
 
-CURRENT_AGENT=$(jq -r '.current.agent' "$TMP/.goal/state.json" 2>/dev/null)
-HANDOFF_HEAD=$(jq -r '.handoff_head' "$TMP/.goal/state.json" 2>/dev/null)
+CURRENT_AGENT=$(jq -r '.current.agent' "$STATE_FILE" 2>/dev/null)
+HANDOFF_HEAD=$(jq -r '.handoff_head' "$STATE_FILE" 2>/dev/null)
 say "state.current.agent = $CURRENT_AGENT"
 say "state.handoff_head = $HANDOFF_HEAD"
 [ "$HANDOFF_HEAD" = "0001" ] || fail "handoff_head expected 0001, got $HANDOFF_HEAD"
@@ -222,7 +224,7 @@ step "7. Wait for state.status = pursuing (bridge-b picks up, within 15s)"
 FOUND_PURSUING=0
 for i in $(seq 1 150); do
     sleep 0.1
-    STATUS=$(jq -r '.status // ""' "$TMP/.goal/state.json" 2>/dev/null) || continue
+    STATUS=$(jq -r '.status // ""' "$STATE_FILE" 2>/dev/null) || continue
     if [ "$STATUS" = "pursuing" ]; then
         FOUND_PURSUING=1
         break
@@ -230,7 +232,7 @@ for i in $(seq 1 150); do
 done
 
 [ "$FOUND_PURSUING" -eq 1 ] || {
-    FINAL_STATUS=$(jq -r '.status' "$TMP/.goal/state.json" 2>/dev/null || echo "unknown")
+    FINAL_STATUS=$(jq -r '.status' "$STATE_FILE" 2>/dev/null || echo "unknown")
     fail "state.status never returned to pursuing within 15s (final: $FINAL_STATUS)"
 }
 say "state.status = pursuing ✓"
