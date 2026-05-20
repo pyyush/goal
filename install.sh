@@ -190,8 +190,8 @@ Install complete. Restart Claude Code (CLI or desktop) to pick up the hooks.
 
 Try it:
   /goal Refactor the auth module to use the new session API; run tests
-  /goal status
-  /goal pause | resume | clear
+  /goal:goal status
+  /goal:goal pause | resume | clear
 
 See README.md for configuration (GOAL_AUTOPAUSE_ON_PROMPT, GOAL_STRIKE_LIMIT,
 GOAL_RELAY_LIMIT_PER_HOUR, etc.) and the threat model.

@@ -1,4 +1,5 @@
 # Per-project /goal runtime artifacts — never commit
+.claude/
 .claude/goal.json
 .claude/goal-hook.log
 .claude/goal.pause
@@ -24,6 +25,9 @@ proposal/
 mcp/node_modules/
 mcp/dist/
 bin/node_modules/
+
+# Profiling / coverage artifacts
+*.profraw
 
 # macOS
 .DS_Store

@@ -16,7 +16,7 @@
 #       ↔ relaying             violet   — peer agent is taking over
 #       ⌛ queued              amber    — waiting for provider headroom
 #       ✓ achieved             green    — done
-#       ‖ paused               dim      — /goal resume to continue
+#       ‖ paused               dim      — /goal:goal resume to continue
 #       ⊘ budget-limited       red      — token budget reached
 #   * No `unmet` — the model can never reach a failed state (RFC §3.4).
 #   * Pull-based: re-renders when Claude Code re-renders the status line. Pair

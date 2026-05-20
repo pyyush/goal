@@ -29,7 +29,7 @@
     "  claude-code → anthropic; codex → openai.",
     "",
     "Env override (any runner): GOAL_BRIDGE_SPAWN_<RUNNER_UPPER>=<space-separated cmd>",
-    "  e.g. GOAL_BRIDGE_SPAWN_CODEX='codex --api-key sk-...'"
+    "  e.g. GOAL_BRIDGE_SPAWN_CODEX='codex --api-key <api-key>'"
   ],
   "runners": {
     "claude-code": {

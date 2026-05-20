@@ -4,11 +4,8 @@
   "version": "0.2.0",
   "description": "Persistent objective lifecycle for Claude Code: set a goal once, Claude pursues it across turns until it is verifiably done.",
   "author": {
-    "name": "pyyush",
-    "url": "https://github.com/pyyush"
+    "name": "goal maintainers"
   },
-  "homepage": "https://github.com/pyyush/goal",
-  "repository": "https://github.com/pyyush/goal",
   "license": "MIT",
   "keywords": ["goal", "objective", "persistence", "agent", "autonomy", "lifecycle"],
   "commands": ["./goal.md"],

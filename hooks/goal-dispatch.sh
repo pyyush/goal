@@ -294,7 +294,7 @@ goal_dispatch_tick() {
     strikes_new=$((strikes_prev + 1))
 
     if [ "$strikes_new" -ge "$GOAL_STRIKE_LIMIT" ]; then
-        # Park — NOT fail. needs-input is fully resumable via /goal resume.
+        # Park — NOT fail. needs-input is fully resumable via /goal:goal resume.
         _disp_write "needs-input" "$strikes_new" "auto-park" \
             "parked after ${strikes_new} consecutive no-progress turns" || true
         _disp_log "park" "needs-input after ${strikes_new} no-progress turns"

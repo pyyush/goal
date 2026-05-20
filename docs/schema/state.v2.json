@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/pyyush/goal/docs/schema/state.v2.json",
+  "$id": "urn:goal:schema:state:v2",
   "title": "goal state.json v2",
   "description": "Schema for .goal/state.json — the single source of truth for an active /goal session. Validated on every write in the MCP server (hand-rolled; this file is documentation + future tooling reference).",
   "type": "object",

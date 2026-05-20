@@ -355,7 +355,7 @@ validation is hand-rolled in `mcp/goal-server.ts` (`validateStateV2`).
 
 - The `/goal` slash command name is unchanged.
 - `goalctl create`, `get`, `status`, `pause`, `resume`, `clear`, `set-budget`,
-  `mark-achieved`, `mark-unmet`, `listen`, and `serve-http` all continue to
+  `mark-achieved`, `listen`, and `serve-http` all continue to
   work identically. v2 writes include the extra fields; v1 reads still succeed
   because jq filters tolerate unknown fields.
 - The three MCP tools (`create_goal`, `update_goal`, `get_goal`) keep their

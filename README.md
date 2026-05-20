@@ -1,383 +1,180 @@
 <p align="center">
-  <img src="docs/banner.svg" alt="goal — durable objectives for Claude Code" width="100%">
+  <img src="docs/assets/goal-banner.png" alt="goal banner showing a durable objective record, statusline cockpit, and audit trail" width="100%">
 </p>
 
-<p align="center">
-  Durable task goals for Claude Code: turn a high-level objective into auditable tasks, keep working across turns, show truthful status, and only claim completion when evidence supports it.
-</p>
+# goal
 
----
+`goal` is a durable objective layer for developer agents. It turns a high-level coding outcome into local state, task checkpoints, statusline visibility, and an evidence gate before model-side completion can be claimed.
 
-## Why use it
+Use Claude Code's built-in `/goal` for a single-session task. Use this plugin when the work needs to survive `/clear`, compaction, restarts, rate limits, or handoff between Claude Code and Codex.
 
-Claude Code's built-in [`/goal`](https://code.claude.com/docs/en/goal) is the right default for a single Claude session that should keep working until a clear condition is met.
+## Why It Exists
 
-This plugin is for work that needs to survive beyond one session:
+Long coding runs fail in predictable ways: the objective drifts, status gets buried in the transcript, a restart loses context, or the model claims a finish before checking the actual files. `goal` makes those failure modes explicit and inspectable.
 
-- A refactor or migration that may take hours.
-- A release checklist where "done" needs concrete evidence.
-- A run you want visible in the statusline and controllable from a terminal.
-- A goal that should continue after `/clear`, compaction, restarts, or multiple Claude Code windows.
-- A task that can hand off between Claude Code and Codex when one provider is rate-limited.
-
-In Claude Code versions that also ship a native `/goal`, invoke this plugin explicitly as `/goal:goal`. If your slash command picker shows the plugin command as bare `/goal`, that alias is equivalent.
-
-Use Claude Code's built-in `/goal` instead when the work is a single-session task with a clear finish line and you do not need durable files, statusline visibility, terminal control, or handoff. This plugin earns its overhead when the run needs task checkpoints, evidence, interruption control, or recovery across sessions.
-
-## What you get
-
-| Feature | What it does |
-|---|---|
-| Durable project state | Stores each goal as its own file under `.goal/goals/<goal_id>.json`, owned by exactly one session via `.goal/sessions/<sid>` — not only the current chat transcript. |
-| Task-level framing | `goalframe` turns the objective into a compact spec plus 3-7 task checkpoints that initialize the audit checklist. |
-| Audit-gated completion | The model can mark a goal complete only after checking the prompt against concrete files, commands, tests, and artifacts. |
-| Auto-continuation | A Claude Code `Stop` hook keeps the run moving while status is `pursuing`. |
-| Statusline | Shows the owned goal, current task, audit count, active time, budget/cost, terminal state, and cowork relay or queue state. |
-| MCP tools | Gives the model structured tools for goal state, progress, breadcrumbs, lane leases, handoffs, relay, queueing, and steering. |
-| Headless control | `goalctl` and a loopback HTTP shim let scripts, CI, IDEs, and scheduled jobs control the same goal. |
-| Cowork relay | Claude Code and Codex can pursue the same goal through shared state and handoff envelopes. |
-| Rate-limit recovery | 429/5xx faults can relay to a peer or queue until provider headroom returns. |
-| Safety controls | Shared lock, atomic writes, CAS checks, `.goal/pause` kill switch, relay guardrail, local-only HTTP. |
-| Observability | `.goal/events.jsonl` and `goal-otel-exporter` emit lifecycle, relay, queue, and lane-conflict events. |
+- File-backed state: every active goal lives under `.goal/goals/<goal_id>.json`.
+- Session ownership: multiple Claude Code windows can work in one repo without sharing a mutable record accidentally.
+- Task checkpoints: `goalframe` turns the raw ask into a compact, auditable work plan.
+- Evidence discipline: `overclaim` blocks unsupported "done" claims.
+- Local control: `goalctl`, MCP tools, hooks, statusline, HTTP, and cowork relay all operate on the same state.
 
 ## Install
 
-Paste this into Claude Code, Cursor, another coding agent, or a terminal:
+This installs the slash command, hooks, statusline integration, MCP server wiring, and local CLI helpers.
 
 ```bash
-git clone https://github.com/pyyush/goal ~/goal && cd ~/goal && ./bin/goal-setup --non-interactive
+git clone <repo-url> ~/goal
+cd ~/goal
+./bin/goal-setup --non-interactive
 ```
 
-Restart Claude Code after install so hooks, statusline, and the MCP server register.
+Restart Claude Code after install so the command, hooks, statusline, and MCP server register.
 
-To inspect the statusline wiring without changing it later, run:
+Useful checks:
 
 ```bash
+./bin/goal-setup --dry-run
 goal-statusline-install --audit
+goalctl --help
 ```
 
-Rollback is scope-local: remove or disable this plugin in the Claude scope where it was installed, or delete the generated hook/statusline/MCP entries from that scope's Claude settings. Existing `.goal/` records are ordinary project files and can be kept for history or removed after the run is no longer needed.
-
-<details>
-<summary>Manual install</summary>
+Manual install is still available:
 
 ```bash
-git clone https://github.com/pyyush/goal
-cd goal
-./bin/goal-setup            # interactive: scope, MCP server, statusline
-# or: ./install.sh user     # minimal: hooks only
+./install.sh user
 ```
 
-Useful setup flags:
+Rollback is scope-local: remove or disable this plugin in the Claude scope where it was installed, or delete the generated hook/statusline/MCP entries from that scope's Claude settings. Existing `.goal/` records are ordinary project files.
+
+## 60-Second Quickstart
+
+Start a durable objective:
 
 ```text
---dry-run
---non-interactive
---scope user|project
+/goal:goal Refactor the auth module to use the new session API; keep tests green
 ```
 
-</details>
-
-## Quickstart
-
-```text
-/goal:goal Refactor the auth module to use the new session API; run tests until green
-```
-
-Claude Code keeps working until the goal is audited as complete, parked for input, paused, budget-limited, or cleared. No model grades completion — the loop is a deterministic state machine and completion is Claude's own audited call.
+Inspect and steer it:
 
 ```text
 /goal:goal status
 /goal:goal tasks
 /goal:goal next
-/goal:goal steer Keep public auth exports unchanged
-/goal:goal pause
-/goal:goal resume
-/goal:goal budget 50000
-/goal:goal achieved
-/goal:goal debrief
-/goal:goal clear
+/goal:goal steer "prefer focused tests before broad cleanup"
 ```
 
-Daily model:
+Control the same goal from a terminal:
 
-```text
-Start:      /goal:goal <outcome>
-Watch:      /goal:goal status     or goalctl watch
-Inspect:    /goal:goal tasks      or /goal:goal next
-Steer:      /goal:goal steer "prefer tests before cleanup"
-Interrupt:  /goal:goal pause
-Resume:     /goal:goal resume
-Join:       /goal:goal adopt <goal_id>
-Verify:     /goal:goal audit
-Finish:     /goal:goal achieved
+```bash
+goalctl status
+goalctl tasks
+goalctl next
+goalctl pause
+goalctl resume
+goalctl clear
 ```
 
-## Claude built-in `/goal` vs this plugin
+In Claude Code versions where the command picker exposes this plugin as bare `/goal`, that alias is equivalent. The explicit `/goal:goal` form avoids ambiguity with the native command.
 
-| Need | Claude Code built-in `/goal` | This plugin |
-|---|---|---|
-| One session, simple condition | Best fit. | Works, but heavier than needed. |
-| Survive `/clear`, compaction, or restart | Session-bound behavior. | Goal state persists at `.goal/goals/<goal_id>.json`; the owning session re-binds on next launch. |
-| Inspect files/tests before completion | Evaluator checks conversation context; it does not run tools. | Audit checklist maps requirements to files, commands, and evidence. |
-| Terminal/CI/IDE control | Not the focus. | `goalctl`, HTTP, MCP, and git sync operate on the same state. |
-| Multi-agent handoff | Not the focus. | Claude Code ↔ Codex relay through `.goal/handoff/`. |
-| Rate-limit resilience | Stays with the current provider/session. | Relay, queue, and resume when provider headroom returns. |
+## Core Loop
 
-## Architecture
+![Goal lifecycle diagram](docs/assets/diagrams/goal-lifecycle.png)
 
-A goal is **owned by exactly one session**. The on-disk layout makes that explicit:
+1. The user gives a developer outcome, not a chat instruction.
+2. `goalframe` shapes it into outcome, verification, constraints, boundaries, and task checkpoints.
+3. Runtime state is written under `.goal/` with atomic writes and per-goal locks.
+4. Hooks, MCP tools, and `goalctl` keep the same record moving.
+5. `overclaim` audits the evidence before model-side completion is recorded.
 
-```
-.goal/
-  goals/<goal_id>.json       per-goal record   (writers: MCP, Stop hook, /goal:goal)
-  sessions/<session_id>      pointer file      (content: the owned goal_id)
-  locks/<goal_id>.lock       per-goal mkdir mutex
-  locks/_coord.lock          cross-goal coordination lock (lanes, handoff seq)
-  cursors/<goal_id>          dispatcher progress cursor (tool-call count + wt hash)
-  events.jsonl               append-only diagnostics
-  pause                      hard kill switch
-```
+## Companion Skills
 
-Resolution is read-only: the bash resolver and MCP both look up `sessions/<sid>` to find which `goals/<gid>.json` to act on, and they never adopt a session into a goal as a side effect of resolving. Two Claude sessions in one folder produce two independent records under two per-goal locks — they never share a mutable file.
+![Companion skills diagram](docs/assets/diagrams/companion-skills.png)
 
-Writes are atomic (`mktemp` + `rename(2)`) and CAS-guarded by `goal_id`. The MCP server's per-goal lock and the bash hooks' per-goal `mkdir` mutex use the same lockfile path, so both runtimes serialize against each other.
+The custom skills are the product logic around the loop.
 
-```mermaid
-flowchart LR
-    subgraph CC["Claude Code session  (CLAUDE_CODE_SESSION_ID = sid)"]
-        SC["/goal:goal<br/>slash command"]
-        HOOKS["Stop / prompt / notify<br/>bash hooks"]
-        MCP["mcp__goal__*<br/>MCP server"]
-    end
-    subgraph EXT["External callers"]
-        CTL["goalctl"]
-        HTTP["goal-http-server<br/>(loopback)"]
-        BR["goal-bridge<br/>(cowork daemon)"]
-    end
-    subgraph FS[".goal/ — session-scoped layout"]
-        G["goals/&lt;gid&gt;.json<br/>per-goal record"]
-        SES["sessions/&lt;sid&gt;<br/>pointer (text = gid)"]
-        LOCK["locks/&lt;gid&gt;.lock<br/>per-goal mkdir mutex"]
-        CLOCK["locks/_coord.lock<br/>cross-goal lock"]
-        EVT["events.jsonl<br/>append-only"]
-    end
+`goalframe` runs at intake. It converts a vague or oversized objective into a compact spec:
 
-    SC --> MCP
-    MCP -- writes --> G
-    MCP -- writes --> SES
-    MCP -- takes --> LOCK
-    HOOKS -- resolves via --> SES
-    HOOKS -- writes --> G
-    HOOKS -- takes --> LOCK
-    CTL -- resolves via --> SES
-    CTL -- writes --> G
-    CTL -- takes --> LOCK
-    HTTP -- resolves via --> SES
-    HTTP -- writes --> G
-    BR -- watches --> G
-    BR -- takes --> LOCK
-    BR -- takes --> CLOCK
-    G -. appends .-> EVT
-
-    classDef rt fill:#eef6ff,stroke:#6b8bb8,color:#0b2a4a
-    classDef ext fill:#fff5e6,stroke:#c08a2f,color:#3a2400
-    classDef fs fill:#f3f3f3,stroke:#888,color:#222
-    class SC,HOOKS,MCP rt
-    class CTL,HTTP,BR ext
-    class G,SES,LOCK,CLOCK,EVT fs
+```json
+{
+  "title": "Migrate auth sessions",
+  "outcome": "auth uses the new session API",
+  "verification": "auth tests and smoke flow pass",
+  "constraints": "public exports stay stable",
+  "tasks": ["map call sites", "migrate core flow", "verify edge cases"]
+}
 ```
 
-### Lifecycle
+`overclaim` runs at exit and before progress claims. It classifies each claim by support level:
 
-The model can reach `achieved` only through the `overclaim` audit. `paused`, `clear`, and budget changes are user/system actions — the model can never write a failure state.
+| Level | Meaning |
+|---|---|
+| `confirmed` | Directly checked this turn against files, commands, tests, or artifacts. |
+| `partial` | Some named part is still unverified or incomplete. |
+| `proxy-only` | Related evidence exists, but it does not prove the claim. |
+| `blocked` | The required evidence cannot be gathered yet. |
 
-```mermaid
-stateDiagram-v2
-    [*] --> pursuing : /goal:goal &lt;objective&gt;
+The result is a goal system that treats "done" as an evidence-backed state, not a guess.
 
-    pursuing --> pursuing : Stop hook tick<br/>(progress observed)
-    pursuing --> needs_input : 2 no-progress turns<br/>(dispatcher auto-park)
-    pursuing --> paused : /goal:goal pause<br/>or notify hook (429/5xx, solo)
-    pursuing --> achieved : overclaim audit passes<br/>+ update_goal complete
-    pursuing --> budget_limited : tokens_used &ge; token_budget
+## Cowork Relay
 
-    paused --> pursuing : /goal:goal resume
-    needs_input --> pursuing : /goal:goal resume
+![Cowork relay diagram](docs/assets/diagrams/cowork-relay.png)
 
-    pursuing --> relaying : 429/5xx<br/>(cowork bridge)
-    relaying --> pursuing : peer turn completes
-    relaying --> queued : no peer has headroom
-    queued --> pursuing : retry timer +<br/>quota recovered
-
-    achieved --> [*]
-    budget_limited --> [*]
-
-    note right of needs_input
-        not a failure state —
-        fully resumable
-    end note
-    note right of achieved
-        only the model can write this,
-        only via overclaim audit
-    end note
-```
-
-### Cowork relay (opt-in)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant CC as Claude Code<br/>(Stop hook)
-    participant G as goals/&lt;gid&gt;.json
-    participant L as locks/_coord.lock
-    participant H as handoff/NNNN.md
-    participant BR as goal-bridge<br/>(codex)
-    participant CX as Codex CLI
-
-    CC->>G: status=pursuing<br/>current.agent=claude-code-...
-    Note over CC,CX: rate-limit hit (429)
-    CC->>L: acquire coord lock
-    CC->>H: write handoff envelope<br/>(seq=NNNN, from=cc, to=codex)
-    CC->>G: status=relaying<br/>current.agent=codex-...<br/>handoff_head=NNNN
-    CC->>L: release
-    BR-->>G: watcher fires (fs.watch on goals/)
-    BR->>G: resolveMyGoal()<br/>current.agent matches AGENT_ID
-    BR->>H: read handoff body
-    BR->>CX: spawn turn with handoff context
-    CX-->>BR: turn.completed
-    BR->>G: status=pursuing<br/>(peer picked up)
-```
-
-## Cowork and rate-limit relay
-
-Cowork is opt-in. Add `.goal/cowork.yml`, start a peer bridge, and agents can hand off through the same goal state.
+Cowork is opt-in. Add `.goal/cowork.yml`, start a peer bridge, and Claude Code and Codex can continue the same objective through handoff envelopes.
 
 ```bash
 goalctl cowork init
 goalctl bridge start codex --root /path/to/project
 ```
 
-When a runner hits a rate limit or server error:
-
-1. The bridge writes `.goal/handoff/NNNN.md`.
-2. The goal record moves to `relaying`.
-3. The peer reads the handoff and continues.
-4. State returns to `pursuing` after the peer's first successful turn.
-5. If every configured provider is throttled, the goal becomes `queued` until headroom returns.
+When a runner hits a rate limit or server error, the bridge can write `.goal/handoff/NNNN.md`, move the goal to `relaying`, and let the peer pick up from the shared state. If every configured provider is throttled, the goal queues until headroom returns.
 
 See [docs/cowork.md](docs/cowork.md) for the full protocol.
 
-## Headless control
+## Developer Interfaces
 
-For CI, scheduled jobs, IDE plugins, and local scripts:
+`goalctl` is the headless control surface:
 
 ```bash
-goalctl create "Ship the migration" --budget 5000
-goalctl status --json | jq '.remaining_tokens'
-goalctl tasks
-goalctl next
+goalctl create "Ship the migration" --budget 50000
+goalctl --json status
 goalctl audit
-goalctl steer "prioritize focused tests before docs"
-goalctl pause / resume / clear
-goalctl listen --grep created
+goalctl listen --grep goal.completed
 goalctl serve-http --port 7474
-goalctl watch
-goalctl template list
-goalctl pr --json
-goalctl sync push / sync pull
 ```
 
-The HTTP shim binds `127.0.0.1` only and exposes:
+The loopback HTTP shim binds `127.0.0.1` only:
 
-| Method | Path | Notes |
-|---|---|---|
-| `GET` | `/goal[?goal=<gid>]` | Returns the resolved goal record. Resolution: `?goal=<gid>` → `X-Claude-Session-Id` header → single-active fallback. |
-| `POST` | `/goal` | Create a new goal. Pass `X-Claude-Session-Id` to bind a per-session goal; otherwise refuses if any active goal already exists. |
-| `PATCH` | `/goal[?goal=<gid>]` | `{"action":"pause"\|"resume"\|"clear"\|"set-budget"\|"mark-needs-input"}`. `clear` returns 204. |
-| `GET` | `/goals` | List every goal in the project. |
-| `GET` | `/events?since=<iso>` | NDJSON event stream from `.goal/events.jsonl`. |
-| `GET` | `/healthz` | `ok`. |
+```bash
+curl -X POST http://127.0.0.1:7474/goal \
+  -H 'Content-Type: application/json' \
+  -d '{"objective":"Ship the migration","token_budget":50000}'
+```
 
-## MCP tools
+The MCP server exposes model-side tools for goal creation, state reads, completion, task progress, lane leases, handoffs, queued messages, and steering. See [mcp/README.md](mcp/README.md).
 
-The bundled MCP server exposes model-side tools under `mcp__goal__*`:
+## Reliability Model
 
-| Tool | Behavior |
-|---|---|
-| `create_goal`, `get_goal`, `update_goal` | Create, read, and complete goals. `create_goal` materializes `spec.tasks[]` into audit checkpoints; `update_goal` only accepts completion. |
-| `report_progress`, `report_stuck`, `record_breadcrumb` | Maintain task/audit evidence, stuck state, and approach history. `report_progress` accepts overclaim support levels such as `confirmed`, `partial`, and `blocked`. |
-| `claim_lane`, `release_lane` | Coordinate file/path ownership between agents. |
-| `write_handoff`, `peer_status`, `relay_now` | Create and inspect handoffs, force relay, and check peer health. |
-| `queue_message`, `steer_message` | Route queued and mid-turn instructions safely. |
-
-The server also declares a Claude `goal/continue` push channel so idle sessions can be re-engaged without waiting for another user prompt.
-
-## Statusline
-
-The statusline renders the owned goal as a compact cockpit segment — and only in the session that owns the goal, so an unrelated shell in the same directory shows nothing.
-
-| State | Shown as |
-|---|---|
-| Pursuing (healthy) | teal `◎ <title> · t3 current task · N/M · 12m` |
-| Pursuing (stalled) | amber `◍ goal stalled · t3 current task · no progress last turn` |
-| Needs input | orange `◌ needs input · t3 blocker · /goal:goal resume after fix` |
-| Achieved | green `✓ goal achieved · <title> · 23m · 47.0K` |
-| Budget-limited | red `⊘ budget limit · <title> · current task` |
-| Relaying | violet `↔ relaying · <title> · t7 final audit · codex` |
-| Queued | amber `⌛ queued · t7 final audit · retry <time>` |
-| No goal | the segment is absent |
-
-The live timer uses `statusLine.refreshInterval` — no background daemon, no writes to `/dev/tty` (which hooks no longer have). The timer counts active pursuit time only; paused time is excluded. Terminal states keep their final time/token snapshots. See `docs/goal-statusline-cockpit.html` for the full interactive mockup.
-
-## Reliability model
-
-- Objectives are wrapped as untrusted data so a goal cannot smuggle higher-priority instructions.
-- Completion is audit-gated and evidence-backed.
-- The model cannot pause, resume, clear, mark a failure, or raise its own budget — `update_goal` is asymmetric and only marks complete (the same contract Codex enforces).
-- `.goal/pause` halts the loop from any terminal.
-- Notification hooks pause on API errors in solo mode.
-- Cowork mode relays or queues on rate limits.
-- Relay guardrail prevents ping-pong loops from burning quota.
-- Runtime files live under `.goal/` and are ignored for project installs.
-
-## Configuration
-
-| Var | Default | What |
-|---|---|---|
-| `GOAL_AUTOPAUSE_ON_PROMPT` | `0` | When `1`, the prompt hook pauses the active goal on every user prompt that isn't `/goal …` or `/goal:goal …`. |
-| `GOAL_STRIKE_LIMIT` | `2` | Consecutive no-progress turns before the dispatcher parks the goal to `needs-input`. |
-| `GOAL_REFRESH_EVERY` | `25` | Tick interval for full-spec refresh in the dispatcher's continuation prompt (short prompt by default). |
-| `GOAL_STOP_PROMPT_STYLE` | `standard` (`goal-setup` wires `compact`) | Set to `compact` to keep Stop-hook auto-continuation but shrink the visible host hook row to a one-line continuation nudge. |
-| `GOAL_PUSH_INTERVAL_SECONDS` | unset | Optional MCP channel timer push. |
-| `GOAL_CHANNEL_DISABLE` | `0` | Disable only the push channel. |
-| `GOAL_CHANNEL_DEBOUNCE_MS` | `5000` | Debounce window between channel pushes vs Stop-hook ticks. |
-| `GOAL_STOP_CONTINUE` | `1` | When `0`, the Stop hook becomes accounting-only and does not emit `decision:block`, avoiding host UIs that render intentional continuation blocks as noisy hook-error rows. Continue manually with `/goal:goal` or rely on the MCP `goal/continue` channel. |
-| `GOAL_LOCK_TIMEOUT_MS` | `5000` | Shared mutex acquire timeout. |
-| `GOAL_LOCK_STALE_MS` | `30000` | Stale lock takeover threshold. |
-| `GOAL_RELAY_LIMIT_PER_HOUR` | `3` | Automatic relay guardrail. |
-| `GOAL_HEARTBEAT_TTL_MS` | `15000` | Stale heartbeat threshold for cowork agents. |
-| `GOAL_OTEL_ENDPOINT` | unset | OTLP HTTP endpoint for `goal-otel-exporter`. |
-| `GOAL_DISABLE_MIGRATION` | `0` | Skip the v1 → v2 → v3 forward migration on first touch. |
-| `CLAUDE_CODE_SESSION_ID` / `CLAUDE_SESSION_ID` / `GOAL_SESSION_ID` | set by Claude Code / test harnesses | Used by the MCP server, `goalctl`, and the HTTP shim to resolve which goal this session owns. |
-
-## Troubleshooting
-
-**Loop is not firing.** Check `jq '.hooks.Stop' ~/.claude/settings.json`, then restart Claude Code.
-
-**Statusline is missing.** Confirm `~/.claude/hooks/goal-statusline.sh` is executable and your statusLine command passes `cwd` and `session_id` on stdin. The bundled `statusline.sh` handles this.
-
-**Goal stuck after a rate limit.** In cowork mode, check `goalctl quota`, `.goal/events.jsonl`, and the peer bridge. In solo mode, run `/goal:goal resume` after the provider recovers.
-
-**Handoff was not picked up.** Check `.claude/goal-hook.log`, `.goal/agents/<runner>.log`, and `.goal/agents/<runner>.pid`. Restart the peer bridge with `goalctl bridge start codex`.
-
-**Need to stop immediately.** Run `touch .goal/pause`.
+- Objectives are treated as untrusted data.
+- Atomic writes use temp files and `rename(2)`.
+- Per-goal locks serialize hooks, MCP, CLI, and bridge writes.
+- `.goal/pause` is a hard local kill switch.
+- Model-side completion is audit-gated; terminal `goalctl mark-achieved` is explicit caller-owned control.
+- The HTTP shim is loopback-only.
+- Runtime records live under `.goal/` and are ignored by default.
 
 ## Requirements
 
 - macOS or Linux (Windows via WSL)
 - `bash` 3.2+, `jq`, `uuidgen`
 - Node 18+ for MCP, HTTP, telemetry, and bridge helpers
+
+## Docs
+
+- [Cowork protocol](docs/cowork.md)
+- [MCP server](mcp/README.md)
+- [Statusline cockpit mockup](docs/goal-statusline-cockpit.html)
+- [V3 design notes](docs/GOAL-V3-RFC.md)
+- [Generated README assets](docs/assets/README.md)
 
 ## License
 

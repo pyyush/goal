@@ -2,7 +2,7 @@
 # hooks/goal-notify.sh — v3 Notification hook for /goal.
 #
 # Auto-pauses an active goal when Claude Code surfaces a rate-limit, API error,
-# quota, or overload notification. The user re-arms with `/goal resume`.
+# quota, or overload notification. The user re-arms with `/goal:goal resume`.
 #
 # v3 changes vs the v2 version that shipped (broken) with the session-scoped
 # merge:

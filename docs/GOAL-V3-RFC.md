@@ -2,7 +2,7 @@
 
 Status: proposed
 Supersedes: v2 schema + the project-scoped `.goal/state.json` model
-Author: pyyush
+Author: goal maintainers
 
 This document diagnoses the four field bugs against how Codex actually
 implements `/goal`, then specifies a v3 architecture that fixes all four and
@@ -45,7 +45,7 @@ re-arms after every productive turn and only *suppresses* (does not kill) the
 loop when a turn is unproductive. The loop is allowed to run forever **as long
 as it is doing real work.**
 
-The current `pyyush/goal` plugin diverges from Codex on (1) and (3), and that
+The current `goal` plugin diverges from Codex on (1) and (3), and that
 divergence is the direct cause of all four reported bugs.
 
 ---
@@ -208,7 +208,7 @@ Consequences:
 * **Bug 3 gone.** A fresh session owns nothing → `goal_resolve_owned` returns
   non-zero → the status line prints nothing. Rendering the status line never
   binds a session to a goal. Terminal goals never render in the status line at
-  all (completion is reported in-chat by the model; `/goal status` always
+  all (completion is reported in-chat by the model; `/goal:goal status` always
   works).
 * **Bug 1 gone.** The `Stop` hook only ever acts on the goal the firing session
   owns. Two sessions = two owners = two goal files = two per-goal locks.
@@ -246,7 +246,7 @@ A pure-text turn or a plan-mode turn is **not** progress. This is Codex's
   * **strike ≥ 2** → **do not block.** Set `status = needs-input`, append a
     history note `auto-parked: 2 consecutive no-progress turns`, emit a plain
     (non-blocking) message telling the user the goal is parked and why. The goal
-    is **parked, not failed.** `/goal resume` re-arms it.
+    is **parked, not failed.** `/goal:goal resume` re-arms it.
 
 **Step 3 — `stop_hook_active` is no longer a kill switch.**
 v2 did `exit 0` on `stop_hook_active=true`, silently killing the loop. v3

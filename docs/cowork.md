@@ -101,7 +101,7 @@ pursuing → relaying     : 429/5xx detected in current agent
 relaying → pursuing     : peer picks up (first successful turn)
 relaying → queued       : no peer with headroom
 queued   → pursuing     : retry timer fires + headroom restored
-pursuing → paused       : user /goal pause, or relay guardrail tripped
+pursuing → paused       : user /goal:goal pause, or relay guardrail tripped
 queued   → pursuing     : auto-resume (no user action required)
 ```
 
@@ -305,10 +305,10 @@ With `GOAL_OTEL_ENDPOINT` set, `goal-otel-exporter` ships these as OpenTelemetry
 
 **Handoff not picked up by peer.** Check `.claude/goal-hook.log` and `.goal/agents/<runner>.log` for `relay-pickup` and `ndjson-loop-start` events from the peer bridge. Verify the peer bridge is running by checking `.goal/agents/<runner>.pid` or restarting it with `goalctl bridge start codex`, and confirm the goal record (`.goal/goals/<goal_id>.json`) shows `current.agent` equal to the peer's agent_id.
 
-**State stuck in `relaying`.** The peer bridge is not running or crashed. Restart it: `goalctl bridge start codex`. If state is inconsistent, run `goalctl status --json` to inspect, then `/goal resume` to force back to `pursuing`.
+**State stuck in `relaying`.** The peer bridge is not running or crashed. Restart it: `goalctl bridge start codex`. If state is inconsistent, run `goalctl status --json` to inspect, then `/goal:goal resume` to force back to `pursuing`.
 
 **Queued indefinitely.** Check `goalctl quota` for provider headroom. If all providers show `exhausted`, headroom is set heuristically from the last 429 `Retry-After` header. Wait for the `queued_until` timestamp or run `goalctl relay` to manually request a peer handoff.
 
-**Relay guardrail tripped.** More than 3 automatic relays fired in one hour. Check `.goal/relay-log.jsonl` for the relay history. Run `/goal resume` after addressing the underlying fault.
+**Relay guardrail tripped.** More than 3 automatic relays fired in one hour. Check `.goal/relay-log.jsonl` for the relay history. Run `/goal:goal resume` after addressing the underlying fault.
 
 **Bridge exits immediately.** The bridge exits if it cannot read `cowork/bridge/patterns.json`. Verify the path with `GOAL_BRIDGE_PATTERNS` env var and that the file is valid JSON.
