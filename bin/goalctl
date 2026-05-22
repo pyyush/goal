@@ -124,6 +124,7 @@ resolve_root() {
     # No existing goal found — for create/listen/serve-http/cowork init, use $PWD. Else fail.
     case "$CMD" in
         create|listen|serve-http|cowork) printf '%s' "$PWD" ;;
+        discover|mint-uuid|session-id-resolve) printf '%s' "$PWD" ;;
         *) die "no goal state found (walked up from $PWD). Did you mean: goalctl create <objective>?" ;;
     esac
 }
@@ -547,6 +548,67 @@ watch|history|debrief|pr|sync|backlog|template|notifier)
     V3="$(cd "$(dirname "$0")" && pwd)/goal-v3"
     [ -x "$V3" ] || die "goal-v3 helper not found at $V3"
     exec node "$V3" "$CMD" "$ROOT" "$JSON_OUTPUT" ${ARGS[@]+"${ARGS[@]}"}
+    ;;
+
+# ---- slash-command prerender helpers ---------------------------------------
+#
+# Single-call replacements for the compound shell preambles in
+# ~/.claude/commands/goal.md. The preambles ran fine in standalone Claude
+# Code, but Desktop's slash-command permission gate refuses any `!` block
+# that "contains shell syntax that cannot be statically analyzed" (while,
+# if/then, pipes, command substitution). Each subcommand here is one bash
+# invocation that emits the SAME text the prior preamble emitted, so goal.md
+# can call `!goalctl discover`, `!goalctl mint-uuid`, `!goalctl session-id-resolve`
+# and have it work in CLI and Desktop alike.
+
+discover)
+    # Print "GOAL_ROOT=..." plus per-record summaries, or NO_GOAL.
+    # Mirrors the prior goal.md preamble exactly.
+    if [ -d "$ROOT/.goal/goals" ]; then
+        printf 'GOAL_ROOT=%s\n' "$ROOT"
+        find "$ROOT/.goal/goals" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null \
+          | sort \
+          | while IFS= read -r f; do
+                printf 'RECORD=%s\n' "$f"
+                jq -c '{goal_id,status,objective:(.objective[0:120]),updated_at}' "$f" 2>/dev/null
+            done
+    elif [ -f "$ROOT/.goal/state.json" ]; then
+        printf 'GOAL_ROOT=%s (legacy v2)\n' "$ROOT"
+        printf 'RECORD=%s/.goal/state.json\n' "$ROOT"
+        jq -c '{goal_id,status,objective:(.objective[0:120])}' "$ROOT/.goal/state.json" 2>/dev/null
+    else
+        echo NO_GOAL
+    fi
+    exit 0
+    ;;
+
+mint-uuid)
+    # Fresh lowercase UUID (or a high-entropy fallback when uuidgen is unavailable).
+    if u=$(uuidgen 2>/dev/null); then
+        printf '%s\n' "$u" | tr 'A-Z' 'a-z'
+    else
+        printf 'fallback-%s-%s\n' "$(date +%s 2>/dev/null || echo 0)" "$$"
+    fi
+    exit 0
+    ;;
+
+session-id-resolve)
+    # Print "SESSION_ID=<id>" using env vars first, then falling back to the
+    # newest transcript file in ~/.claude/projects/<slugged-cwd>/.
+    sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-${GOAL_SESSION_ID:-}}}"
+    if [ -z "$sid" ] && [ -n "${HOME:-}" ]; then
+        slug=$(printf '%s' "$PWD" | tr '/' '-')
+        proj="$HOME/.claude/projects/$slug"
+        if [ -d "$proj" ]; then
+            f=$(find "$proj" -maxdepth 1 -type f -name '*.jsonl' -exec ls -t {} + 2>/dev/null | head -n 1)
+            if [ -n "$f" ]; then
+                base="${f##*/}"
+                sid="${base%.jsonl}"
+            fi
+        fi
+    fi
+    printf 'SESSION_ID=%s\n' "$sid"
+    exit 0
     ;;
 
 create|replace)

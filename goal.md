@@ -28,18 +28,18 @@ If `mcp__goal__get_goal`, `mcp__goal__create_goal`, and `mcp__goal__update_goal`
 
 ## Current goal on disk
 
-!`d="$PWD"; while [ "$d" != "/" ] && [ -n "$d" ]; do if [ -d "$d/.goal/goals" ]; then echo "GOAL_ROOT=$d"; find "$d/.goal/goals" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | sort | while IFS= read -r f; do echo "RECORD=$f"; jq -c '{goal_id,status,objective:(.objective[0:120]),updated_at}' "$f" 2>/dev/null; done; exit 0; fi; if [ -f "$d/.goal/state.json" ]; then echo "GOAL_ROOT=$d (legacy v2)"; echo "RECORD=$d/.goal/state.json"; jq -c '{goal_id,status,objective:(.objective[0:120])}' "$d/.goal/state.json" 2>/dev/null; exit 0; fi; d=$(dirname "$d"); done; echo NO_GOAL`
+!`goalctl discover`
 
 ## Fresh UUID / current UTC timestamp
 
-!`uuidgen 2>/dev/null | tr 'A-Z' 'a-z' || echo "fallback-$(date +%s)-$$"`
+!`goalctl mint-uuid`
 !`date -u +%FT%TZ`
 
 ## Current Claude session id
 
 Claude normally exports the session id to slash-command shell preambles. If a host build only exposes it to hooks/statusline payloads, infer it from the newest transcript for this workspace so a newly created goal still binds to the current session and renders immediately in the statusline.
 
-!`sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-${GOAL_SESSION_ID:-}}}"; if [ -z "$sid" ] && [ -n "${HOME:-}" ]; then slug=$(printf '%s' "$PWD" | tr '/' '-'); proj="$HOME/.claude/projects/$slug"; if [ -d "$proj" ]; then f=$(find "$proj" -maxdepth 1 -type f -name '*.jsonl' -exec ls -t {} + 2>/dev/null | head -n 1); if [ -n "$f" ]; then base="${f##*/}"; sid="${base%.jsonl}"; fi; fi; fi; printf 'SESSION_ID=%s\n' "$sid"`
+!`goalctl session-id-resolve`
 
 ## User arguments
 
@@ -131,4 +131,4 @@ Last:   <newest history entry: action — note>
 
 - Kill switch: `touch .goal/pause` from any terminal — the Stop hook exits cleanly on the next turn.
 - Hook diagnostics go to `.goal/events.jsonl` (one JSON line per fire), never to your chat.
-- The statusline helper (`hooks/goal-statusline.sh`) renders the active goal as a compact cockpit segment.
+- The statusline helper (`hooks/goal-statusline.sh`) renders the active goal as a two-line cockpit — see `README.md`.
