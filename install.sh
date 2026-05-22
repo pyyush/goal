@@ -91,6 +91,22 @@ chmod +x "$TARGET/hooks/"*.sh
 mkdir -p "$TARGET/bin"
 cp "$REPO_DIR/bin/goal-statusline-install" "$TARGET/bin/goal-statusline-install"
 chmod +x "$TARGET/bin/goal-statusline-install"
+
+# Symlink goalctl onto a stable PATH location so /goal's slash-command
+# preambles (`!goalctl discover`, `!goalctl mint-uuid`, `!goalctl session-id-resolve`)
+# resolve identically in standalone Claude Code CLI, Desktop chats, and
+# Desktop-launched code sessions. Without this, Desktop's permission gate
+# can still parse the !-line but the spawned subshell cannot find goalctl
+# on its PATH. ~/.local/bin is the conventional user-PATH location; both
+# CLI and Desktop subprocesses inherit it on macOS.
+GOALCTL_LINK_DIR="${GOALCTL_LINK_DIR:-$HOME/.local/bin}"
+mkdir -p "$GOALCTL_LINK_DIR"
+if ln -sfn "$REPO_DIR/bin/goalctl" "$GOALCTL_LINK_DIR/goalctl" 2>/dev/null; then
+    printf 'Symlinked goalctl -> %s/goalctl\n' "$GOALCTL_LINK_DIR"
+else
+    printf 'WARN: could not symlink goalctl into %s — /goal may not work from Desktop.\n' "$GOALCTL_LINK_DIR" >&2
+fi
+
 printf 'Installed command + hook files to %s/\n' "$TARGET"
 
 # ---- settings.json merge ---------------------------------------------------

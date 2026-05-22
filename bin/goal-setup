@@ -252,6 +252,17 @@ cp "$REPO_DIR/bin/goal-statusline-install" "$TARGET/bin/goal-statusline-install"
 chmod +x "$TARGET/bin/goal-statusline-install"
 ok "wrote $TARGET/bin/goal-statusline-install"
 
+# Symlink goalctl onto a stable PATH location so /goal's slash-command
+# preambles resolve identically in standalone Claude Code CLI, Desktop
+# chats, and Desktop-launched code sessions. See install.sh for context.
+GOALCTL_LINK_DIR="${GOALCTL_LINK_DIR:-$HOME/.local/bin}"
+mkdir -p "$GOALCTL_LINK_DIR"
+if ln -sfn "$REPO_DIR/bin/goalctl" "$GOALCTL_LINK_DIR/goalctl" 2>/dev/null; then
+    ok "symlinked goalctl -> $GOALCTL_LINK_DIR/goalctl"
+else
+    warn "could not symlink goalctl into $GOALCTL_LINK_DIR — /goal may not work from Desktop."
+fi
+
 # ---- 2. settings.json merge (hook registrations) ---------------------------
 
 head1 "Wiring hooks into $SETTINGS"
